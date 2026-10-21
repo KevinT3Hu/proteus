@@ -11,13 +11,13 @@ use std::time::Duration;
 
 use smithay_client_toolkit::reexports::calloop::timer::{TimeoutAction, Timer};
 
-use super::{App, Prompt};
+use super::{App, Prompt, Win};
 
 const RUN_POLL: Duration = Duration::from_millis(50);
 /// Shells without a line editor never leave canonical mode: type anyway.
 pub(super) const RUN_TIMEOUT: Duration = Duration::from_secs(3);
-use crate::layout::{PaneId, Tab};
-use crate::spec::{self, LayoutSpec, NodeSpec, PaneSpec, TabSpec};
+use crate::layout::{Float, PaneId, Tab};
+use crate::spec::{self, FloatSpec, LayoutSpec, NodeSpec, PaneSpec, TabSpec};
 
 /// Owner of the session file. Only one instance (the one holding the lock)
 /// saves and restores; later ones run without a session.
@@ -126,43 +126,83 @@ impl App {
         });
     }
 
-    /// Open the tabs of `spec` after the existing ones and switch to the
-    /// focused (or first) of them.
+    /// Open `spec`: its first window's tabs after the current window's
+    /// tabs (switching to the focused, or first, of them), further windows
+    /// as new windows.
     pub(super) fn open_layout(&mut self, spec: &LayoutSpec) -> io::Result<()> {
+        let home = self.w.id;
+        for (i, tabs) in spec.windows.iter().enumerate() {
+            if i > 0 {
+                self.new_window()?;
+            }
+            let res = self.open_tabs(tabs);
+            if i > 0 && self.w.tabs.is_empty() {
+                self.destroy_window();
+            }
+            res?;
+        }
+        self.activate(home);
+        Ok(())
+    }
+
+    fn open_tabs(&mut self, tabs: &[TabSpec]) -> io::Result<()> {
         let m = self.layout_metrics();
         let area = self.area();
         let (cols, rows) = ((area.w / m.cell_w).max(2) as u16, (area.h / m.cell_h).max(1) as u16);
         let before: Vec<PaneId> = self.panes.keys().copied().collect();
-        let first = self.tabs.len();
+        let first = self.w.tabs.len();
         let mut focus_tab = None;
-        for t in &spec.tabs {
-            let built = t.root.to_node(&mut |p| self.spawn_spec(p, cols, rows));
-            let (root, focus) = match built {
+        let cleanup = |app: &mut App| {
+            // Drop panes started for tabs that never opened.
+            let placed: Vec<PaneId> = app.w.tabs.iter().flat_map(|t| t.panes()).collect();
+            app.panes.retain(|id, _| before.contains(id) || placed.contains(id));
+        };
+        for t in tabs {
+            let (root, focus) = match t.root.to_node(&mut |p| self.spawn_spec(p, cols, rows)) {
                 Ok(b) => b,
                 Err(e) => {
-                    // Drop panes started for tabs that never opened.
-                    let placed: Vec<PaneId> = self.tabs.iter().flat_map(|t| t.panes()).collect();
-                    self.panes.retain(|id, _| before.contains(id) || placed.contains(id));
+                    cleanup(self);
                     return Err(e);
                 }
             };
             let mut ids = Vec::new();
             root.leaves(&mut ids);
             let mut tab = Tab::with_root(root, focus.unwrap_or(ids[0]));
+            let mut float_focus = None;
+            for f in &t.floating {
+                let id = match self.spawn_spec(&f.pane, cols / 2, rows / 2) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        cleanup(self);
+                        return Err(e);
+                    }
+                };
+                let geom = match f.geometry {
+                    Some((col, row, w, h)) => Float { id, col, row, cols: w, rows: h },
+                    None => tab.default_float(id, area, m),
+                };
+                tab.floats.push(geom);
+                if f.pane.focus {
+                    float_focus = Some(id);
+                }
+            }
+            tab.floats_visible = t.show_floating && !tab.floats.is_empty();
+            if let Some(id) = float_focus.filter(|_| tab.floats_visible) {
+                tab.set_focus(id);
+            }
             tab.zoomed = t.zoomed && ids.len() > 1;
             tab.name = t.name.clone();
-            self.tabs.push(tab);
+            self.w.tabs.push(tab);
             if t.focus {
-                focus_tab = Some(self.tabs.len() - 1);
+                focus_tab = Some(self.w.tabs.len() - 1);
             }
         }
-        let old = self.tabs.get(self.active).map(|t| t.focus);
-        self.active = focus_tab.unwrap_or(first);
+        let old = self.w.tabs.get(self.w.active).map(|t| t.focus);
+        self.w.active = focus_tab.unwrap_or(first);
         self.relayout();
-        if let Some(old) = old {
-            self.after_focus(old);
-        } else {
-            self.update_title();
+        match old {
+            Some(old) if first > 0 => self.after_focus(old),
+            _ => self.update_title(),
         }
         Ok(())
     }
@@ -170,8 +210,8 @@ impl App {
     /// One pane running `command` (or the shell).
     pub(super) fn open_default(&mut self, command: Option<Vec<OsString>>) -> io::Result<()> {
         let id = self.spawn_pane(80, 24, None, command)?;
-        self.tabs.push(Tab::new(id));
-        self.active = self.tabs.len() - 1;
+        self.w.tabs.push(Tab::new(id));
+        self.w.active = self.w.tabs.len() - 1;
         self.relayout();
         self.update_title();
         Ok(())
@@ -186,29 +226,51 @@ impl App {
         PaneSpec { cmd: p.cmd.clone(), run, cwd: p.cwd(&self.hostname), name: p.name.clone(), focus }
     }
 
-    /// The window as a layout: tabs, splits, ratios, cwd, names, and
-    /// foreground commands from `session.restore_commands`.
-    pub(super) fn current_spec(&self) -> LayoutSpec {
-        let tabs = self
-            .tabs
+    fn tab_specs(&self, w: &Win) -> Vec<TabSpec> {
+        w.tabs
             .iter()
             .enumerate()
             .map(|(i, t)| {
-                let root = NodeSpec::from_node(&t.root, &mut |id| self.pane_spec(id, id == t.focus && t.panes().len() > 1));
+                let many = t.panes().len() > 1;
+                let root = NodeSpec::from_node(&t.root, &mut |id| self.pane_spec(id, id == t.focus && many));
                 // One pane: its `cwd` doubles as the tab's.
                 let cwd = match &root {
-                    NodeSpec::Pane(p) => p.cwd.clone(),
+                    NodeSpec::Pane(p) if t.floats.is_empty() => p.cwd.clone(),
                     _ => None,
                 };
-                TabSpec { name: t.name.clone(), cwd, focus: i == self.active, zoomed: t.zoomed, root }
+                let floating = t
+                    .floats
+                    .iter()
+                    .map(|f| FloatSpec { pane: self.pane_spec(f.id, f.id == t.focus), geometry: Some((f.col, f.row, f.cols, f.rows)) })
+                    .collect();
+                TabSpec {
+                    name: t.name.clone(),
+                    cwd,
+                    focus: i == w.active,
+                    zoomed: t.zoomed,
+                    root,
+                    floating,
+                    show_floating: t.floats_visible,
+                }
             })
-            .collect();
-        LayoutSpec { tabs, clean: None }
+            .collect()
+    }
+
+    /// The current window (or, with `all`, every window) as a layout:
+    /// tabs, splits, stacks, floats, ratios, cwd, names, and foreground
+    /// commands from `session.restore_commands`.
+    pub(super) fn current_spec(&self, all: bool) -> LayoutSpec {
+        if !all {
+            return LayoutSpec::single(self.tab_specs(&self.w));
+        }
+        let mut wins: Vec<&Win> = std::iter::once(&self.w).chain(&self.parked).collect();
+        wins.sort_by_key(|w| w.id);
+        LayoutSpec { windows: wins.into_iter().map(|w| self.tab_specs(w)).filter(|t| !t.is_empty()).collect(), clean: None }
     }
 
     pub(super) fn save_layout(&mut self, name: &str) {
         let Some(path) = spec::resolve(name) else { return self.notice("no config directory for layouts".into()) };
-        let text = spec::to_lua(&self.current_spec());
+        let text = spec::to_lua(&self.current_spec(false));
         let res = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|_| std::fs::write(&path, text));
         match res {
             Ok(()) => self.notice(format!("Layout saved to {}", path.display())),
@@ -246,16 +308,22 @@ impl App {
 
     // --- session -------------------------------------------------------------------
 
+    /// The restore question is still open (the old session must not be
+    /// overwritten yet).
+    fn restore_pending(&self) -> bool {
+        std::iter::once(&self.w).chain(&self.parked).any(|w| w.prompts.iter().any(|p| matches!(p, Prompt::Restore(_))))
+    }
+
     /// Write the session file if anything changed (runs on a timer).
     pub(super) fn autosave(&mut self) {
         // Do not overwrite a session the user may still restore.
-        if self.exit || self.tabs.is_empty() || self.prompts.iter().any(|p| matches!(p, Prompt::Restore(_))) {
+        if self.exit || self.restore_pending() {
             return;
         }
         if self.session.is_none() {
             return;
         }
-        let mut spec = self.current_spec();
+        let mut spec = self.current_spec(true);
         spec.clean = Some(false);
         let text = spec::to_lua(&spec);
         if let Some(s) = self.session.as_mut() {
@@ -267,11 +335,11 @@ impl App {
     /// is only restored with `restore = "always"`); the last pane ending
     /// ends the session.
     pub(super) fn finish_session(&mut self) {
-        if self.prompts.iter().any(|p| matches!(p, Prompt::Restore(_))) {
+        if self.restore_pending() {
             return;
         }
-        if self.quit_requested && !self.tabs.is_empty() {
-            let mut spec = self.current_spec();
+        if self.quit_requested {
+            let mut spec = self.current_spec(true);
             spec.clean = Some(true);
             let text = spec::to_lua(&spec);
             if let Some(s) = self.session.as_mut() {

@@ -299,6 +299,23 @@ pub enum Action {
     RenamePane,
     SaveLayout,
     LoadLayout,
+    /// Next pane in order (tmux `o`).
+    FocusNext,
+    /// Show/hide the floating panes (a first one is created if none).
+    ToggleFloating,
+    /// Float the focused pane, or embed the focused float.
+    ToggleEmbed,
+    NewFloating,
+    /// Stack the focused pane with its sibling, or unstack.
+    ToggleStack,
+    TogglePaneTitles,
+    NewWindow,
+    TabToNewWindow,
+    PaneToNewWindow,
+    /// Move the tab into the next window.
+    TabToNextWindow,
+    /// Run any action by name.
+    Palette,
 }
 
 /// Cells per resize step.
@@ -372,6 +389,17 @@ impl Action {
             Action::RenamePane => "pane.rename".into(),
             Action::SaveLayout => "layout.save".into(),
             Action::LoadLayout => "layout.load".into(),
+            Action::FocusNext => "pane.focus_next".into(),
+            Action::ToggleFloating => "pane.toggle_floating".into(),
+            Action::ToggleEmbed => "pane.toggle_embed".into(),
+            Action::NewFloating => "pane.new_floating".into(),
+            Action::ToggleStack => "pane.toggle_stack".into(),
+            Action::TogglePaneTitles => "ui.toggle_pane_titles".into(),
+            Action::NewWindow => "window.new".into(),
+            Action::TabToNewWindow => "tab.to_new_window".into(),
+            Action::PaneToNewWindow => "pane.to_new_window".into(),
+            Action::TabToNextWindow => "tab.to_next_window".into(),
+            Action::Palette => "palette".into(),
         }
     }
 
@@ -411,6 +439,19 @@ impl Action {
         v.extend([Select::Char, Select::Line, Select::Block].map(Action::CopySelect));
         v.extend([Action::CopyYank, Action::CopyEscape, Action::SearchStart, Action::SearchUp, Action::SearchDown]);
         v.extend([Action::RenameTab, Action::RenamePane, Action::SaveLayout, Action::LoadLayout]);
+        v.extend([
+            Action::FocusNext,
+            Action::ToggleFloating,
+            Action::ToggleEmbed,
+            Action::NewFloating,
+            Action::ToggleStack,
+            Action::TogglePaneTitles,
+            Action::NewWindow,
+            Action::TabToNewWindow,
+            Action::PaneToNewWindow,
+            Action::TabToNextWindow,
+            Action::Palette,
+        ]);
         v
     }
 
@@ -471,6 +512,17 @@ impl Action {
             Action::RenameTab | Action::RenamePane => "rename",
             Action::SaveLayout => "save layout",
             Action::LoadLayout => "load layout",
+            Action::FocusNext => "next pane",
+            Action::ToggleFloating => "floating",
+            Action::ToggleEmbed => "float/embed",
+            Action::NewFloating => "new floating",
+            Action::ToggleStack => "stack",
+            Action::TogglePaneTitles => "titles",
+            Action::NewWindow => "new window",
+            Action::TabToNewWindow | Action::PaneToNewWindow => "to new window",
+            Action::TabToNextWindow => "to next window",
+            Action::Palette if mode.passes_keys() => return None,
+            Action::Palette => "palette",
         })
     }
 }
@@ -484,14 +536,27 @@ pub enum Preset {
     /// One leader key opens a mode menu (no chords taken from the shell
     /// besides the leader); the same Alt+… quick keys.
     Leader,
+    /// tmux: the prefix (Ctrl+b) then one tmux key (`c`, `%`, `"`, `n`,
+    /// `p`, `o`, `x`, `z`, `[`, ...). No Alt quick keys.
+    Tmux,
+}
+
+impl Preset {
+    pub fn default_leader(self) -> Chord {
+        match self {
+            Preset::Tmux => Chord::new(Key::Char('b'), Mods::CTRL),
+            Preset::Zellij | Preset::Leader => Chord::new(Key::Char('g'), Mods::CTRL),
+        }
+    }
 }
 
 /// Key settings from the config: a preset plus per-mode overrides.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KeyConfig {
     pub preset: Preset,
-    /// Zellij preset: lock/unlock key. Leader preset: opens the mode menu.
-    pub leader: Chord,
+    /// Zellij preset: lock/unlock key. Leader preset: opens the mode
+    /// menu. Tmux preset: the prefix. `None`: the preset's default.
+    pub leader: Option<Chord>,
     /// Stay in a mode after an action instead of returning to Normal.
     pub sticky: bool,
     /// Applied in order on top of the preset; `None` unbinds the chord.
@@ -500,7 +565,7 @@ pub struct KeyConfig {
 
 impl Default for KeyConfig {
     fn default() -> Self {
-        Self { preset: Preset::Zellij, leader: Chord::new(Key::Char('g'), Mods::CTRL), sticky: false, binds: Vec::new() }
+        Self { preset: Preset::Zellij, leader: None, sticky: false, binds: Vec::new() }
     }
 }
 
@@ -567,7 +632,47 @@ fn quick_keys(t: &mut Table) {
     for i in 1..=9u8 {
         bind(t, &[&format!("alt+{i}")], Action::GotoTab(i - 1));
     }
+    bind(t, &["alt+f"], Action::ToggleFloating);
     bind(t, &["ctrl+shift+f"], Action::SearchStart);
+}
+
+/// Window-level keys, in Normal mode of every preset.
+fn window_keys(t: &mut Table) {
+    bind(t, &["ctrl+shift+p"], Action::Palette);
+    bind(t, &["ctrl+shift+n"], Action::NewWindow);
+}
+
+/// tmux's prefix table (in the Menu mode; one key, then back to Normal).
+fn tmux_table(t: &mut Table) {
+    bind(t, &["c"], Action::NewTab);
+    bind(t, &["n"], Action::NextTab);
+    bind(t, &["p"], Action::PrevTab);
+    for i in 1..=9u8 {
+        bind(t, &[&i.to_string()], Action::GotoTab(i - 1));
+    }
+    bind(t, &["%"], Action::Split(Axis::X));
+    bind(t, &["\""], Action::Split(Axis::Y));
+    dirs(t, "", Action::Focus);
+    bind(t, &["o"], Action::FocusNext);
+    bind(t, &["x"], Action::ClosePane);
+    bind(t, &["&"], Action::CloseTab);
+    bind(t, &["z"], Action::Zoom);
+    bind(t, &["!"], Action::PaneToNewTab);
+    bind(t, &["{"], Action::Swap(Dir::Left));
+    bind(t, &["}"], Action::Swap(Dir::Right));
+    bind(t, &[","], Action::RenameTab);
+    bind(t, &["."], Action::RenamePane);
+    bind(t, &["["], Action::Mode(Mode::Scroll));
+    bind(t, &["/"], Action::SearchStart);
+    bind(t, &[":"], Action::Palette);
+    bind(t, &["w"], Action::ToggleFloating);
+    bind(t, &["s"], Action::Mode(Mode::Session));
+    bind(t, &["r"], Action::Mode(Mode::Resize));
+    bind(t, &["m"], Action::Mode(Mode::Move));
+    for (k, d) in [("ctrl+left", Dir::Left), ("ctrl+right", Dir::Right), ("ctrl+up", Dir::Up), ("ctrl+down", Dir::Down)] {
+        bind(t, &[k], Action::Resize(d, RESIZE_STEP));
+    }
+    bind(t, &["esc"], Action::Mode(Mode::Normal));
 }
 
 /// Bindings of the modes entered from Normal (shared by both presets).
@@ -582,6 +687,11 @@ fn mode_table(mode: Mode) -> Table {
             bind(&mut t, &["r", "v"], Action::Split(Axis::X));
             bind(&mut t, &["x"], Action::ClosePane);
             bind(&mut t, &["f", "z"], Action::Zoom);
+            bind(&mut t, &["w"], Action::ToggleFloating);
+            bind(&mut t, &["e"], Action::ToggleEmbed);
+            bind(&mut t, &["S"], Action::ToggleStack);
+            bind(&mut t, &["T"], Action::TogglePaneTitles);
+            bind(&mut t, &["W"], Action::PaneToNewWindow);
             bind(&mut t, &["c"], Action::RenamePane);
         }
         Mode::Tab => {
@@ -594,6 +704,8 @@ fn mode_table(mode: Mode) -> Table {
             bind(&mut t, &["b"], Action::PaneToNewTab);
             bind(&mut t, &["r"], Action::RenameTab);
             bind(&mut t, &["x"], Action::CloseTab);
+            bind(&mut t, &["w"], Action::TabToNextWindow);
+            bind(&mut t, &["W"], Action::TabToNewWindow);
         }
         Mode::Resize => {
             dirs(&mut t, "", |d| Action::Resize(d, RESIZE_STEP));
@@ -665,7 +777,7 @@ pub struct Keymap {
 
 impl Keymap {
     pub fn new(cfg: &KeyConfig) -> Self {
-        let leader = cfg.leader;
+        let leader = cfg.leader.unwrap_or(cfg.preset.default_leader());
         let mut tables: Vec<(Mode, Table)> = MODES.into_iter().map(|m| (m, mode_table(m))).collect();
         for (mode, t) in &mut tables {
             match (*mode, cfg.preset) {
@@ -675,12 +787,24 @@ impl Keymap {
                         bind(t, &[k], Action::Mode(m));
                     }
                     quick_keys(t);
+                    window_keys(t);
                     terminal_keys(t);
                 }
                 (Mode::Normal, Preset::Leader) => {
                     bind_chord(t, leader, Action::Mode(Mode::Menu));
                     quick_keys(t);
+                    window_keys(t);
                     terminal_keys(t);
+                }
+                (Mode::Normal, Preset::Tmux) => {
+                    bind_chord(t, leader, Action::Mode(Mode::Menu));
+                    window_keys(t);
+                    terminal_keys(t);
+                }
+                (Mode::Menu, Preset::Tmux) => {
+                    // Prefix twice sends it (tmux `send-prefix`).
+                    bind_chord(t, leader, Action::Passthrough);
+                    tmux_table(t);
                 }
                 (Mode::Locked, _) => {
                     bind_chord(t, leader, Action::Mode(Mode::Normal));
@@ -705,7 +829,7 @@ impl Keymap {
                     }
                     bind_chord(t, leader, Action::Mode(Mode::Locked));
                 }
-                (_, Preset::Leader) => {
+                (_, Preset::Leader | Preset::Tmux) => {
                     bind(t, &["esc"], Action::Mode(Mode::Normal));
                     bind_chord(t, leader, Action::Mode(Mode::Normal));
                 }
@@ -886,6 +1010,23 @@ mod tests {
     }
 
     #[test]
+    fn tmux_preset() {
+        let k = km(Preset::Tmux);
+        let (b, ctrl) = (Key::Char('b'), Mods::CTRL);
+        assert_eq!(k.lookup(Mode::Normal, b, ctrl), Lookup::Do(Action::Mode(Mode::Menu)));
+        assert_eq!(k.lookup(Mode::Normal, Key::Char('p'), ctrl), Lookup::Pass);
+        assert_eq!(k.lookup(Mode::Normal, Key::Char('h'), Mods::ALT), Lookup::Pass);
+        let pct = k.lookup_shifted(Mode::Menu, Key::Char('5'), Mods::SHIFT, Some('%'));
+        assert_eq!(pct, Lookup::Do(Action::Split(Axis::X)));
+        assert_eq!(k.lookup(Mode::Menu, Key::Char('c'), NONE), Lookup::Do(Action::NewTab));
+        assert_eq!(k.after(Mode::Menu, Action::NewTab), Mode::Normal);
+        assert_eq!(k.lookup(Mode::Menu, b, ctrl), Lookup::Do(Action::Passthrough));
+        assert_eq!(k.lookup(Mode::Menu, Key::Char('['), NONE), Lookup::Do(Action::Mode(Mode::Scroll)));
+        assert_eq!(k.lookup(Mode::Tab, b, ctrl), Lookup::Do(Action::Mode(Mode::Normal)));
+        assert_eq!(k.hints(Mode::Normal)[0], ("ctrl+b".to_string(), "menu"));
+    }
+
+    #[test]
     fn overrides() {
         let p = |s| Chord::parse(s).unwrap();
         let cfg = KeyConfig {
@@ -942,7 +1083,11 @@ mod tests {
             assert_eq!(Action::from_name(&a.name()), Some(a), "{}", a.name());
         }
         for m in MODES {
-            for &(_, a) in km(Preset::Zellij).bindings(m).iter().chain(km(Preset::Leader).bindings(m)) {
+            let all: Vec<Action> = [Preset::Zellij, Preset::Leader, Preset::Tmux]
+                .into_iter()
+                .flat_map(|p| km(p).bindings(m).iter().map(|x| x.1).collect::<Vec<_>>())
+                .collect();
+            for a in all {
                 assert_eq!(Action::from_name(&a.name()), Some(a), "{}", a.name());
             }
         }

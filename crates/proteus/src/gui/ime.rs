@@ -114,10 +114,17 @@ impl Dispatch2<ZwpTextInputManagerV3, App> for ImeData {
 impl Dispatch2<ZwpTextInputV3, App> for ImeData {
     fn event(&self, app: &mut App, _: &ZwpTextInputV3, ev: zwp_text_input_v3::Event, _: &Connection, _: &QueueHandle<App>) {
         use zwp_text_input_v3::Event;
-        let ours = app.window_surface().clone();
+        // Enter/leave name a window; everything else goes to the keyboard's.
+        let ours = match &ev {
+            Event::Enter { surface } | Event::Leave { surface } => app.activate_surface(surface),
+            _ => {
+                app.activate_kbd();
+                true
+            }
+        };
         let Some(ime) = app.ime.as_mut() else { return };
         match ev {
-            Event::Enter { surface } if surface == ours => {
+            Event::Enter { .. } if ours => {
                 ime.active = true;
                 ime.rect = None;
                 ime.input.enable();
@@ -125,7 +132,7 @@ impl Dispatch2<ZwpTextInputV3, App> for ImeData {
                 ime.input.commit();
                 app.update_ime_rect();
             }
-            Event::Leave { surface } if surface == ours => {
+            Event::Leave { .. } if ours => {
                 ime.active = false;
                 ime.pending = Pending::default();
                 ime.input.disable();

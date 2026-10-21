@@ -9,11 +9,11 @@
 //!   clipboard = { osc52_read = "ask", paste_protection = true },
 //!   shell = { command = { "fish", "-l" }, integration = true },
 //!   scrollback = 20000,
-//!   ui = { hint_bar = "in-mode", tab_bar = "auto" },
+//!   ui = { hint_bar = "in-mode", tab_bar = "auto", pane_titles = "never" },
 //!   panes = { confirm_close = true, confirm_close_ignore = { "less", "man" } },
 //!   session = { restore = "ask", restore_commands = { "nvim", "htop" } },
 //!   keys = {
-//!     preset = "zellij",   -- or "leader"
+//!     preset = "zellij",   -- or "leader", "tmux"
 //!     leader = "ctrl+g",   -- zellij: lock/unlock; leader: opens the mode menu
 //!     sticky = false,
 //!     -- Per mode: key = action name (`proteus --list-actions`), or "none".
@@ -69,6 +69,10 @@ pub struct Config {
     pub keys: KeyConfig,
     pub hint_bar: HintBar,
     pub tab_bar: TabBar,
+    pub pane_titles: PaneTitles,
+    /// Closing the last pane of a window starts a new shell instead of
+    /// closing the window.
+    pub keep_last_shell: bool,
     /// Ask before closing a pane whose foreground process is not the shell.
     pub confirm_close: bool,
     /// Foreground programs that never need the close confirmation.
@@ -98,6 +102,15 @@ pub enum HintBar {
     Never,
 }
 
+/// Title rows above tiled panes (stacked and floating panes always have one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneTitles {
+    /// When the tab has more than one tiled pane.
+    Auto,
+    Always,
+    Never,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabBar {
     /// Shown when there is more than one tab.
@@ -123,6 +136,8 @@ impl Default for Config {
             scrollback: 10_000,
             keys: KeyConfig::default(),
             hint_bar: HintBar::InMode,
+            pane_titles: PaneTitles::Never,
+            keep_last_shell: false,
             tab_bar: TabBar::Auto,
             confirm_close: true,
             confirm_close_ignore: ["less", "more", "man", "top", "htop", "btop", "watch", "tail"]
@@ -302,6 +317,14 @@ fn apply(c: &mut Config, t: &Table) -> Result<(), String> {
                             _ => return Err("ui.tab_bar: expected \"auto\", \"always\" or \"never\"".into()),
                         }
                     }
+                    "pane_titles" => {
+                        c.pane_titles = match string(v, "ui.pane_titles")?.as_str() {
+                            "auto" => PaneTitles::Auto,
+                            "always" => PaneTitles::Always,
+                            "never" => PaneTitles::Never,
+                            _ => return Err("ui.pane_titles: expected \"auto\", \"always\" or \"never\"".into()),
+                        }
+                    }
                     _ => return Err(unknown("ui", k)),
                 }
                 Ok(())
@@ -312,12 +335,13 @@ fn apply(c: &mut Config, t: &Table) -> Result<(), String> {
                         c.keys.preset = match string(v, "keys.preset")?.as_str() {
                             "zellij" => Preset::Zellij,
                             "leader" => Preset::Leader,
-                            _ => return Err("keys.preset: expected \"zellij\" or \"leader\"".into()),
+                            "tmux" => Preset::Tmux,
+                            _ => return Err("keys.preset: expected \"zellij\", \"leader\" or \"tmux\"".into()),
                         }
                     }
                     "leader" => {
                         c.keys.leader =
-                            Chord::parse(&string(v, "keys.leader")?).map_err(|e| format!("keys.leader: {e}"))?
+                            Some(Chord::parse(&string(v, "keys.leader")?).map_err(|e| format!("keys.leader: {e}"))?)
                     }
                     "sticky" => c.keys.sticky = boolean(v, "keys.sticky")?,
                     m => {
@@ -344,6 +368,7 @@ fn apply(c: &mut Config, t: &Table) -> Result<(), String> {
             "panes" => section(&v, "panes", |k, v| {
                 match k {
                     "confirm_close" => c.confirm_close = boolean(v, "panes.confirm_close")?,
+                    "keep_last_shell" => c.keep_last_shell = boolean(v, "panes.keep_last_shell")?,
                     "confirm_close_ignore" => c.confirm_close_ignore = strings(v, "panes.confirm_close_ignore")?,
                     _ => return Err(unknown("panes", k)),
                 }
@@ -468,8 +493,8 @@ mod tests {
     #[test]
     fn mux_config() {
         let c = ev(r#"require("proteus").config {
-            ui = { hint_bar = "always", tab_bar = "never" },
-            panes = { confirm_close = false, confirm_close_ignore = { "less" } },
+            ui = { hint_bar = "always", tab_bar = "never", pane_titles = "auto" },
+            panes = { confirm_close = false, confirm_close_ignore = { "less" }, keep_last_shell = true },
             session = { restore = "always", restore_commands = { "nvim" } },
             keys = {
               preset = "leader", leader = "ctrl+space", sticky = true,
@@ -480,10 +505,12 @@ mod tests {
         .unwrap();
         let k = &c.keys;
         assert_eq!(k.preset, Preset::Leader);
-        assert_eq!(k.leader, Chord::parse("ctrl+space").unwrap());
+        assert_eq!(k.leader, Some(Chord::parse("ctrl+space").unwrap()));
         assert!(k.sticky && !c.confirm_close);
         assert_eq!(c.hint_bar, HintBar::Always);
         assert_eq!(c.tab_bar, TabBar::Never);
+        assert_eq!(c.pane_titles, PaneTitles::Auto);
+        assert!(c.keep_last_shell);
         assert_eq!(c.confirm_close_ignore, ["less"]);
         assert_eq!((c.restore, c.restore_commands.clone()), (Restore::Always, vec!["nvim".to_string()]));
         assert_eq!(k.binds.len(), 4);

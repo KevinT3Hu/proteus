@@ -12,14 +12,22 @@
 //!         { run = "git status" },                  -- typed into the shell
 //!       },
 //!     },
-//!     { name = "logs", cmd = "journalctl -f" },
+//!     { name = "logs", cmd = "journalctl -f",
+//!       floating = { { run = "htop", x = 10, y = 3, width = 80, height = 20 } },
+//!       show_floating = true,
+//!     },
+//!     { split = "horizontal", stacked = true, { run = "make" }, { run = "git log" } },
 //!   },
 //! }
 //! ```
 //!
+//! The session file (and a layout of several windows) uses
+//! `windows = { { tabs = { ... } }, ... }` instead of `tabs`.
+//!
 //! A tab table is a node with extra tab keys (`name`, `cwd`, `focus`,
 //! `zoom`). A node is a pane (`cmd`, `run`, `cwd`, `name`, `focus`) or a
-//! split (`split`, `ratio` and two or more child nodes). `cmd` replaces the
+//! split (`split`, `ratio`, optionally `stacked = true`, and two or more
+//! child nodes; a stack's children must be panes). `cmd` replaces the
 //! shell (a string runs through `$SHELL -c`); `run` is typed into the shell,
 //! so the pane stays open when the command ends.
 
@@ -62,7 +70,15 @@ pub struct PaneSpec {
 #[derive(Debug, Clone, PartialEq)]
 pub enum NodeSpec {
     Pane(PaneSpec),
-    Split { axis: Axis, ratio: Option<f32>, children: Vec<NodeSpec> },
+    Split { axis: Axis, ratio: Option<f32>, stacked: bool, children: Vec<NodeSpec> },
+}
+
+/// A floating pane: the pane and its grid position/size in cells.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FloatSpec {
+    pub pane: PaneSpec,
+    /// (col, row, cols, rows); `None` = default placement.
+    pub geometry: Option<(i32, i32, i32, i32)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -73,11 +89,14 @@ pub struct TabSpec {
     pub focus: bool,
     pub zoomed: bool,
     pub root: NodeSpec,
+    pub floating: Vec<FloatSpec>,
+    pub show_floating: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LayoutSpec {
-    pub tabs: Vec<TabSpec>,
+    /// Tabs of each window.
+    pub windows: Vec<Vec<TabSpec>>,
     /// Session file only: the program exited normally.
     pub clean: Option<bool>,
 }
@@ -90,7 +109,16 @@ impl LayoutSpec {
                 NodeSpec::Split { children, .. } => children.iter().map(count).sum(),
             }
         }
-        self.tabs.iter().map(|t| count(&t.root)).sum()
+        self.tabs().map(|t| count(&t.root) + t.floating.len()).sum()
+    }
+
+    pub fn tabs(&self) -> impl Iterator<Item = &TabSpec> {
+        self.windows.iter().flatten()
+    }
+
+    /// One window of tabs.
+    pub fn single(tabs: Vec<TabSpec>) -> Self {
+        Self { windows: vec![tabs], clean: None }
     }
 }
 
@@ -126,11 +154,30 @@ fn boolean(v: &Value, at: &str) -> Result<bool, String> {
 
 const PANE_KEYS: [&str; 5] = ["cmd", "run", "cwd", "name", "focus"];
 
-/// Parse a node table. `tab` allows the tab keys, which are returned as
-/// (name, cwd, focus, zoom) and not treated as pane keys.
-fn node(t: &Table, at: &str, base: Option<&Path>, tab: bool) -> Result<NodeSpec, String> {
+/// Which extra keys a node table may have.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// Tab keys (read by `tab()`) are skipped here.
+    Tab,
+    Child,
+    /// Floating pane geometry keys (read by `float()`) are skipped here.
+    Float,
+}
+
+fn number(v: &Value, at: &str) -> Result<f64, String> {
+    match v {
+        Value::Integer(i) => Ok(*i as f64),
+        Value::Number(n) => Ok(*n),
+        _ => Err(format!("{at}: expected a number")),
+    }
+}
+
+/// Parse a node table.
+fn node(t: &Table, at: &str, base: Option<&Path>, kind: Kind) -> Result<NodeSpec, String> {
+    let tab = kind == Kind::Tab;
     let mut children = Vec::new();
     let mut split = None;
+    let mut stacked = false;
     let mut ratio = None;
     let mut pane = PaneSpec::default();
     let mut pane_keys = false;
@@ -149,12 +196,9 @@ fn node(t: &Table, at: &str, base: Option<&Path>, tab: bool) -> Result<NodeSpec,
                             _ => return Err(format!("{key_at}: expected \"vertical\" or \"horizontal\"")),
                         })
                     }
+                    "stacked" => stacked = boolean(&v, &key_at)?,
                     "ratio" => {
-                        let r = match v {
-                            Value::Integer(i) => i as f64,
-                            Value::Number(n) => n,
-                            _ => return Err(format!("{key_at}: expected a number")),
-                        };
+                        let r = number(&v, &key_at)?;
                         if !(r > 0.0 && r < 1.0) {
                             return Err(format!("{key_at}: expected a number between 0 and 1"));
                         }
@@ -183,7 +227,8 @@ fn node(t: &Table, at: &str, base: Option<&Path>, tab: bool) -> Result<NodeSpec,
                     }
                     "plugin" => return Err(format!("{key_at}: plugin panes are not supported yet")),
                     // Tab keys are read by `tab()`.
-                    "name" | "cwd" | "focus" | "zoom" if tab => {}
+                    "name" | "cwd" | "focus" | "zoom" | "floating" | "show_floating" if tab => {}
+                    "x" | "y" | "width" | "height" if kind == Kind::Float => {}
                     "cwd" => {
                         pane_keys = true;
                         pane.cwd = Some(expand(&string(&v, &key_at)?, base));
@@ -206,7 +251,10 @@ fn node(t: &Table, at: &str, base: Option<&Path>, tab: bool) -> Result<NodeSpec,
         let v = v.map_err(|e| format!("{at}: {e}"))?;
         let child_at = format!("{at}[{}]", i + 1);
         let Value::Table(c) = v else { return Err(format!("{child_at}: expected a table")) };
-        children.push(node(&c, &child_at, base, false)?);
+        children.push(node(&c, &child_at, base, Kind::Child)?);
+    }
+    if kind == Kind::Float && !children.is_empty() {
+        return Err(format!("{at}: a floating pane cannot be split"));
     }
     match (split, children.len()) {
         (None, 0) => {
@@ -220,8 +268,28 @@ fn node(t: &Table, at: &str, base: Option<&Path>, tab: bool) -> Result<NodeSpec,
         (Some(_), _) if pane_keys => {
             Err(format!("{at}: a split cannot have pane keys ({})", PANE_KEYS.join(", ")))
         }
-        (Some(axis), _) => Ok(NodeSpec::Split { axis, ratio, children }),
+        (Some(_), _) if stacked && children.iter().any(|c| !matches!(c, NodeSpec::Pane(_))) => {
+            Err(format!("{at}: a stack's children must be panes"))
+        }
+        (Some(axis), _) => Ok(NodeSpec::Split { axis, ratio, stacked, children }),
     }
+}
+
+fn float(t: &Table, at: &str, base: Option<&Path>) -> Result<FloatSpec, String> {
+    let NodeSpec::Pane(pane) = node(t, at, base, Kind::Float)? else { unreachable!("floats are panes") };
+    let mut g = [None; 4];
+    for (i, k) in ["x", "y", "width", "height"].iter().enumerate() {
+        match t.raw_get::<Value>(*k).map_err(|e| format!("{at}.{k}: {e}"))? {
+            Value::Nil => {}
+            v => g[i] = Some(number(&v, &format!("{at}.{k}"))?.round() as i32),
+        }
+    }
+    let geometry = match g {
+        [Some(x), Some(y), Some(w), Some(h)] => Some((x, y, w, h)),
+        [None, None, None, None] => None,
+        _ => return Err(format!("{at}: give all of x, y, width and height, or none")),
+    };
+    Ok(FloatSpec { pane, geometry })
 }
 
 fn tab(t: &Table, at: &str) -> Result<TabSpec, String> {
@@ -242,7 +310,31 @@ fn tab(t: &Table, at: &str) -> Result<TabSpec, String> {
         Value::Nil => false,
         v => boolean(&v, &format!("{at}.zoom"))?,
     };
-    let root = node(t, at, cwd.as_deref(), true)?;
+    let show_floating = match get("show_floating")? {
+        Value::Nil => false,
+        v => boolean(&v, &format!("{at}.show_floating"))?,
+    };
+    let mut floating = Vec::new();
+    match get("floating")? {
+        Value::Nil => {}
+        Value::Table(list) => {
+            for (i, f) in list.sequence_values::<Value>().enumerate() {
+                let fat = format!("{at}.floating[{}]", i + 1);
+                match f.map_err(|e| format!("{fat}: {e}"))? {
+                    Value::Table(f) => {
+                        let mut f = float(&f, &fat, cwd.as_deref())?;
+                        if f.pane.cwd.is_none() {
+                            f.pane.cwd = cwd.clone();
+                        }
+                        floating.push(f);
+                    }
+                    _ => return Err(format!("{fat}: expected a table")),
+                }
+            }
+        }
+        _ => return Err(format!("{at}.floating: expected a list")),
+    }
+    let root = node(t, at, cwd.as_deref(), Kind::Tab)?;
     // Panes without their own cwd use the tab's.
     fn inherit(n: &mut NodeSpec, cwd: &Option<PathBuf>) {
         match n {
@@ -256,7 +348,7 @@ fn tab(t: &Table, at: &str) -> Result<TabSpec, String> {
     }
     let mut root = root;
     inherit(&mut root, &cwd);
-    Ok(TabSpec { name, cwd, focus, zoomed, root })
+    Ok(TabSpec { name, cwd, focus, zoomed, root, floating, show_floating })
 }
 
 /// Evaluate layout (or session) source. `chunk` names it in errors.
@@ -268,17 +360,42 @@ pub fn parse(src: &str, chunk: &str) -> Result<LayoutSpec, String> {
     })?;
     let Value::Table(t) = value else { return Err(format!("{chunk}: the file must `return {{ tabs = {{ ... }} }}`")) };
     let mut spec = LayoutSpec::default();
+    let tabs = |v: Value, prefix: &str| -> Result<Vec<TabSpec>, String> {
+        let Value::Table(list) = v else { return Err(format!("{chunk}: {prefix}tabs: expected a list")) };
+        let mut out = Vec::new();
+        for (i, t) in list.sequence_values::<Value>().enumerate() {
+            let at = format!("{prefix}tabs[{}]", i + 1);
+            match t.map_err(|e| format!("{at}: {e}"))? {
+                Value::Table(t) => out.push(tab(&t, &at).map_err(|e| format!("{chunk}: {e}"))?),
+                _ => return Err(format!("{chunk}: {at}: expected a table")),
+            }
+        }
+        if out.is_empty() {
+            return Err(format!("{chunk}: {prefix}no tabs"));
+        }
+        Ok(out)
+    };
+    let mut seen_tabs = false;
     for pair in t.pairs::<String, Value>() {
         let (k, v) = pair.map_err(|e| format!("{chunk}: {e}"))?;
         match k.as_str() {
             "tabs" => {
-                let Value::Table(list) = v else { return Err(format!("{chunk}: tabs: expected a list")) };
-                for (i, t) in list.sequence_values::<Value>().enumerate() {
-                    let at = format!("tabs[{}]", i + 1);
-                    match t.map_err(|e| format!("{at}: {e}"))? {
-                        Value::Table(t) => spec.tabs.push(tab(&t, &at).map_err(|e| format!("{chunk}: {e}"))?),
-                        _ => return Err(format!("{chunk}: {at}: expected a table")),
+                seen_tabs = true;
+                spec.windows.insert(0, tabs(v, "")?);
+            }
+            "windows" => {
+                let Value::Table(list) = v else { return Err(format!("{chunk}: windows: expected a list")) };
+                for (i, w) in list.sequence_values::<Value>().enumerate() {
+                    let at = format!("windows[{}].", i + 1);
+                    let Ok(Value::Table(w)) = w else { return Err(format!("{chunk}: {at}: expected a table")) };
+                    for pair in w.pairs::<String, Value>() {
+                        let (k, _) = pair.map_err(|e| format!("{chunk}: {e}"))?;
+                        if k != "tabs" {
+                            return Err(format!("{chunk}: {at}: unknown key `{k}`"));
+                        }
                     }
+                    let v = w.raw_get::<Value>("tabs").map_err(|e| e.to_string())?;
+                    spec.windows.push(tabs(v, &at)?);
                 }
             }
             "clean" => spec.clean = Some(boolean(&v, "clean")?),
@@ -286,7 +403,10 @@ pub fn parse(src: &str, chunk: &str) -> Result<LayoutSpec, String> {
             _ => return Err(format!("{chunk}: unknown key `{k}`")),
         }
     }
-    if spec.tabs.is_empty() {
+    if seen_tabs && spec.windows.len() > 1 {
+        return Err(format!("{chunk}: use either `tabs` or `windows`"));
+    }
+    if spec.windows.is_empty() {
         return Err(format!("{chunk}: no tabs"));
     }
     Ok(spec)
@@ -371,8 +491,11 @@ fn write_node(n: &NodeSpec, indent: usize, keys: Vec<String>, tab_cwd: Option<&P
             write_pane_keys(p, &mut keys, tab_cwd);
             out.push_str(&format!("{pad}{{ {} }},\n", keys.join(", ")).replace("{  }", "{}"));
         }
-        NodeSpec::Split { axis, ratio, children } => {
+        NodeSpec::Split { axis, ratio, stacked, children } => {
             keys.push(format!("split = {}", quote(if *axis == Axis::X { "vertical" } else { "horizontal" })));
+            if *stacked {
+                keys.push("stacked = true".into());
+            }
             if let Some(r) = ratio {
                 keys.push(format!("ratio = {}", (r * 1000.0).round() / 1000.0));
             }
@@ -385,14 +508,10 @@ fn write_node(n: &NodeSpec, indent: usize, keys: Vec<String>, tab_cwd: Option<&P
     }
 }
 
-/// Lua source for `spec`, readable by [`parse`].
-pub fn to_lua(spec: &LayoutSpec) -> String {
-    let mut out = String::from("-- Proteus layout\nreturn {\n");
-    if let Some(c) = spec.clean {
-        out.push_str(&format!("  clean = {c},\n"));
-    }
-    out.push_str("  tabs = {\n");
-    for t in &spec.tabs {
+fn write_tabs(tabs: &[TabSpec], indent: usize, out: &mut String) {
+    let pad = "  ".repeat(indent);
+    out.push_str(&format!("{pad}tabs = {{\n"));
+    for t in tabs {
         let mut keys = Vec::new();
         if let Some(n) = &t.name {
             keys.push(format!("name = {}", quote(n)));
@@ -406,14 +525,52 @@ pub fn to_lua(spec: &LayoutSpec) -> String {
         if t.zoomed {
             keys.push("zoom = true".into());
         }
+        if t.show_floating {
+            keys.push("show_floating = true".into());
+        }
+        if !t.floating.is_empty() {
+            let floats: Vec<String> = t
+                .floating
+                .iter()
+                .map(|f| {
+                    let mut k = Vec::new();
+                    write_pane_keys(&f.pane, &mut k, t.cwd.as_deref());
+                    if let Some((x, y, w, h)) = f.geometry {
+                        k.push(format!("x = {x}, y = {y}, width = {w}, height = {h}"));
+                    }
+                    format!("{{ {} }}", k.join(", ")).replace("{  }", "{}")
+                })
+                .collect();
+            keys.push(format!("floating = {{ {} }}", floats.join(", ")));
+        }
         // A one-pane tab: the tab's own `name`/`focus` mean the tab's.
         let root = match &t.root {
             NodeSpec::Pane(p) => NodeSpec::Pane(PaneSpec { name: None, focus: false, ..p.clone() }),
             n => n.clone(),
         };
-        write_node(&root, 2, keys, t.cwd.as_deref(), &mut out);
+        write_node(&root, indent + 1, keys, t.cwd.as_deref(), out);
     }
-    out.push_str("  },\n}\n");
+    out.push_str(&format!("{pad}}},\n"));
+}
+
+/// Lua source for `spec`, readable by [`parse`].
+pub fn to_lua(spec: &LayoutSpec) -> String {
+    let mut out = String::from("-- Proteus layout\nreturn {\n");
+    if let Some(c) = spec.clean {
+        out.push_str(&format!("  clean = {c},\n"));
+    }
+    if let [tabs] = spec.windows.as_slice() {
+        write_tabs(tabs, 1, &mut out);
+    } else {
+        out.push_str("  windows = {\n");
+        for w in &spec.windows {
+            out.push_str("    {\n");
+            write_tabs(w, 3, &mut out);
+            out.push_str("    },\n");
+        }
+        out.push_str("  },\n");
+    }
+    out.push_str("}\n");
     out
 }
 
@@ -432,7 +589,20 @@ impl NodeSpec {
                 let id = spawn(p)?;
                 Ok((Node::Leaf(id), p.focus.then_some(id)))
             }
-            NodeSpec::Split { axis, ratio, children } => {
+            NodeSpec::Split { stacked: true, children, .. } => {
+                let mut panes = Vec::with_capacity(children.len());
+                let mut active = 0;
+                for (i, c) in children.iter().enumerate() {
+                    let NodeSpec::Pane(p) = c else { continue };
+                    panes.push(spawn(p)?);
+                    if p.focus {
+                        active = i;
+                    }
+                }
+                let focus = children.iter().any(|c| matches!(c, NodeSpec::Pane(p) if p.focus)).then(|| panes[active]);
+                Ok((Node::Stack { panes, active }, focus))
+            }
+            NodeSpec::Split { axis, ratio, children, .. } => {
                 let mut built = Vec::with_capacity(children.len());
                 let mut focus = None;
                 for c in children {
@@ -458,7 +628,14 @@ impl NodeSpec {
             Node::Split { axis, ratio, a, b } => NodeSpec::Split {
                 axis: *axis,
                 ratio: Some(*ratio),
+                stacked: false,
                 children: vec![Self::from_node(a, pane), Self::from_node(b, pane)],
+            },
+            Node::Stack { panes, .. } => NodeSpec::Split {
+                axis: Axis::Y,
+                ratio: None,
+                stacked: true,
+                children: panes.iter().map(|&id| NodeSpec::Pane(pane(id))).collect(),
             },
         }
     }
@@ -484,12 +661,12 @@ mod tests {
     #[test]
     fn parse_doc_example() {
         let s = parse(DOC, "dev.lua").unwrap();
-        assert_eq!(s.tabs.len(), 2);
+        assert_eq!(s.windows[0].len(), 2);
         assert_eq!(s.pane_count(), 4);
-        let t = &s.tabs[0];
+        let t = &s.windows[0][0];
         assert_eq!(t.name.as_deref(), Some("code"));
         assert!(t.focus);
-        let NodeSpec::Split { axis: Axis::X, ratio: Some(r), children } = &t.root else { panic!("{t:?}") };
+        let NodeSpec::Split { axis: Axis::X, ratio: Some(r), children, .. } = &t.root else { panic!("{t:?}") };
         assert!((r - 0.65).abs() < 1e-6);
         let NodeSpec::Pane(nvim) = &children[0] else { panic!() };
         assert_eq!(nvim.cmd, Some(Cmd::Shell("nvim".into())));
@@ -498,9 +675,9 @@ mod tests {
         let NodeSpec::Pane(ls) = &inner[1] else { panic!() };
         assert_eq!(ls.run.as_deref(), Some("ls"));
         assert_eq!(ls.cwd.as_deref(), Some(Path::new("/src/app/sub")));
-        let NodeSpec::Pane(logs) = &s.tabs[1].root else { panic!() };
+        let NodeSpec::Pane(logs) = &s.windows[0][1].root else { panic!() };
         assert_eq!(logs.cmd.as_ref().unwrap().argv()[1..], ["-c".to_string(), "journalctl -f".into()]);
-        assert_eq!(s.tabs[1].name.as_deref(), Some("logs"));
+        assert_eq!(s.windows[0][1].name.as_deref(), Some("logs"));
         assert_eq!(logs.name, None);
     }
 
@@ -513,9 +690,28 @@ mod tests {
         session.clean = Some(false);
         // In a one-pane tab, `cwd` is both the tab's and the pane's.
         let odd = PathBuf::from("/tmp/a \"b\"\n");
-        session.tabs[1].cwd = Some(odd.clone());
-        session.tabs[1].root = NodeSpec::Pane(PaneSpec { cwd: Some(odd), ..PaneSpec::default() });
+        session.windows[0][1].cwd = Some(odd.clone());
+        session.windows[0][1].root = NodeSpec::Pane(PaneSpec { cwd: Some(odd), ..PaneSpec::default() });
         assert_eq!(parse(&to_lua(&session), "s").unwrap(), session);
+        // Several windows, floats and stacks.
+        let mut multi = session.clone();
+        let mut extra = s.windows[0].clone();
+        extra[0].floating = vec![
+            // Floats inherit the tab's cwd.
+            FloatSpec { pane: PaneSpec { run: Some("htop".into()), cwd: Some("/src/app".into()), ..PaneSpec::default() }, geometry: Some((3, 2, 40, 10)) },
+            FloatSpec { pane: PaneSpec { cwd: Some("/src/app".into()), ..PaneSpec::default() }, geometry: None },
+        ];
+        extra[0].show_floating = true;
+        extra[1].root = NodeSpec::Split {
+            axis: Axis::Y,
+            ratio: None,
+            stacked: true,
+            children: vec![NodeSpec::Pane(PaneSpec::default()), NodeSpec::Pane(PaneSpec { focus: true, ..PaneSpec::default() })],
+        };
+        multi.windows.push(extra);
+        let src = to_lua(&multi);
+        assert!(src.contains("windows = {"), "{src}");
+        assert_eq!(parse(&src, "m").unwrap(), multi, "{src}");
     }
 
     #[test]
@@ -531,6 +727,11 @@ mod tests {
             ("return { tabs = { { split = 'vertical', {}, { comand = 'x' } } } }", "tabs[1][2]: unknown key `comand`"),
             ("return { tabs = { { plugin = 'files' } } }", "plugin"),
             ("return { tabz = {} }", "unknown key `tabz`"),
+            ("return { tabs = { { split = 'vertical', stacked = true, {}, { split = 'vertical', {}, {} } } } }", "must be panes"),
+            ("return { tabs = { { floating = { { x = 1 } } } } }", "x, y, width and height"),
+            ("return { tabs = { { floating = { { split = 'vertical', {}, {} } } } } }", "cannot be split"),
+            ("return { windows = { { tabs = {} } } }", "no tabs"),
+            ("return { tabs = { {} }, windows = { { tabs = { {} } } } }", "either"),
         ] {
             let e = parse(src, "t.lua").unwrap_err();
             assert!(e.contains(want), "{src}: {e}");
@@ -541,7 +742,7 @@ mod tests {
     fn tree_conversion() {
         let s = parse("return { tabs = { { split = 'vertical', {}, { focus = true }, {} } } }", "t").unwrap();
         let mut next = 0;
-        let (node, focus) = s.tabs[0]
+        let (node, focus) = s.windows[0][0]
             .root
             .to_node(&mut |_| -> Result<PaneId, ()> {
                 next += 1;

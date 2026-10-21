@@ -95,6 +95,12 @@ pub struct PaneFrame<'a> {
     /// Viewport rows hidden at the top: the grid is drawn this many rows
     /// higher, so its last row clears an overlay at the bottom.
     pub skip: usize,
+    /// Drawn over the tiled panes, in its own layer.
+    pub floating: bool,
+    /// Floating panes: the frame, drawn under the grid.
+    pub backdrop: Vec<([f32; 4], Rgb)>,
+    /// Floating panes: frame text, drawn over the grid.
+    pub labels: Vec<Label>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,7 +151,10 @@ pub struct FrameInfo<'a> {
     pub cursor_blink_off: bool,
     /// Shape runs of text so fonts can apply ligatures.
     pub ligatures: bool,
-    /// Solid chrome rectangles (x, y, w, h), drawn over the grids.
+    /// Dividers and title rows of tiled panes (under the floating panes).
+    pub tiled_rects: Vec<([f32; 4], Rgb)>,
+    pub tiled_labels: Vec<Label>,
+    /// Solid chrome rectangles (x, y, w, h), drawn over everything.
     pub rects: Vec<([f32; 4], Rgb)>,
     /// Chrome text, drawn over `rects`.
     pub labels: Vec<Label>,
@@ -188,6 +197,8 @@ pub struct Renderer {
     scratch: Vec<Instance>,
     /// Glyphs drawn after backgrounds.
     fg: Vec<Instance>,
+    /// Finished layers, in drawing order.
+    out: Vec<Instance>,
     pub adapter_info: String,
     /// An atlas filled up mid-frame: draw again so every glyph is valid.
     pub redraw_needed: bool,
@@ -372,6 +383,7 @@ impl Renderer {
             glyphs: HashMap::new(),
             scratch: Vec::new(),
             fg: Vec::new(),
+            out: Vec::new(),
             adapter_info,
             redraw_needed: false,
         })
@@ -519,9 +531,10 @@ impl Renderer {
         let bg_default = info.theme.bg;
         self.scratch.clear();
         self.fg.clear();
+        self.out.clear();
         self.build(fonts, info, m);
-        let mut all = std::mem::take(&mut self.scratch);
-        all.append(&mut self.fg);
+        self.flush_layer();
+        let mut all = std::mem::take(&mut self.out);
         if all.len() > self.capacity {
             self.capacity = all.len().next_power_of_two();
             self.instances = Self::instance_buffer(&self.device, self.capacity);
@@ -565,7 +578,7 @@ impl Renderer {
             }
         }
         all.clear();
-        self.scratch = all;
+        self.out = all;
         enc.finish()
     }
 
@@ -574,21 +587,45 @@ impl Renderer {
     }
 
     /// Build all instances: grids, then chrome, then the overlay.
-    fn build(&mut self, fonts: &mut Fonts, info: &FrameInfo, m: Metrics) {
-        for p in &info.panes {
-            self.build_pane(fonts, p, info, m);
-        }
+    /// Backgrounds, then glyphs of what was built so far, become one layer
+    /// over the previous ones.
+    fn flush_layer(&mut self) {
+        self.out.append(&mut self.scratch);
+        self.out.append(&mut self.fg);
+    }
+
+    fn chrome(&mut self, fonts: &mut Fonts, rects: &[([f32; 4], Rgb)], labels: &[Label], m: Metrics) {
         let cw = m.cell_w as f32;
-        for &([x, y, w, h], c) in &info.rects {
+        for &([x, y, w, h], c) in rects {
             self.fg.push(solid(x, y, w, h, rgba(c, 1.0)));
         }
-        for l in &info.labels {
+        for l in labels {
             if let Some(bg) = l.bg {
                 self.fg.push(solid(l.x, l.y, l.cols as f32 * cw, m.cell_h as f32, rgba(bg, 1.0)));
             }
             let style = if l.bold { BOLD } else { 0 };
             self.text_line(fonts, &l.text, l.x, l.y, l.cols, style, rgba(l.fg, 1.0), m, cw);
         }
+    }
+
+    /// Tiled panes, their chrome, floating panes (each its own layer, with
+    /// its frame), the window chrome, and the overlay.
+    fn build(&mut self, fonts: &mut Fonts, info: &FrameInfo, m: Metrics) {
+        for p in info.panes.iter().filter(|p| !p.floating) {
+            self.build_pane(fonts, p, info, m);
+        }
+        self.chrome(fonts, &info.tiled_rects, &info.tiled_labels, m);
+        self.flush_layer();
+        for p in info.panes.iter().filter(|p| p.floating) {
+            for &([x, y, w, h], c) in &p.backdrop {
+                self.scratch.push(solid(x, y, w, h, rgba(c, 1.0)));
+            }
+            self.build_pane(fonts, p, info, m);
+            self.chrome(fonts, &[], &p.labels, m);
+            self.flush_layer();
+        }
+        self.chrome(fonts, &info.rects, &info.labels, m);
+        self.flush_layer();
         if let Some(o) = &info.overlay {
             self.build_overlay(fonts, o, info, m);
         }

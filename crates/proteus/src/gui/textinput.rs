@@ -15,6 +15,8 @@ pub enum Purpose {
     RenamePane(PaneId),
     SaveLayout,
     LoadLayout,
+    /// Run an action by name.
+    Palette,
 }
 
 impl Purpose {
@@ -25,6 +27,7 @@ impl Purpose {
             Purpose::RenamePane(_) => "RENAME PANE",
             Purpose::SaveLayout => "SAVE LAYOUT",
             Purpose::LoadLayout => "LOAD LAYOUT",
+            Purpose::Palette => "ACTION",
         }
     }
 }
@@ -39,6 +42,8 @@ pub struct Input {
     pub regex: bool,
     /// Shown after the text (match count, error, choices).
     pub status: String,
+    /// Palette: the highlighted entry among the matches.
+    pub choice: usize,
 }
 
 /// Result of a key press in the input.
@@ -50,11 +55,15 @@ pub enum Edit {
     Moved,
     Submit,
     Cancel,
+    /// Up / Shift+Tab: previous choice.
+    Prev,
+    /// Down / Tab: next choice.
+    Next,
 }
 
 impl Input {
     pub fn new(purpose: Purpose, text: &str) -> Self {
-        Self { purpose, text: text.to_string(), cursor: text.len(), regex: false, status: String::new() }
+        Self { purpose, text: text.to_string(), cursor: text.len(), regex: false, status: String::new(), choice: 0 }
     }
 
     fn prev_boundary(&self) -> usize {
@@ -77,6 +86,9 @@ impl Input {
         let ctrl = m == Mods::CTRL;
         match key {
             Key::Enter => Edit::Submit,
+            Key::Up => Edit::Prev,
+            Key::Tab if m == Mods::SHIFT => Edit::Prev,
+            Key::Down | Key::Tab => Edit::Next,
             Key::Escape => Edit::Cancel,
             Key::Char('c' | 'g') if ctrl => Edit::Cancel,
             Key::Backspace if self.cursor > 0 => {
@@ -137,6 +149,24 @@ impl Input {
     }
 }
 
+/// Action names matching a palette query: every word of the query must
+/// appear; earlier and tighter matches first.
+pub fn palette_matches<'a>(names: &'a [String], query: &str) -> Vec<&'a str> {
+    let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    let mut hits: Vec<(usize, &str)> = names
+        .iter()
+        .filter_map(|n| {
+            let mut score = 0;
+            for w in &words {
+                score += n.find(w.as_str())?;
+            }
+            Some((score * 100 + n.len(), n.as_str()))
+        })
+        .collect();
+    hits.sort();
+    hits.into_iter().map(|h| h.1).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,10 +194,20 @@ mod tests {
         assert_eq!(i.key(Key::Char('x'), Mods::ALT, "x"), Edit::Moved);
         assert_eq!(i.key(Key::Enter, n, "\r"), Edit::Submit);
         assert_eq!(i.key(Key::Escape, n, ""), Edit::Cancel);
+        assert_eq!(i.key(Key::Tab, n, ""), Edit::Next);
+        assert_eq!(i.key(Key::Tab, Mods::SHIFT, ""), Edit::Prev);
         let mut r = Input::new(Purpose::RenameTab(1), "abc");
         assert_eq!(r.key(Key::Char('r'), Mods::CTRL, ""), Edit::Moved);
         r.key(Key::Left, n, "");
         r.key(Key::Delete, n, "");
         assert_eq!(r.text, "ab");
+    }
+
+    #[test]
+    fn palette() {
+        let names: Vec<String> = ["pane.split_right", "pane.split_down", "tab.new", "window.new"].map(String::from).to_vec();
+        assert_eq!(palette_matches(&names, "new"), ["tab.new", "window.new"]);
+        assert_eq!(palette_matches(&names, "split dow"), ["pane.split_down"]);
+        assert_eq!(palette_matches(&names, "").len(), 4);
     }
 }
