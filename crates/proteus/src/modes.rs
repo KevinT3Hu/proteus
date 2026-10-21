@@ -243,6 +243,45 @@ const MOTIONS: [(Motion, &str); 20] = [
     (Motion::NextPrompt, "next_prompt"),
 ];
 
+/// Part of a command block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Part {
+    Command,
+    Output,
+    /// Prompt, command and output.
+    All,
+}
+
+impl Part {
+    fn key(self) -> &'static str {
+        match self {
+            Part::Command => "command",
+            Part::Output => "output",
+            Part::All => "all",
+        }
+    }
+}
+
+/// What picking a hint does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HintAction {
+    /// URLs and files: `xdg-open`; `path:line`: `$EDITOR`. Others: copy.
+    Open,
+    Copy,
+    /// Type the text at the prompt of the focused pane.
+    Insert,
+}
+
+impl HintAction {
+    pub fn key(self) -> &'static str {
+        match self {
+            HintAction::Open => "open",
+            HintAction::Copy => "copy",
+            HintAction::Insert => "insert",
+        }
+    }
+}
+
 /// Kind of keyboard selection started at the copy cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Select {
@@ -316,6 +355,19 @@ pub enum Action {
     TabToNextWindow,
     /// Run any action by name.
     Palette,
+    /// Copy part of the block at the Scroll cursor (else the last one).
+    BlockCopy(Part),
+    /// Select part of the block at the Scroll cursor.
+    BlockSelect(Part),
+    /// Fold or unfold the block's output.
+    BlockFold,
+    BlockUnfoldAll,
+    /// Run the block's command again.
+    BlockRerun,
+    /// Command, exit status, duration and directory of the block.
+    BlockInfo,
+    /// Label on-screen URLs, paths, hashes...; typing a label picks one.
+    Hints(HintAction),
 }
 
 /// Cells per resize step.
@@ -400,6 +452,13 @@ impl Action {
             Action::PaneToNewWindow => "pane.to_new_window".into(),
             Action::TabToNextWindow => "tab.to_next_window".into(),
             Action::Palette => "palette".into(),
+            Action::BlockCopy(p) => format!("block.copy_{}", p.key()),
+            Action::BlockSelect(p) => format!("block.select_{}", p.key()),
+            Action::BlockFold => "block.fold".into(),
+            Action::BlockUnfoldAll => "block.unfold_all".into(),
+            Action::BlockRerun => "block.rerun".into(),
+            Action::BlockInfo => "block.info".into(),
+            Action::Hints(h) => format!("hints.{}", h.key()),
         }
     }
 
@@ -452,6 +511,11 @@ impl Action {
             Action::TabToNextWindow,
             Action::Palette,
         ]);
+        const PARTS: [Part; 3] = [Part::Command, Part::Output, Part::All];
+        v.extend(PARTS.map(Action::BlockCopy));
+        v.extend(PARTS.map(Action::BlockSelect));
+        v.extend([Action::BlockFold, Action::BlockUnfoldAll, Action::BlockRerun, Action::BlockInfo]);
+        v.extend([HintAction::Open, HintAction::Copy, HintAction::Insert].map(Action::Hints));
         v
     }
 
@@ -523,6 +587,14 @@ impl Action {
             Action::TabToNextWindow => "to next window",
             Action::Palette if mode.passes_keys() => return None,
             Action::Palette => "palette",
+            Action::BlockCopy(_) => "copy block",
+            Action::BlockSelect(_) => "select block",
+            Action::BlockFold => "fold",
+            Action::BlockUnfoldAll => return None,
+            Action::BlockRerun => "rerun",
+            Action::BlockInfo => "info",
+            Action::Hints(_) if mode.passes_keys() => return None,
+            Action::Hints(_) => "hints",
         })
     }
 }
@@ -640,6 +712,7 @@ fn quick_keys(t: &mut Table) {
 fn window_keys(t: &mut Table) {
     bind(t, &["ctrl+shift+p"], Action::Palette);
     bind(t, &["ctrl+shift+n"], Action::NewWindow);
+    bind(t, &["ctrl+shift+e"], Action::Hints(HintAction::Open));
 }
 
 /// tmux's prefix table (in the Menu mode; one key, then back to Normal).
@@ -745,6 +818,17 @@ fn mode_table(mode: Mode) -> Table {
             bind(&mut t, &["L"], c(Motion::ScreenBottom));
             bind(&mut t, &["["], c(Motion::PrevPrompt));
             bind(&mut t, &["]"], c(Motion::NextPrompt));
+            bind(&mut t, &["c"], Action::BlockCopy(Part::Command));
+            bind(&mut t, &["o"], Action::BlockCopy(Part::Output));
+            bind(&mut t, &["a"], Action::BlockCopy(Part::All));
+            bind(&mut t, &["C"], Action::BlockSelect(Part::Command));
+            bind(&mut t, &["O"], Action::BlockSelect(Part::Output));
+            bind(&mut t, &["A"], Action::BlockSelect(Part::All));
+            bind(&mut t, &["z"], Action::BlockFold);
+            bind(&mut t, &["Z"], Action::BlockUnfoldAll);
+            bind(&mut t, &["r"], Action::BlockRerun);
+            bind(&mut t, &["i"], Action::BlockInfo);
+            bind(&mut t, &["f"], Action::Hints(HintAction::Open));
             bind(&mut t, &["ctrl+e"], s(Scroll::Lines(1)));
             bind(&mut t, &["ctrl+y"], s(Scroll::Lines(-1)));
             bind(&mut t, &["esc"], Action::CopyEscape);
@@ -885,11 +969,31 @@ impl Keymap {
         match action {
             Action::Mode(m) => m,
             Action::CopyYank => Mode::Normal,
+            Action::BlockRerun if mode == Mode::Scroll => Mode::Normal,
             _ if mode.passes_keys() => mode,
             _ if mode == Mode::Menu => Mode::Normal,
             _ if self.sticky || mode.repeatable() => mode,
             _ => Mode::Normal,
         }
+    }
+
+    /// Keys that run `a` from Normal mode: `alt+n`, `ctrl+p r`, `ctrl+b c`.
+    pub fn key_path(&self, a: Action) -> Option<String> {
+        let find = |m: Mode, a: Action| self.bindings(m).iter().find(|x| x.1 == a).map(|x| x.0.label());
+        if let Some(k) = find(Mode::Normal, a) {
+            return Some(k);
+        }
+        let menu = find(Mode::Normal, Action::Mode(Mode::Menu));
+        let entry = |m: Mode| -> Option<String> {
+            if let Some(k) = find(Mode::Normal, Action::Mode(m)) {
+                return Some(k);
+            }
+            if m == Mode::Menu {
+                return menu.clone();
+            }
+            Some(format!("{} {}", menu.clone()?, find(Mode::Menu, Action::Mode(m))?))
+        };
+        MODES.into_iter().filter(|m| !m.passes_keys()).find_map(|m| Some(format!("{} {}", entry(m)?, find(m, a)?)))
     }
 
     /// Hint bar entries for `mode`: (keys, label). Bindings with the same
@@ -994,6 +1098,14 @@ mod tests {
         assert_eq!(k.after(Mode::Scroll, Action::CopyYank), Mode::Normal);
         assert_eq!(k.lookup(Mode::Normal, ch('o'), Mods::CTRL), Lookup::Do(Action::Mode(Mode::Session)));
         assert_eq!(k.lookup(Mode::Tab, ch('r'), NONE), Lookup::Do(Action::RenameTab));
+        assert_eq!(k.lookup(Mode::Scroll, ch('o'), NONE), Lookup::Do(Action::BlockCopy(Part::Output)));
+        assert_eq!(k.lookup(Mode::Scroll, ch('o'), Mods::SHIFT), Lookup::Do(Action::BlockSelect(Part::Output)));
+        assert_eq!(k.lookup(Mode::Scroll, ch('z'), NONE), Lookup::Do(Action::BlockFold));
+        assert_eq!(k.after(Mode::Scroll, Action::BlockRerun), Mode::Normal);
+        assert_eq!(k.after(Mode::Scroll, Action::BlockCopy(Part::All)), Mode::Scroll);
+        let e = Lookup::Do(Action::Hints(HintAction::Open));
+        assert_eq!(k.lookup(Mode::Normal, ch('e'), Mods::CTRL | Mods::SHIFT), e);
+        assert_eq!(k.lookup(Mode::Scroll, ch('f'), NONE), e);
     }
 
     #[test]
@@ -1092,6 +1204,11 @@ mod tests {
             }
         }
         assert_eq!(Action::from_name("tab.goto_12"), Some(Action::GotoTab(11)));
+        assert_eq!(km(Preset::Zellij).key_path(Action::NewTab), Some("alt+t".into()));
+        assert_eq!(km(Preset::Zellij).key_path(Action::Split(Axis::X)), Some("ctrl+p r".into()));
+        assert_eq!(km(Preset::Leader).key_path(Action::Equalize), Some("ctrl+g r =".into()));
+        assert_eq!(km(Preset::Tmux).key_path(Action::Split(Axis::X)), Some("ctrl+b %".into()));
+        assert_eq!(km(Preset::Tmux).key_path(Action::NewWindow), Some("ctrl+shift+n".into()));
         assert_eq!(Action::from_name("nope"), None);
     }
 }

@@ -5,13 +5,17 @@
 //! reader thread, and timers. Frames are drawn only when something changed
 //! and only after the compositor's frame callback (no busy loop).
 
+mod blocks;
 mod chrome;
 mod copy;
 mod font;
+mod hint;
 mod ime;
 mod keys;
+mod notify;
 mod pane;
 mod render;
+mod rows;
 mod scroll;
 mod textinput;
 mod workspace;
@@ -33,6 +37,7 @@ use raw_window_handle::{
     DisplayHandle, HandleError, HasDisplayHandle, RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle,
     WaylandWindowHandle,
 };
+use smithay_client_toolkit::activation::{ActivationHandler, ActivationState, RequestData};
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, FrameCallbackData};
 use smithay_client_toolkit::data_device_manager::data_device::{DataDevice, DataDeviceHandler};
 use smithay_client_toolkit::data_device_manager::data_offer::{DataOfferHandler, DragOffer};
@@ -91,6 +96,9 @@ use pane::Pane;
 use render::{FrameInfo, Overlay, PaneFrame, Renderer, Theme};
 
 const APP_ID: &str = "dev.proteus.Proteus";
+const APP_NAME: &str = "Proteus";
+/// How long the visual bell tints a pane.
+const FLASH: Duration = Duration::from_millis(120);
 const MIMES: [&str; 4] = ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain", "STRING"];
 /// Padding around the grid, logical pixels.
 const PAD: f64 = 4.0;
@@ -132,6 +140,9 @@ pub(crate) enum Msg {
     Pty(PaneId, Vec<u8>),
     PtyClosed(PaneId),
     Clipboard(ClipTarget, String),
+    /// A desktop notification about this pane was clicked (with an
+    /// xdg-activation token, if the daemon sent one).
+    NotifyActivated(PaneId, Option<String>),
 }
 
 /// Lets wgpu's GL backend reach the Wayland display.
@@ -211,6 +222,8 @@ struct PanePart {
     floating: bool,
     backdrop: Vec<([f32; 4], proteus_core::color::Rgb)>,
     labels: Vec<render::Label>,
+    rows: rows::Rows,
+    flash: bool,
 }
 
 /// Frame description without borrows of the panes (see [`App::draw`]).
@@ -238,6 +251,8 @@ impl FrameParts {
                     floating: p.floating,
                     backdrop: p.backdrop,
                     labels: p.labels,
+                    rows: p.rows,
+                    flash: p.flash,
                 })
             })
             .collect();
@@ -283,6 +298,10 @@ struct Win {
     mouse: Mouse,
     /// A divider is being dragged: PTY resizes wait for the release.
     defer_pty_resize: bool,
+    /// Block whose gutter mark the pointer is over.
+    hover: Option<(PaneId, proteus_core::blocks::BlockId)>,
+    /// Hint mode: labels are shown and keys pick one.
+    hints: Option<hint::HintState>,
 }
 
 /// A tab being dragged to another window (Wayland drag and drop).
@@ -343,6 +362,11 @@ struct App {
     /// The timer delivering layouts' `run` lines is active.
     run_timer: bool,
     tab_dnd: Option<TabDnd>,
+    notifier: notify::Notifier,
+    activation: Option<ActivationState>,
+    hint_patterns: Vec<proteus_core::hints::HintPattern>,
+    /// Palette entries used recently, most recent first.
+    recent: Vec<String>,
 
     keyboard: Option<WlKeyboard>,
     pointer: Option<ThemedPointer>,
@@ -434,6 +458,8 @@ fn make_win(
         window_title: String::new(),
         mouse: Mouse::default(),
         defer_pty_resize: false,
+        hover: None,
+        hints: None,
     })
 }
 
@@ -489,10 +515,14 @@ pub fn run(
             channel::Event::Msg(Msg::Pty(id, bytes)) => app.pty_output(id, &bytes),
             channel::Event::Msg(Msg::PtyClosed(id)) => app.close_pane(id),
             channel::Event::Msg(Msg::Clipboard(target, text)) => app.clipboard_received(target, text),
+            channel::Event::Msg(Msg::NotifyActivated(pane, token)) => app.notification_clicked(pane, token),
             channel::Event::Closed => app.exit = true,
         })
         .map_err(|e| err(e.to_string()))?;
 
+    let notifier = notify::Notifier::new(sender.clone());
+    let activation = ActivationState::bind(&globals, &qh).ok();
+    let hint_patterns = hint::patterns(&cfg.hint_patterns);
     let mut app = App {
         w: first,
         parked: Vec::new(),
@@ -529,6 +559,10 @@ pub fn run(
         quit_requested: false,
         run_timer: false,
         tab_dnd: None,
+        notifier,
+        activation,
+        hint_patterns,
+        recent: scroll::load_recent(),
         keyboard: None,
         pointer: None,
         data_device: None,
@@ -802,7 +836,7 @@ impl App {
     }
 
     fn hint_bar_visible(&self) -> bool {
-        if self.w.input.is_some() {
+        if self.w.input.is_some() || self.w.hints.is_some() {
             return true;
         }
         match self.cfg.hint_bar {
@@ -825,7 +859,9 @@ impl App {
         if self.cfg.hint_bar == HintBar::Always {
             bottom -= ch + p;
         }
-        Rect::new(p, top, (pw as i32 - 2 * p).max(1), (bottom - top).max(1))
+        // The block gutter of the leftmost panes lives in the padding.
+        let left = p.max(self.gutter_px() + 1);
+        Rect::new(left, top, (pw as i32 - left - p).max(1), (bottom - top).max(1))
     }
 
     /// Visible panes of the active tab.
@@ -940,23 +976,24 @@ impl App {
         if t.lines() < 2 || r.y + t.lines() as i32 * ch <= bar {
             return 0;
         }
-        let top = t.grid().viewport_line(0);
-        let last = top + t.lines() as u64 - 1;
-        let at_last = |l: u64| l == last;
+        let rows = rows::Rows::of(t);
+        let last = t.lines() - 1;
+        let at_last = |l: u64| rows.row_of(l) == Some(last);
         let cursor = self.w.copy.as_ref().filter(|c| c.pane == id).is_some_and(|c| at_last(c.cursor.line));
         let current = self
             .w
             .search
             .as_ref()
-            .filter(|s| s.pane == id)
             .and_then(|s| s.matches.get(s.current?))
-            .is_some_and(|m| at_last(m.start.line) || at_last(m.end.line));
+            .filter(|(p, _)| *p == id)
+            .is_some_and(|(_, m)| at_last(m.start.line) || at_last(m.end.line));
         usize::from(cursor || (current && self.w.input.is_some()))
     }
 
     fn point_in(&self, id: PaneId, pos: (f64, f64)) -> Option<Point> {
         let (col, row, _) = self.cell_in(id, pos)?;
-        Some(Point::new(self.panes[&id].term.grid().viewport_line(row), col))
+        let rows = rows::Rows::of(&self.panes.get(&id)?.term);
+        Some(Point::new(rows.line(row).or_else(|| rows.last_line())?, col))
     }
 
     // --- drawing -------------------------------------------------------------
@@ -978,10 +1015,12 @@ impl App {
             .map(|t| {
                 let title = t.name.as_deref().unwrap_or_else(|| self.panes.get(&t.focus).map_or("", |p| p.title()));
                 let n = t.panes().len();
+                // A bell rang in one of its panes.
+                let bell = if t.panes().iter().any(|id| self.panes.get(id).is_some_and(|p| p.bell)) { "• " } else { "" };
                 match (n, t.zoomed) {
-                    (1, _) => title.to_string(),
-                    (n, true) => format!("{title} [{n}, zoom]"),
-                    (n, false) => format!("{title} [{n}]"),
+                    (1, _) => format!("{bell}{title}"),
+                    (n, true) => format!("{bell}{title} [{n}, zoom]"),
+                    (n, false) => format!("{bell}{title} [{n}]"),
                 }
             })
             .collect();
@@ -989,27 +1028,36 @@ impl App {
         chrome::tab_bar(&titles, self.w.active, p, p, cols, cw, theme)
     }
 
-    fn pane_part(&self, id: PaneId, r: Rect, fid: PaneId, floating: bool) -> PanePart {
+    fn pane_part(&self, id: PaneId, r: Rect, fid: PaneId, floating: bool, theme: &Theme) -> PanePart {
         let focused = id == fid;
         let preedit = self.ime.as_ref().and_then(|i| i.preedit.clone());
+        let pane = self.panes.get(&id);
+        let rows = pane.map_or(rows::Rows(Vec::new()), |p| rows::Rows::of(&p.term));
+        let skip = self.row_skip(id);
+        let mut marks = self.search_marks(id);
+        marks.extend(self.hint_marks(id));
         PanePart {
             id,
             x: r.x as f32,
             y: r.y as f32,
             focused: focused && self.w.focused,
-            preedit: if focused && self.w.input.is_none() { preedit } else { None },
+            preedit: if focused && self.w.input.is_none() && self.w.hints.is_none() { preedit } else { None },
             copy_cursor: self.copy_cursor_cell(id),
-            marks: self.search_marks(id),
-            skip: self.row_skip(id),
+            marks,
+            skip,
             floating,
-            backdrop: Vec::new(),
+            backdrop: self.gutter_marks(id, r, &rows, skip, theme),
             labels: Vec::new(),
+            rows,
+            flash: pane.and_then(|p| p.flash_until).is_some_and(|t| Instant::now() < t),
         }
     }
 
     /// Title text of a pane's title row: name, and the mode on the focused one.
     fn title_text(&self, id: PaneId, focused: bool) -> String {
-        let t = self.panes.get(&id).map_or("", |p| p.title());
+        let p = self.panes.get(&id);
+        let t = p.map_or("", |p| p.title());
+        let t = if p.is_some_and(|p| p.bell) { format!("• {t}") } else { t.to_string() };
         if focused && self.w.mode != Mode::Normal {
             format!(" {t}  [{}]", self.w.mode.name())
         } else {
@@ -1028,7 +1076,7 @@ impl App {
         let p = self.pad() as f32;
         let thick = (self.w.scale.round() as f32).max(1.0);
         let float_focus = self.w.tabs[self.w.active].focus_is_float();
-        let mut panes: Vec<PanePart> = view.panes.iter().map(|&(id, r)| self.pane_part(id, r, fid, false)).collect();
+        let mut panes: Vec<PanePart> = view.panes.iter().map(|&(id, r)| self.pane_part(id, r, fid, false, &theme)).collect();
 
         // Tiled chrome: dividers, the focused pane's accent, title rows.
         let mut tiled_rects = Vec::new();
@@ -1091,18 +1139,20 @@ impl App {
         // Floating panes, each with its frame.
         for f in &view.floats {
             let on = f.id == fid;
-            let mut part = self.pane_part(f.id, f.content, fid, true);
+            let mut part = self.pane_part(f.id, f.content, fid, true, &theme);
             let bg = self.panes.get(&f.id).map_or(theme.bg, |p| p.term.palette().background());
             let line = if on { theme.accent } else { theme.dim };
             let o = f.outer;
             let (x, y, w, h) = (o.x as f32, o.y as f32, o.w as f32, o.h as f32);
-            part.backdrop = vec![
+            let mut frame = vec![
                 ([x, y, w, h], bg),
                 ([x, f.title.y as f32, w, ch], if on { theme.accent } else { theme.bar }),
                 ([x, y, thick, h], line),
                 ([x + w - thick, y, thick, h], line),
                 ([x, y + h - thick, w, thick], line),
             ];
+            frame.append(&mut part.backdrop);
+            part.backdrop = frame;
             let cols = (f.title.w as f32 / cw).max(1.0) as usize;
             part.labels.push(render::Label {
                 x: f.title.x as f32,
@@ -1133,6 +1183,15 @@ impl App {
                 let (l, x) = chrome::input_bar(i.purpose.badge(), &i.text, caret_cols, &i.status, p, y, cols, cw, &theme);
                 labels.extend(l);
                 rects.push(([x, y, (cw / 8.0).round().max(1.0), ch], theme.fg));
+            } else if let Some(h) = &self.w.hints {
+                let hints = vec![
+                    ("a-z".to_string(), h.action.key()),
+                    ("shift".to_string(), "copy"),
+                    ("ctrl".to_string(), "insert"),
+                    ("bksp".to_string(), "undo"),
+                    ("esc".to_string(), "cancel"),
+                ];
+                labels.extend(chrome::hint_bar(&format!("HINTS {}", h.items.len()), &hints, p, y, cols, cw, &theme));
             } else {
                 let mut name = self.w.mode.name().to_string();
                 if self.w.tabs[self.w.active].zoomed {
@@ -1144,6 +1203,9 @@ impl App {
                 labels.extend(chrome::hint_bar(&name, &self.keymap.hints(self.w.mode), p, y, cols, cw, &theme));
             }
         }
+
+        labels.extend(self.hint_labels(&theme));
+        labels.extend(self.hover_label(&theme));
 
         FrameParts {
             panes,
@@ -1203,7 +1265,9 @@ impl App {
         let (cw, ch) = self.cell();
         let Some(r) = self.view().rect(self.focused_id()) else { return };
         let t = &self.focused_pane().term;
-        let (cols, x, y) = (t.cols(), t.cursor().x, t.cursor().y);
+        let (cols, x) = (t.cols(), t.cursor().x);
+        let skip = self.row_skip(self.focused_id());
+        let y = rows::Rows::of(t).row_of(t.grid().abs_line(t.cursor().y)).unwrap_or(t.cursor().y).saturating_sub(skip);
         let s = self.w.scale;
         let Some(ime) = self.ime.as_mut() else { return };
         let col = match &ime.preedit {
@@ -1279,6 +1343,13 @@ impl App {
         if std::mem::take(&mut self.w.renderer.redraw_needed) {
             self.w.dirty = true;
         }
+        // Animations: the spinner of running commands, the visual bell.
+        let flash_end = visible.iter().filter_map(|id| self.panes.get(id)?.flash_until).max();
+        match flash_end {
+            Some(t) if t > Instant::now() => self.schedule(t - Instant::now()),
+            _ if self.spinner_visible() => self.schedule(blocks::SPINNER),
+            _ => {}
+        }
         self.update_ime_rect();
     }
 
@@ -1311,9 +1382,15 @@ impl App {
     /// Split the focused pane (`None`: along its longer side). With a
     /// floating pane focused, `None` opens another floating pane.
     fn split(&mut self, axis: Option<Axis>) {
+        self.split_with(axis, None, None);
+    }
+
+    /// Split, running `command` (else the shell) in `cwd` (else the
+    /// focused pane's directory).
+    fn split_with(&mut self, axis: Option<Axis>, cwd: Option<PathBuf>, command: Option<Vec<OsString>>) {
         let (area, m) = (self.area(), self.layout_metrics());
         let tab = &self.w.tabs[self.w.active];
-        if axis.is_none() && tab.focus_is_float() {
+        if axis.is_none() && tab.focus_is_float() && command.is_none() {
             return self.new_floating();
         }
         let id = tab.last_tiled;
@@ -1328,11 +1405,13 @@ impl App {
             Axis::X => (cols / 2, rows),
             Axis::Y => (cols, rows / 2),
         };
-        let cwd = self.focused_pane().cwd(&self.hostname);
-        match self.spawn_pane(c as u16, rw as u16, cwd, None) {
+        let cwd = cwd.or_else(|| self.focused_pane().cwd(&self.hostname));
+        let old = self.focused_id();
+        match self.spawn_pane(c as u16, rw as u16, cwd, command) {
             Ok(new) => {
                 self.w.tabs[self.w.active].split(new, axis);
                 self.relayout();
+                self.after_focus(old);
             }
             Err(e) => self.notice(format!("cannot start shell: {e}")),
         }
@@ -1590,6 +1669,14 @@ impl App {
     /// focused before): focus reports, window title, cursor.
     fn after_focus(&mut self, old: PaneId) {
         let new = self.focused_id();
+        if new != old {
+            self.w.hints = None;
+        }
+        if self.w.focused
+            && let Some(p) = self.panes.get_mut(&new)
+        {
+            p.bell = false;
+        }
         if self.w.copy.as_ref().is_some_and(|c| c.pane != new) || (self.w.mode == Mode::Scroll && self.w.copy.is_none()) {
             self.set_mode(Mode::Normal);
         }
@@ -1744,6 +1831,13 @@ impl App {
                 self.move_tab(from, old, next, None);
             }
             Action::Palette => self.open_palette(),
+            Action::BlockCopy(p) => self.block_copy(p),
+            Action::BlockSelect(p) => self.block_select(p),
+            Action::BlockFold => self.block_fold(),
+            Action::BlockUnfoldAll => self.unfold_all(),
+            Action::BlockRerun => self.block_rerun(),
+            Action::BlockInfo => self.block_info(),
+            Action::Hints(h) => self.hints_start(h),
         }
         if !self.exit {
             self.after_focus(old);
@@ -1771,14 +1865,28 @@ impl App {
     /// actions once the window is up (`PROTEUS_ACTIONS_AFTER=secs` waits
     /// first). `type:TEXT` types into the input line (or the pane),
     /// `key:enter` / `key:esc` press a key in the input line, `key:y`
-    /// answers a prompt.
+    /// answers a prompt, `key:X` types X in hint mode, `sleep:SECS` waits.
     fn run_env_actions(&mut self) {
         let Ok(list) = std::env::var("PROTEUS_ACTIONS") else { return };
         let after = std::env::var("PROTEUS_ACTIONS_AFTER").ok().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+        let steps: Vec<String> = list.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
+        self.run_env_steps(steps, after);
+    }
+
+    fn run_env_steps(&mut self, steps: Vec<String>, after: f64) {
         let run = move |app: &mut App| {
             // The first window, whichever was drawn last.
             app.activate(1);
-            for name in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            for (i, name) in steps.iter().enumerate() {
+                let name = name.as_str();
+                if let Some(secs) = name.strip_prefix("sleep:").and_then(|s| s.parse::<f64>().ok()) {
+                    app.run_env_steps(steps[i + 1..].to_vec(), secs.max(0.001));
+                    return;
+                }
+                if let Some(c) = name.strip_prefix("key:").filter(|_| app.w.hints.is_some()).and_then(|k| k.chars().next()) {
+                    app.hint_key(input::Key::Char(c), input::Mods::empty());
+                    continue;
+                }
                 if let Some(text) = name.strip_prefix("type:") {
                     // `\n` stands for Enter.
                     let text = &text.replace("\\n", "\r");
@@ -1823,12 +1931,25 @@ impl App {
         if !reply.is_empty() {
             p.write(&reply);
         }
+        let events = p.term.take_events();
+        // A command started or ended: the foreground process changed.
+        if events.iter().any(|e| matches!(e, Event::PromptStarted { .. } | Event::CommandStarted { .. })) {
+            p.expire_proc_title();
+        }
         let mut title = p.refresh_proc_title();
-        for ev in p.term.take_events() {
+        for ev in events {
             match ev {
                 Event::TitleChanged(_) => title = true,
                 Event::ClipboardStore { kind, text } => self.set_selection(kind, text),
                 Event::ClipboardLoad { kind, terminator } => self.clipboard_load(id, kind, terminator),
+                Event::Bell => self.bell(id),
+                Event::Notification { title, body } => {
+                    if self.cfg.notify_osc {
+                        let summary = title.unwrap_or_else(|| self.panes.get(&id).map_or(APP_NAME, |p| p.title()).to_string());
+                        self.notifier.send(id, summary, body);
+                    }
+                }
+                Event::CommandFinished { block, exit_code, duration } => self.command_finished(id, block, exit_code, duration),
                 _ => {}
             }
         }
@@ -1841,6 +1962,97 @@ impl App {
         if focused {
             self.ensure_blink();
         }
+    }
+
+    // --- bell and notifications -----------------------------------------------
+
+    /// Window holding pane `id`, without making it current.
+    fn win_with_pane(&self, id: PaneId) -> Option<&Win> {
+        std::iter::once(&self.w).chain(&self.parked).find(|w| w.tabs.iter().any(|t| t.contains(id)))
+    }
+
+    /// Whether the user is looking at pane `id`: its window has focus and
+    /// it is the focused pane of the active tab.
+    fn pane_watched(&self, id: PaneId) -> bool {
+        self.win_with_pane(id).is_some_and(|w| w.focused && w.tabs.get(w.active).is_some_and(|t| t.focus == id))
+    }
+
+    fn bell(&mut self, id: PaneId) {
+        let watched = self.pane_watched(id);
+        let visual = self.cfg.visual_bell;
+        let Some(p) = self.panes.get_mut(&id) else { return };
+        if visual {
+            p.flash_until = Some(Instant::now() + FLASH);
+        }
+        if !watched {
+            p.bell = true;
+        }
+        self.w.dirty = true;
+    }
+
+    fn command_finished(
+        &mut self,
+        id: PaneId,
+        block: proteus_core::blocks::BlockId,
+        exit_code: Option<i32>,
+        duration: Option<Duration>,
+    ) {
+        let (Some(min), Some(d)) = (self.cfg.notify_after, duration) else { return };
+        if d < min || self.pane_watched(id) {
+            return;
+        }
+        let Some(p) = self.panes.get(&id) else { return };
+        let command = p.term.blocks().get(block).and_then(|b| b.command.clone()).filter(|c| !c.is_empty());
+        let summary = match exit_code {
+            Some(c) if c != 0 => format!("Command failed (exit {c})"),
+            _ => "Command finished".to_string(),
+        };
+        let mut body = command.map(|c| c.lines().next().unwrap_or("").to_string()).unwrap_or_default();
+        body.push_str(&format!("{}took {}", if body.is_empty() { "" } else { "\n" }, blocks::human_duration(d)));
+        self.notifier.send(id, summary, body);
+    }
+
+    /// Show pane `id`: its window, tab and focus. A window other than the
+    /// keyboard window is raised with xdg-activation (`token` from a
+    /// notification daemon, else one we request).
+    fn reveal_pane(&mut self, id: PaneId, token: Option<String>) {
+        if !self.activate_pane(id) {
+            return;
+        }
+        let old = self.focused_id();
+        if let Some(i) = self.w.tabs.iter().position(|t| t.contains(id)) {
+            self.w.active = i;
+            self.w.tabs[i].set_focus(id);
+            self.relayout();
+            self.after_focus(old);
+        }
+        let target = self.w.id;
+        match (&self.activation, token) {
+            (Some(a), Some(t)) => a.activate::<App>(self.w.window.wl_surface(), t),
+            (Some(_), None) if self.kbd_win != Some(target) => self.request_activation(target),
+            _ => {}
+        }
+        self.w.dirty = true;
+    }
+
+    /// Ask the compositor to focus window `target`, vouched for by the
+    /// window that has the keyboard.
+    fn request_activation(&mut self, target: WinId) {
+        let Some(a) = &self.activation else { return };
+        let from = self.kbd_win.and_then(|k| std::iter::once(&self.w).chain(&self.parked).find(|w| w.id == k));
+        let seat = self.seat_state.seats().next();
+        let data = RequestData {
+            app_id: Some(APP_ID.into()),
+            seat_and_serial: seat.map(|s| (s, self.serial)),
+            surface: from.map(|w| w.window.wl_surface().clone()),
+            udata: target,
+        };
+        a.request_token(&self.qh, data);
+    }
+
+    fn notification_clicked(&mut self, id: PaneId, token: Option<String>) {
+        self.reveal_pane(id, token);
+        self.activate_kbd();
     }
 
     // --- keyboard ------------------------------------------------------------
@@ -1870,6 +2082,13 @@ impl App {
             if self.w.input.is_some() {
                 self.consume(event.raw_code);
                 self.input_key(key, mods, event.utf8.as_deref().unwrap_or(""));
+                return;
+            }
+            if self.w.hints.is_some() {
+                self.consume(event.raw_code);
+                if action == KeyAction::Press {
+                    self.hint_key(key, mods);
+                }
                 return;
             }
             match self.keymap.lookup_shifted(self.w.mode, key, mods, shifted) {
@@ -2191,12 +2410,15 @@ impl App {
                 self.w.mouse.icon = None;
                 self.update_pointer_icon();
             }
-            PointerEventKind::Leave { .. } => {}
+            PointerEventKind::Leave { .. } => {
+                self.update_hover(None);
+            }
             PointerEventKind::Motion { .. } => {
                 if self.w.mouse.drag.is_some() {
                     self.drag_to(ev.position);
                     return;
                 }
+                self.update_hover(Some(ev.position));
                 self.update_pointer_icon();
                 if let Some(id) = self.w.mouse.selecting {
                     let Some(p) = self.point_in(id, ev.position) else { return };
@@ -2250,6 +2472,21 @@ impl App {
                     && let Some(d) = self.divider_at(ev.position)
                 {
                     self.w.mouse.drag = Some(Drag::Divider(d));
+                    return;
+                }
+                // A gutter mark folds its block; a fold marker unfolds.
+                if b == MouseButton::Left
+                    && let Some((id, block)) = self.gutter_hit(ev.position)
+                {
+                    self.toggle_fold(id, block);
+                    return;
+                }
+                if b == MouseButton::Left
+                    && let Some((id, row, false)) = self.row_at(ev.position)
+                    && let Some(rows::Row::Fold { block, .. }) =
+                        self.panes.get(&id).and_then(|p| rows::Rows::of(&p.term).0.get(row).copied())
+                {
+                    self.toggle_fold(id, block);
                     return;
                 }
                 let Some((id, part)) = self.hit_at(ev.position) else { return };
@@ -2436,6 +2673,7 @@ impl App {
     /// frames, an arrow over the tab bar and titles, else a text cursor.
     fn update_pointer_icon(&mut self) {
         let icon = match (self.divider_at(self.w.mouse.pos), self.hit_at(self.w.mouse.pos)) {
+            _ if self.w.hover.is_some() => CursorIcon::Pointer,
             (Some(d), _) if d.axis == Axis::X => CursorIcon::ColResize,
             (Some(_), _) => CursorIcon::RowResize,
             _ if self.tab_at(self.w.mouse.pos).is_some() => CursorIcon::Default,
@@ -2614,6 +2852,7 @@ impl KeyboardHandler for App {
             self.w.dirty = true;
             self.restart_blink();
             let p = self.focused_pane_mut();
+            p.bell = false;
             if let Some(b) = input::encode_focus(true, p.term.mode()) {
                 p.write(b);
             }
@@ -2758,6 +2997,18 @@ impl PrimarySelectionSourceHandler for App {
             self.primary = None;
         }
         src.destroy();
+    }
+}
+
+impl ActivationHandler for App {
+    /// The window to activate with the token.
+    type RequestUdata = WinId;
+    fn new_token(&mut self, token: String, data: &RequestData<WinId>) {
+        if let Some(a) = &self.activation
+            && let Some(w) = std::iter::once(&self.w).chain(&self.parked).find(|w| w.id == data.udata)
+        {
+            a.activate::<App>(w.window.wl_surface(), token);
+        }
     }
 }
 

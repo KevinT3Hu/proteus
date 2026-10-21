@@ -31,6 +31,8 @@ pollster.workspace = true
 bytemuck.workspace = true
 swash.workspace = true
 yeslogic-fontconfig-sys.workspace = true
+zbus.workspace = true
+regex.workspace = true
 
 [dev-dependencies]
 naga = { version = "=30.0.1", features = ["wgsl-in"] }

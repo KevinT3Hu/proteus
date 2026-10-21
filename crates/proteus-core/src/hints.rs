@@ -47,12 +47,37 @@ pub struct Hint {
 pub const DEFAULT_ALPHABET: &str = "asdfghjkl";
 
 
+/// Hosts recognized as URLs without a scheme: `www.` names, names ending
+/// in a common top-level domain, `localhost[:port]`, `IPv4:port`. TLDs
+/// that are also common file extensions (`.rs`, `.sh`, `.py`, `.md`,
+/// `.cc`, `.in`, `.so`, `.app`, `.zip`...) are left out so file names stay
+/// paths.
+const BARE_HOST: &str = concat!(
+    r"www\.[\w-]+(?:\.[\w-]+)+(?::\d{1,5})?",
+    r"|(?:[A-Za-z0-9](?:[\w-]*[A-Za-z0-9])?\.)+(?i:com|org|net|edu|gov|io|dev|cn|co|me|info|xyz|tech|cloud|site|top|uk|de|jp|fr|ru|eu|us|ca|au|kr|tw|hk|nl|ch|se|it|es|br)\b(?::\d{1,5})?",
+    r"|localhost(?::\d{1,5})?\b",
+    r"|\d{1,3}(?:\.\d{1,3}){3}:\d{1,5}\b",
+);
+
+/// URL to open for a URL hint: scheme-less ones get `https://`
+/// (`http://` for localhost and IP addresses).
+pub fn url_with_scheme(text: &str) -> String {
+    if text.contains("://") {
+        return text.to_string();
+    }
+    let host = text.split([':', '/', '?', '#']).next().unwrap_or("");
+    let local = host == "localhost" || host.parse::<std::net::Ipv4Addr>().is_ok();
+    format!("{}://{text}", if local { "http" } else { "https" })
+}
+
 /// Built-in patterns in priority order: earlier patterns win on overlap.
 pub fn builtin_patterns() -> Vec<HintPattern> {
     const OCTET: &str = r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)";
     let ipv4 = format!(r"\b(?:{OCTET}\.){{3}}{OCTET}(?::\d{{1,5}})?\b");
-    let table: [(HintKind, &str); 7] = [
+    let bare = format!(r#"(?:^|[^\w@./:~-])((?:{BARE_HOST})(?:[/?#][^\s<>"'`]*)?)"#);
+    let table: [(HintKind, &str); 8] = [
         (HintKind::Url, r#"\b(?:https?|ftp|file|ssh|git)://[^\s<>"'`]+"#),
+        (HintKind::Url, &bare),
         (HintKind::Uuid, r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"),
         (HintKind::Ipv4, &ipv4),
         (
@@ -87,7 +112,8 @@ fn refine(kind: &HintKind, s: &str, range: Range<usize>) -> Option<Range<usize>>
                     break;
                 }
             }
-            (end > t.find("://")? + 3).then(|| range.start..range.start + end)
+            let min = t.find("://").map_or(0, |i| i + 3);
+            (end > min).then(|| range.start..range.start + end)
         }
         HintKind::GitHash => {
             let ok = t.bytes().any(|b| b.is_ascii_digit()) && t.bytes().any(|b| b.is_ascii_alphabetic());
@@ -191,6 +217,32 @@ mod tests {
         assert_eq!(parse_location("src/a.rs:12:5"), Location { path: "src/a.rs".into(), line: Some(12), col: Some(5) });
         assert_eq!(parse_location("src/a.rs:12"), Location { path: "src/a.rs".into(), line: Some(12), col: None });
         assert_eq!(parse_location("/tmp/x"), Location { path: "/tmp/x".into(), line: None, col: None });
+    }
+
+    #[test]
+    fn bare_urls() {
+        let pats = builtin_patterns();
+        let bare = &pats[1].regex;
+        let find = |s: &str| {
+            bare.captures(s).and_then(|c| {
+                let m = c.get(1)?;
+                refine(&HintKind::Url, s, m.range()).map(|r| s[r].to_string())
+            })
+        };
+        assert_eq!(find("see example.com."), Some("example.com".into()));
+        assert_eq!(find("go to www.rust-lang.org/learn, now"), Some("www.rust-lang.org/learn".into()));
+        assert_eq!(find("(github.com/a/b)"), Some("github.com/a/b".into()));
+        assert_eq!(find("at localhost:8080/api?x=1"), Some("localhost:8080/api?x=1".into()));
+        assert_eq!(find("on 10.0.0.1:3000/"), Some("10.0.0.1:3000/".into()));
+        assert_eq!(find("baidu.COM/s"), Some("baidu.COM/s".into()));
+        // File names, paths, mail addresses, plain IPs are not URLs.
+        for s in ["src/main.rs", "build.sh", "a/example.com/x", "./example.com", "me@example.com", "10.0.0.1", "foo.company", "lib.so"] {
+            assert_eq!(find(s), None, "{s}");
+        }
+        assert_eq!(url_with_scheme("example.com/x"), "https://example.com/x");
+        assert_eq!(url_with_scheme("localhost:8080"), "http://localhost:8080");
+        assert_eq!(url_with_scheme("10.0.0.1:3000/a"), "http://10.0.0.1:3000/a");
+        assert_eq!(url_with_scheme("ftp://x"), "ftp://x");
     }
 
     #[test]

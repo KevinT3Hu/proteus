@@ -9,9 +9,15 @@
 //!   clipboard = { osc52_read = "ask", paste_protection = true },
 //!   shell = { command = { "fish", "-l" }, integration = true },
 //!   scrollback = 20000,
-//!   ui = { hint_bar = "in-mode", tab_bar = "auto", pane_titles = "never" },
+//!   ui = { hint_bar = "in-mode", tab_bar = "auto", pane_titles = "never", gutter = 0.5 },
 //!   panes = { confirm_close = true, confirm_close_ignore = { "less", "man" } },
 //!   session = { restore = "ask", restore_commands = { "nvim", "htop" } },
+//!   notify = { min_duration = 10, osc = true },  -- min_duration = false: never
+//!   bell = { visual = true },
+//!   hints = {
+//!     alphabet = "asdfghjkl",
+//!     patterns = { { name = "jira", regex = "\\b[A-Z]+-\\d+\\b", url = "https://jira.example/browse/{}" } },
+//!   },
 //!   keys = {
 //!     preset = "zellij",   -- or "leader", "tmux"
 //!     leader = "ctrl+g",   -- zellij: lock/unlock; leader: opens the mode menu
@@ -80,6 +86,28 @@ pub struct Config {
     pub restore: Restore,
     /// Foreground programs that are started again when a session is restored.
     pub restore_commands: Vec<String>,
+    /// Width of the command-block gutter left of each pane, in cells (0: none).
+    pub gutter: f32,
+    /// Desktop notification when a command that ran at least this long
+    /// finishes in a pane without focus (`None`: never).
+    pub notify_after: Option<std::time::Duration>,
+    /// Pass OSC 9 / OSC 777 notifications from applications to the desktop.
+    pub notify_osc: bool,
+    /// Flash the pane on the bell.
+    pub visual_bell: bool,
+    /// Hint labels are made of these characters.
+    pub hint_alphabet: String,
+    /// Extra hint patterns, tried before the built-in ones.
+    pub hint_patterns: Vec<HintPatternConfig>,
+}
+
+/// A user-defined hint pattern: `{ name = "jira", regex = "[A-Z]+-\\d+", url = "https://x/browse/{}" }`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HintPatternConfig {
+    pub name: String,
+    pub regex: String,
+    /// Opening the hint opens this URL with `{}` replaced by the text.
+    pub url: Option<String>,
 }
 
 /// Restoring the previous session at startup.
@@ -145,6 +173,12 @@ impl Default for Config {
                 .to_vec(),
             restore: Restore::Ask,
             restore_commands: ["nvim", "vim", "hx", "less", "htop", "btop", "top", "man"].map(String::from).to_vec(),
+            gutter: 0.5,
+            notify_after: Some(std::time::Duration::from_secs(10)),
+            notify_osc: true,
+            visual_bell: true,
+            hint_alphabet: proteus_core::hints::DEFAULT_ALPHABET.into(),
+            hint_patterns: Vec::new(),
         }
     }
 }
@@ -325,6 +359,7 @@ fn apply(c: &mut Config, t: &Table) -> Result<(), String> {
                             _ => return Err("ui.pane_titles: expected \"auto\", \"always\" or \"never\"".into()),
                         }
                     }
+                    "gutter" => c.gutter = number(v, "ui.gutter")?.clamp(0.0, 2.0) as f32,
                     _ => return Err(unknown("ui", k)),
                 }
                 Ok(())
@@ -390,10 +425,78 @@ fn apply(c: &mut Config, t: &Table) -> Result<(), String> {
                 Ok(())
             })?,
             "scrollback" => c.scrollback = number(&v, "scrollback")?.max(0.0) as usize,
+            "notify" => section(&v, "notify", |k, v| {
+                match k {
+                    "min_duration" => {
+                        c.notify_after = match v {
+                            Value::Boolean(false) => None,
+                            _ => Some(std::time::Duration::from_secs_f64(number(v, "notify.min_duration")?.max(0.0))),
+                        }
+                    }
+                    "osc" => c.notify_osc = boolean(v, "notify.osc")?,
+                    _ => return Err(unknown("notify", k)),
+                }
+                Ok(())
+            })?,
+            "bell" => section(&v, "bell", |k, v| {
+                match k {
+                    "visual" => c.visual_bell = boolean(v, "bell.visual")?,
+                    _ => return Err(unknown("bell", k)),
+                }
+                Ok(())
+            })?,
+            "hints" => section(&v, "hints", |k, v| {
+                match k {
+                    "alphabet" => {
+                        let a = string(v, "hints.alphabet")?;
+                        let mut chars: Vec<char> = a.chars().collect();
+                        chars.sort();
+                        chars.dedup();
+                        if chars.len() < 2 || chars.iter().any(|c| !c.is_ascii_lowercase() && !c.is_ascii_digit()) {
+                            return Err("hints.alphabet: expected at least 2 lowercase letters or digits".into());
+                        }
+                        c.hint_alphabet = a;
+                    }
+                    "patterns" => c.hint_patterns = hint_patterns(v)?,
+                    _ => return Err(unknown("hints", k)),
+                }
+                Ok(())
+            })?,
             _ => return Err(format!("unknown config key `{k}`")),
         }
     }
     Ok(())
+}
+
+/// `hints.patterns`: a list of `{ name, regex, url }` tables.
+fn hint_patterns(v: &Value) -> Result<Vec<HintPatternConfig>, String> {
+    let Value::Table(t) = v else { return Err("hints.patterns: expected a list".into()) };
+    let mut out = Vec::new();
+    for (i, p) in t.sequence_values::<Value>().enumerate() {
+        let p = p.map_err(|e| format!("hints.patterns: {e}"))?;
+        let name = format!("hints.patterns[{}]", i + 1);
+        let mut hp = HintPatternConfig { name: String::new(), regex: String::new(), url: None };
+        section(&p, &name, |k, v| {
+            match k {
+                "name" => hp.name = string(v, &format!("{name}.name"))?,
+                "regex" => hp.regex = string(v, &format!("{name}.regex"))?,
+                "url" => hp.url = Some(string(v, &format!("{name}.url"))?),
+                _ => return Err(format!("unknown config key `{name}.{k}`")),
+            }
+            Ok(())
+        })?;
+        if hp.regex.is_empty() {
+            return Err(format!("{name}: `regex` is required"));
+        }
+        if let Err(e) = regex::Regex::new(&hp.regex) {
+            return Err(format!("{name}.regex: {}", e.to_string().lines().last().unwrap_or("invalid")));
+        }
+        if hp.name.is_empty() {
+            hp.name = format!("pattern{}", i + 1);
+        }
+        out.push(hp);
+    }
+    Ok(out)
 }
 
 fn section(v: &Value, name: &str, mut f: impl FnMut(&str, &Value) -> Result<(), String>) -> Result<(), String> {
@@ -524,6 +627,34 @@ mod tests {
             (r#"keys = { normal = { ["hyper+x"] = "pane.close" } }"#, "keys.normal"),
             (r#"keys = { insert = {} }"#, "keys.insert"),
             (r#"ui = { tab_bar = "top" }"#, "ui.tab_bar"),
+        ] {
+            let e = ev(&format!(r#"require("proteus").config {{ {src} }}"#)).unwrap_err();
+            assert!(e.contains(want), "{e}");
+        }
+    }
+
+    #[test]
+    fn shell_integration_config() {
+        let c = ev(r#"require("proteus").config {
+            ui = { gutter = 1 },
+            notify = { min_duration = 3.5, osc = false },
+            bell = { visual = false },
+            hints = { alphabet = "jkl", patterns = { { name = "jira", regex = "[A-Z]+-\\d+", url = "https://j/{}" }, { regex = "x+" } } },
+        }"#)
+        .unwrap();
+        assert_eq!(c.gutter, 1.0);
+        assert_eq!(c.notify_after, Some(std::time::Duration::from_millis(3500)));
+        assert!(!c.notify_osc && !c.visual_bell);
+        assert_eq!(c.hint_alphabet, "jkl");
+        assert_eq!(c.hint_patterns.len(), 2);
+        assert_eq!(c.hint_patterns[0].url.as_deref(), Some("https://j/{}"));
+        assert_eq!(c.hint_patterns[1].name, "pattern2");
+        assert_eq!(ev(r#"require("proteus").config { notify = { min_duration = false } }"#).unwrap().notify_after, None);
+        for (src, want) in [
+            (r#"hints = { alphabet = "a" }"#, "hints.alphabet"),
+            (r#"hints = { patterns = { { regex = "(" } } }"#, "hints.patterns[1].regex"),
+            (r#"hints = { patterns = { { name = "x" } } }"#, "`regex` is required"),
+            (r#"notify = { when = 1 }"#, "notify.when"),
         ] {
             let e = ev(&format!(r#"require("proteus").config {{ {src} }}"#)).unwrap_err();
             assert!(e.contains(want), "{e}");

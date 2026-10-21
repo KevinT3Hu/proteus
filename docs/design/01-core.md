@@ -63,6 +63,7 @@
   - re-run command,
   - send block to AI (if AI enabled).
 - Duration and exit code stored per block and shown on hover or in a block info popup.
+- Default keys in Scroll mode: `c`/`o`/`a` copy command/output/all, `C`/`O`/`A` select them, `z` fold, `Z` unfold all, `r` re-run, `i` info, `[`/`]` previous/next prompt. Without a Scroll cursor the actions use the last command. Clicking a gutter mark folds its block; clicking a fold marker unfolds it.
 
 ## Search
 
@@ -70,13 +71,15 @@
 - Scope: current pane (default) or all panes in tab.
 - Matches highlighted; `n`/`N` navigate; `Enter` exits to selection at match.
 - Search restricted to command output only (via blocks) as a toggle.
+- Toggles while typing: `Ctrl+R` regex, `Ctrl+T` all panes of the tab, `Ctrl+O` output only.
 
 ## Hint mode
 
 - Key enters hint mode; on-screen matches get short labels (home-row letters).
 - Built-in patterns: URL, file path (absolute, relative to block cwd, `path:line:col`), git hash, IPv4/IPv6, UUID, hex color.
 - Actions by modifier: open (`xdg-open` or `$EDITOR` for `path:line`), copy, insert into prompt.
-- Patterns and actions extensible from Lua.
+- Patterns and actions extensible from Lua. v1 config: `hints = { alphabet, patterns = { { name, regex, url } } }`; Lua functions as actions come with doc 05.
+- Keys: `Ctrl+Shift+e` (Normal), `f` (Scroll). A label opens; with Shift on its last key it copies, with Ctrl it is inserted at the prompt.
 
 ## Command palette
 
@@ -108,7 +111,7 @@
 
 - Detachable sessions, SSH domains, scrollback restore.
 
-## Open questions
+## Decisions (were open questions)
 
-1. Ligatures default on or off? (Proposed: on.)
-2. Gutter default width: 1 cell or a few pixels? (Proposed: ~0.5 cell, pixel-rendered.)
+1. Ligatures: on by default (`font.ligatures`).
+2. Gutter: 0.5 cell by default, pixel-rendered in the padding/gap left of each pane so no column is lost (`ui.gutter`, 0 hides it).

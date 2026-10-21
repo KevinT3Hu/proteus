@@ -11,6 +11,7 @@ use proteus_core::{CursorShape, Point, TermMode, Terminal};
 
 use super::font::{self, BOLD, Fonts, GlyphRef, ITALIC, Metrics};
 use super::ime::Preedit;
+use super::rows::{Row, Rows};
 
 const ATLAS: u32 = 2048;
 
@@ -97,18 +98,30 @@ pub struct PaneFrame<'a> {
     pub skip: usize,
     /// Drawn over the tiled panes, in its own layer.
     pub floating: bool,
-    /// Floating panes: the frame, drawn under the grid.
+    /// Drawn under the grid: floating frames, the block gutter.
     pub backdrop: Vec<([f32; 4], Rgb)>,
     /// Floating panes: frame text, drawn over the grid.
     pub labels: Vec<Label>,
+    /// What each row shows (see [`Rows`]).
+    pub rows: Rows,
+    /// Visual bell: tint the pane.
+    pub flash: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkKind {
+    Match,
+    /// The match the search is on.
+    Current,
+    /// Text of a hint (hint mode).
+    Hint,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Mark {
     pub start: Point,
     pub end: Point,
-    /// The match the search is on.
-    pub current: bool,
+    pub kind: MarkKind,
 }
 
 impl Mark {
@@ -612,6 +625,9 @@ impl Renderer {
     /// its frame), the window chrome, and the overlay.
     fn build(&mut self, fonts: &mut Fonts, info: &FrameInfo, m: Metrics) {
         for p in info.panes.iter().filter(|p| !p.floating) {
+            for &([x, y, w, h], c) in &p.backdrop {
+                self.scratch.push(solid(x, y, w, h, rgba(c, 1.0)));
+            }
             self.build_pane(fonts, p, info, m);
         }
         self.chrome(fonts, &info.tiled_rects, &info.tiled_labels, m);
@@ -645,12 +661,27 @@ impl Renderer {
         let blink_off = info.cursor_blink_off && p.focused;
         let show_cursor = t.cursor_visible() && !blink_off && p.preedit.is_none() && p.copy_cursor.is_none();
         let grid = t.grid();
-        let (first, last) = (grid.viewport_line(0), grid.viewport_line(t.lines() - 1));
+        let first = (0..p.rows.0.len()).find_map(|y| p.rows.line(y)).unwrap_or(0);
+        let last = p.rows.last_line().unwrap_or(0);
         let marks: Vec<Mark> = p.marks.iter().copied().filter(|m| m.end.line >= first && m.start.line <= last).collect();
-        for y in skip..t.lines() {
-            let line = grid.viewport_line(y);
-            let row = grid.viewport_row(y);
+        let cursor_row = p.rows.row_of(grid.abs_line(cursor.y)).filter(|_| show_cursor || p.preedit.is_some());
+        let cols = t.cols();
+        for (y, r) in p.rows.0.iter().enumerate().skip(skip) {
             let top = py + y as f32 * ch;
+            let line = match *r {
+                Row::Line(l) => l,
+                Row::Empty => continue,
+                Row::Fold { start, end, .. } => {
+                    let n = end - start;
+                    let text = format!("▸ {} line{}", group_digits(n), if n == 1 { "" } else { "s" });
+                    let fg = pal.foreground();
+                    self.rect(px, top, cols as f32 * cw, ch, rgba(super::chrome::mix(default_bg, fg, 0.08), 1.0));
+                    self.text_line(fonts, &text, px, top, cols, ITALIC, rgba(fg, 0.6), m, cw);
+                    continue;
+                }
+            };
+            let Some(row) = grid.abs_row(line) else { continue };
+            let is_cursor_row = cursor_row == Some(y);
             let mut run = Run::default();
             let mut cell_buf = String::new();
             // Run-length merge of backgrounds on this row.
@@ -676,14 +707,19 @@ impl Renderer {
                     std::mem::swap(&mut fg, &mut bg);
                 }
                 if let Some(m) = marks.iter().find(|m| m.contains(Point::new(line, x))) {
-                    bg = pal.indexed(if m.current { 208 } else { 3 });
-                    fg = pal.indexed(0);
+                    match m.kind {
+                        MarkKind::Match | MarkKind::Current => {
+                            bg = pal.indexed(if m.kind == MarkKind::Current { 208 } else { 3 });
+                            fg = pal.indexed(0);
+                        }
+                        MarkKind::Hint => fg = info.theme.accent,
+                    }
                 }
                 if p.copy_cursor == Some((x, y)) {
                     bg = info.theme.accent;
                     fg = info.theme.bg;
                 }
-                let is_cursor = show_cursor && y == cursor.y && x == cursor.x && p.focused;
+                let is_cursor = show_cursor && is_cursor_row && x == cursor.x && p.focused;
                 let is_cursor_block = is_cursor && t.cursor_shape() == CursorShape::Block;
                 if is_cursor_block {
                     let cc = pal.cursor().unwrap_or(fg);
@@ -802,7 +838,7 @@ impl Renderer {
                 }
 
                 // Non-block cursors.
-                if show_cursor && y == cursor.y && x == cursor.x && !is_cursor_block {
+                if show_cursor && is_cursor_row && x == cursor.x && !is_cursor_block {
                     let cc = pal.cursor().unwrap_or(pal.resolve(style.fg, true));
                     let c = rgba(cc, 1.0);
                     let thick = (cw / 8.0).round().max(1.0);
@@ -824,8 +860,15 @@ impl Renderer {
                 self.rect(px + start as f32 * cw, top, (row.cells.len() - start) as f32 * cw, ch, rgba(c, 1.0));
             }
         }
-        if let Some(pre) = &p.preedit {
-            self.build_preedit(t, fonts, pre, (px, py), m);
+        if let (Some(pre), Some(row)) = (&p.preedit, cursor_row) {
+            self.build_preedit(t, fonts, pre, (px, py), row, m);
+        }
+        if p.flash {
+            // Premultiplied: a light veil of the foreground color.
+            let a = 0.18;
+            let c = rgba(pal.foreground(), 1.0);
+            let veil = [c[0] * a, c[1] * a, c[2] * a, a];
+            self.fg.push(solid(px, p.y, cols as f32 * cw, (t.lines() - skip) as f32 * ch, veil));
         }
     }
 
@@ -885,15 +928,12 @@ impl Renderer {
     /// Draw the input method's composition over the grid at the cursor:
     /// opaque background, underline, thicker underline under the selected
     /// segment, and a bar cursor.
-    fn build_preedit(&mut self, t: &Terminal, fonts: &mut Fonts, p: &Preedit, origin: (f32, f32), m: Metrics) {
+    #[allow(clippy::too_many_arguments)]
+    fn build_preedit(&mut self, t: &Terminal, fonts: &mut Fonts, p: &Preedit, origin: (f32, f32), row: usize, m: Metrics) {
         let pal = t.palette();
         let (cw, ch) = (m.cell_w as f32, m.cell_h as f32);
         let (px, py) = origin;
         let cursor = t.cursor();
-        let row = cursor.y + t.grid().display_offset();
-        if row >= t.lines() {
-            return;
-        }
         let start = preedit_start(cursor.x, p.width(), t.cols());
         let top = py + row as f32 * ch;
         let left = px + start as f32 * cw;
@@ -1034,6 +1074,19 @@ fn cell_text<'a>(cell: &'a proteus_core::cell::Cell, buf: &'a mut String) -> &'a
     }
 }
 
+/// `12345` → `12,345`.
+pub fn group_digits(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn solid(x: f32, y: f32, w: f32, h: f32, c: [f32; 4]) -> Instance {
     Instance { pos: [x, y], size: [w, h], uv: [0.0; 4], color: c, kind: SOLID }
 }
@@ -1049,6 +1102,13 @@ mod tests {
             .validate(&module)
             .expect("WGSL validates");
         assert_eq!(std::mem::size_of::<Instance>(), 52);
+    }
+
+    #[test]
+    fn digits() {
+        assert_eq!(group_digits(7), "7");
+        assert_eq!(group_digits(1234), "1,234");
+        assert_eq!(group_digits(1234567), "1,234,567");
     }
 
     #[test]

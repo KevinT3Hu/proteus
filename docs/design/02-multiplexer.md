@@ -39,16 +39,16 @@ Pane = Terminal | PluginView
 | Search | Incremental search (doc 01) | `n`/`N`, `Enter`, `Esc` |
 | Session | Layouts and session restore | `l` load layout, `s` save layout |
 
-### Default entry: "leader to mode menu" (non-colliding)
+### Default entry: zellij preset (`keys.preset`)
 
-zellij's default chords (`Ctrl+p`, `Ctrl+t`, `Ctrl+s`, `Ctrl+n`...) collide with shell history, fzf and editors. Proteus defaults to a single leader:
+The leader-only default took too many steps for everyday splits and tab switches, so the default is zellij-style with one-step quick keys:
 
-- `Ctrl+g` (configurable) from Normal opens the mode menu; hint bar shows `p pane · t tab · r resize · m move · s scroll · / search · o session · l lock`.
-- After an action, return to Normal (default) or stay in the mode (`modes.sticky = true`); `Esc` always returns to Normal.
-- Locked mode: entered with `Ctrl+g l`; only `Ctrl+g` is intercepted to unlock.
-- A few direct shortcuts work in Normal without the leader (configurable, all can be disabled): `Alt+h/j/k/l` focus, `Alt+n` new pane, `Alt+[`/`Alt+]` prev/next tab, `Ctrl+Shift+c/v` copy/paste, `Ctrl+Shift+p` palette.
-- Presets: `default`, `zellij` (original chords), `tmux` (`Ctrl+b` prefix, tmux keys).
-- Every binding is a palette action; Lua can rebind anything (doc 05).
+- `Ctrl+p/t/n/h/s/o` enter Pane, Tab, Resize, Move, Scroll, Session mode directly; the same chord leaves it. `Esc` always returns to Normal.
+- `Ctrl+g` (`keys.leader`) locks: in Locked mode only `Ctrl+g` (unlock) and the terminal keys are intercepted.
+- Quick keys in Normal: `Alt+h/j/k/l` focus (left/right at the window edge go to the previous/next tab), `Alt+n` new pane, `Alt+t` new tab, `Alt+[`/`Alt+]` prev/next tab, `Alt+1..9` go to tab, `Alt+f` floating panes; `Ctrl+Shift+p` palette, `Ctrl+Shift+e` hints, `Ctrl+Shift+f` search, `Ctrl+Shift+n` new window.
+- After an action, return to Normal (default) or stay in the mode (`keys.sticky = true`); Resize, Move and Scroll always stay.
+- Other presets: `leader` (one leader key opens a mode menu, nothing else taken from the shell besides the leader and the Alt quick keys) and `tmux` (`Ctrl+b` prefix, tmux keys).
+- Every binding is a named action (`proteus --list-actions`); the config maps keys to actions per mode: `keys = { normal = { ["alt+x"] = "pane.close" } }`.
 
 ### Hint bar
 

@@ -33,6 +33,10 @@ pub struct Pane {
     /// Foreground process name and cwd, used when the app sets no title.
     proc_title: String,
     proc_checked: Option<Instant>,
+    /// The bell rang while the pane was not looked at (marker on its tab).
+    pub bell: bool,
+    /// Visual bell: tinted until then.
+    pub flash_until: Option<Instant>,
 }
 
 impl Pane {
@@ -65,8 +69,19 @@ impl Pane {
             let _ = tx.send(Msg::PtyClosed(id));
         })?;
         let size = session::window_size(opts.cols, opts.rows, opts.cell);
-        let mut pane =
-            Pane { term, name: None, cmd: None, pending_run: None, pty, writer, size, proc_title: String::new(), proc_checked: None };
+        let mut pane = Pane {
+            term,
+            name: None,
+            cmd: None,
+            pending_run: None,
+            pty,
+            writer,
+            size,
+            proc_title: String::new(),
+            proc_checked: None,
+            bell: false,
+            flash_until: None,
+        };
         pane.refresh_proc_title();
         Ok(pane)
     }
@@ -144,6 +159,11 @@ impl Pane {
         let argv: Vec<String> =
             raw.split(|&b| b == 0).filter(|a| !a.is_empty()).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
         (!argv.is_empty()).then_some((name, argv))
+    }
+
+    /// Re-read the foreground process on the next refresh.
+    pub fn expire_proc_title(&mut self) {
+        self.proc_checked = None;
     }
 
     /// Re-read the foreground process at most once a second. Returns true

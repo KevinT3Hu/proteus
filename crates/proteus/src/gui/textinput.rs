@@ -38,8 +38,12 @@ pub struct Input {
     pub text: String,
     /// Byte offset of the caret.
     pub cursor: usize,
-    /// Search: the query is a regular expression.
+    /// Search: the query is a regular expression (Ctrl+R).
     pub regex: bool,
+    /// Search: all visible panes of the tab (Ctrl+T).
+    pub tab: bool,
+    /// Search: command output only (Ctrl+O).
+    pub output: bool,
     /// Shown after the text (match count, error, choices).
     pub status: String,
     /// Palette: the highlighted entry among the matches.
@@ -63,7 +67,7 @@ pub enum Edit {
 
 impl Input {
     pub fn new(purpose: Purpose, text: &str) -> Self {
-        Self { purpose, text: text.to_string(), cursor: text.len(), regex: false, status: String::new(), choice: 0 }
+        Self { purpose, text: text.to_string(), cursor: text.len(), regex: false, tab: false, output: false, status: String::new(), choice: 0 }
     }
 
     fn prev_boundary(&self) -> usize {
@@ -135,6 +139,14 @@ impl Input {
                 self.regex = !self.regex;
                 Edit::Changed
             }
+            Key::Char('t') if ctrl && self.purpose == Purpose::Search => {
+                self.tab = !self.tab;
+                Edit::Changed
+            }
+            Key::Char('o') if ctrl && self.purpose == Purpose::Search => {
+                self.output = !self.output;
+                Edit::Changed
+            }
             _ if !text.is_empty() && !m.intersects(Mods::CTRL | Mods::ALT | Mods::SUPER) => {
                 self.insert(text);
                 Edit::Changed
@@ -149,18 +161,19 @@ impl Input {
     }
 }
 
-/// Action names matching a palette query: every word of the query must
-/// appear; earlier and tighter matches first.
-pub fn palette_matches<'a>(names: &'a [String], query: &str) -> Vec<&'a str> {
+/// Indices of the (lowercase) palette entries matching a query: every
+/// word of the query must appear; earlier and tighter matches first.
+pub fn palette_rank(keys: &[String], query: &str) -> Vec<usize> {
     let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
-    let mut hits: Vec<(usize, &str)> = names
+    let mut hits: Vec<(usize, usize)> = keys
         .iter()
-        .filter_map(|n| {
+        .enumerate()
+        .filter_map(|(i, n)| {
             let mut score = 0;
             for w in &words {
                 score += n.find(w.as_str())?;
             }
-            Some((score * 100 + n.len(), n.as_str()))
+            Some((score * 100 + n.len(), i))
         })
         .collect();
     hits.sort();
@@ -191,6 +204,9 @@ mod tests {
         assert_eq!((i.text.as_str(), i.cursor), ("oo ", 0));
         assert_eq!(i.key(Key::Char('r'), Mods::CTRL, ""), Edit::Changed);
         assert!(i.regex);
+        i.key(Key::Char('t'), Mods::CTRL, "");
+        i.key(Key::Char('o'), Mods::CTRL, "");
+        assert!(i.tab && i.output);
         assert_eq!(i.key(Key::Char('x'), Mods::ALT, "x"), Edit::Moved);
         assert_eq!(i.key(Key::Enter, n, "\r"), Edit::Submit);
         assert_eq!(i.key(Key::Escape, n, ""), Edit::Cancel);
@@ -206,8 +222,8 @@ mod tests {
     #[test]
     fn palette() {
         let names: Vec<String> = ["pane.split_right", "pane.split_down", "tab.new", "window.new"].map(String::from).to_vec();
-        assert_eq!(palette_matches(&names, "new"), ["tab.new", "window.new"]);
-        assert_eq!(palette_matches(&names, "split dow"), ["pane.split_down"]);
-        assert_eq!(palette_matches(&names, "").len(), 4);
+        assert_eq!(palette_rank(&names, "new"), [2, 3]);
+        assert_eq!(palette_rank(&names, "split DOW"), [1]);
+        assert_eq!(palette_rank(&names, "").len(), 4);
     }
 }

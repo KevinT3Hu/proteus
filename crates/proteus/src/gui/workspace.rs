@@ -29,7 +29,7 @@ pub struct SessionStore {
 }
 
 /// `$XDG_STATE_HOME/proteus` (default `~/.local/state/proteus`).
-fn state_dir() -> Option<PathBuf> {
+pub(super) fn state_dir() -> Option<PathBuf> {
     let base = match std::env::var_os("XDG_STATE_HOME").filter(|d| !d.is_empty()) {
         Some(d) => PathBuf::from(d),
         None => PathBuf::from(std::env::var_os("HOME")?).join(".local/state"),

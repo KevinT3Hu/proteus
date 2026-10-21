@@ -9,6 +9,11 @@ use super::render::{Label, Theme};
 const TAB_MAX: usize = 24;
 const TAB_MIN: usize = 6;
 
+/// Display width in cells.
+pub fn text_width(s: &str) -> usize {
+    width(s)
+}
+
 fn width(s: &str) -> usize {
     use unicode_segmentation::UnicodeSegmentation;
     s.graphemes(true).map(|g| g.width().clamp(1, 2)).sum()
