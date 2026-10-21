@@ -362,6 +362,24 @@ impl Terminal {
         }
     }
 
+    /// Scroll so absolute line `abs` is at the top of the viewport (clamped).
+    pub fn scroll_to_line(&mut self, abs: Line) {
+        if self.grid.scroll_to_line(abs) {
+            self.damage.full = true;
+        }
+    }
+
+    /// Scroll as little as possible so absolute line `abs` is visible.
+    pub fn reveal_line(&mut self, abs: Line) {
+        let top = self.grid.viewport_line(0);
+        let lines = self.lines() as Line;
+        if abs < top {
+            self.scroll_to_line(abs);
+        } else if abs >= top + lines {
+            self.scroll_to_line(abs + 1 - lines);
+        }
+    }
+
     pub fn scroll_to_bottom(&mut self) {
         if self.grid.reset_display() {
             self.damage.full = true;

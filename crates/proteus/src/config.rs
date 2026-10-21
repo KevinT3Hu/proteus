@@ -9,6 +9,17 @@
 //!   clipboard = { osc52_read = "ask", paste_protection = true },
 //!   shell = { command = { "fish", "-l" }, integration = true },
 //!   scrollback = 20000,
+//!   ui = { hint_bar = "in-mode", tab_bar = "auto" },
+//!   panes = { confirm_close = true, confirm_close_ignore = { "less", "man" } },
+//!   session = { restore = "ask", restore_commands = { "nvim", "htop" } },
+//!   keys = {
+//!     preset = "zellij",   -- or "leader"
+//!     leader = "ctrl+g",   -- zellij: lock/unlock; leader: opens the mode menu
+//!     sticky = false,
+//!     -- Per mode: key = action name (`proteus --list-actions`), or "none".
+//!     normal = { ["alt+x"] = "pane.close", ["alt+t"] = "none" },
+//!     pane = { ["v"] = "pane.split_right" },
+//!   },
 //! }
 //! ```
 //!
@@ -24,6 +35,8 @@ use std::rc::Rc;
 
 use mlua::{Lua, LuaOptions, StdLib, Table, Value};
 use proteus_core::ClipboardRead;
+
+use crate::modes::{Action, Chord, KeyConfig, Mode, Preset};
 
 /// Cursor blinking policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +66,44 @@ pub struct Config {
     pub command: Option<Vec<OsString>>,
     pub shell_integration: bool,
     pub scrollback: usize,
+    pub keys: KeyConfig,
+    pub hint_bar: HintBar,
+    pub tab_bar: TabBar,
+    /// Ask before closing a pane whose foreground process is not the shell.
+    pub confirm_close: bool,
+    /// Foreground programs that never need the close confirmation.
+    pub confirm_close_ignore: Vec<String>,
+    pub restore: Restore,
+    /// Foreground programs that are started again when a session is restored.
+    pub restore_commands: Vec<String>,
+}
+
+/// Restoring the previous session at startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Restore {
+    /// Offer to restore after an unclean exit (crash, logout, killed).
+    Ask,
+    /// Always restore the last session.
+    Always,
+    /// Never restore (and do not save).
+    Never,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HintBar {
+    /// Over the bottom row while a mode other than Normal is active.
+    InMode,
+    /// A reserved bottom row, always visible.
+    Always,
+    Never,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabBar {
+    /// Shown when there is more than one tab.
+    Auto,
+    Always,
+    Never,
 }
 
 impl Default for Config {
@@ -70,6 +121,15 @@ impl Default for Config {
             command: None,
             shell_integration: true,
             scrollback: 10_000,
+            keys: KeyConfig::default(),
+            hint_bar: HintBar::InMode,
+            tab_bar: TabBar::Auto,
+            confirm_close: true,
+            confirm_close_ignore: ["less", "more", "man", "top", "htop", "btop", "watch", "tail"]
+                .map(String::from)
+                .to_vec(),
+            restore: Restore::Ask,
+            restore_commands: ["nvim", "vim", "hx", "less", "htop", "btop", "top", "man"].map(String::from).to_vec(),
         }
     }
 }
@@ -84,6 +144,10 @@ impl Config {
         c.osc52_read = self.osc52_read;
         c.grapheme_clustering = self.grapheme_clustering;
         c
+    }
+
+    pub fn keymap(&self) -> crate::modes::Keymap {
+        crate::modes::Keymap::new(&self.keys)
     }
 }
 
@@ -220,6 +284,86 @@ fn apply(c: &mut Config, t: &Table) -> Result<(), String> {
                 }
                 Ok(())
             })?,
+            "ui" => section(&v, "ui", |k, v| {
+                match k {
+                    "hint_bar" => {
+                        c.hint_bar = match string(v, "ui.hint_bar")?.as_str() {
+                            "in-mode" => HintBar::InMode,
+                            "always" => HintBar::Always,
+                            "never" => HintBar::Never,
+                            _ => return Err("ui.hint_bar: expected \"in-mode\", \"always\" or \"never\"".into()),
+                        }
+                    }
+                    "tab_bar" => {
+                        c.tab_bar = match string(v, "ui.tab_bar")?.as_str() {
+                            "auto" => TabBar::Auto,
+                            "always" => TabBar::Always,
+                            "never" => TabBar::Never,
+                            _ => return Err("ui.tab_bar: expected \"auto\", \"always\" or \"never\"".into()),
+                        }
+                    }
+                    _ => return Err(unknown("ui", k)),
+                }
+                Ok(())
+            })?,
+            "keys" => section(&v, "keys", |k, v| {
+                match k {
+                    "preset" => {
+                        c.keys.preset = match string(v, "keys.preset")?.as_str() {
+                            "zellij" => Preset::Zellij,
+                            "leader" => Preset::Leader,
+                            _ => return Err("keys.preset: expected \"zellij\" or \"leader\"".into()),
+                        }
+                    }
+                    "leader" => {
+                        c.keys.leader =
+                            Chord::parse(&string(v, "keys.leader")?).map_err(|e| format!("keys.leader: {e}"))?
+                    }
+                    "sticky" => c.keys.sticky = boolean(v, "keys.sticky")?,
+                    m => {
+                        let mode = Mode::from_key(m).ok_or_else(|| unknown("keys", m))?;
+                        let name = format!("keys.{m}");
+                        section(v, &name, |key, action| {
+                            let chord = Chord::parse(key).map_err(|e| format!("{name}: {e}"))?;
+                            let action = match action {
+                                Value::Boolean(false) => None,
+                                _ => match string(action, &format!("{name}[\"{key}\"]"))?.as_str() {
+                                    "none" => None,
+                                    a => Some(Action::from_name(a).ok_or_else(|| {
+                                        format!("{name}[\"{key}\"]: unknown action `{a}` (see `proteus --list-actions`)")
+                                    })?),
+                                },
+                            };
+                            c.keys.binds.push((mode, chord, action));
+                            Ok(())
+                        })?;
+                    }
+                }
+                Ok(())
+            })?,
+            "panes" => section(&v, "panes", |k, v| {
+                match k {
+                    "confirm_close" => c.confirm_close = boolean(v, "panes.confirm_close")?,
+                    "confirm_close_ignore" => c.confirm_close_ignore = strings(v, "panes.confirm_close_ignore")?,
+                    _ => return Err(unknown("panes", k)),
+                }
+                Ok(())
+            })?,
+            "session" => section(&v, "session", |k, v| {
+                match k {
+                    "restore" => {
+                        c.restore = match string(v, "session.restore")?.as_str() {
+                            "ask" => Restore::Ask,
+                            "always" => Restore::Always,
+                            "never" => Restore::Never,
+                            _ => return Err("session.restore: expected \"ask\", \"always\" or \"never\"".into()),
+                        }
+                    }
+                    "restore_commands" => c.restore_commands = strings(v, "session.restore_commands")?,
+                    _ => return Err(unknown("session", k)),
+                }
+                Ok(())
+            })?,
             "scrollback" => c.scrollback = number(&v, "scrollback")?.max(0.0) as usize,
             _ => return Err(format!("unknown config key `{k}`")),
         }
@@ -253,6 +397,12 @@ fn number(v: &Value, name: &str) -> Result<f64, String> {
         Value::Number(n) => Ok(*n),
         _ => Err(format!("{name}: expected a number")),
     }
+}
+
+fn strings(v: &Value, name: &str) -> Result<Vec<String>, String> {
+    let err = || format!("{name}: expected a list of strings");
+    let Value::Table(t) = v else { return Err(err()) };
+    t.sequence_values::<String>().collect::<mlua::Result<Vec<_>>>().map_err(|_| err())
 }
 
 fn boolean(v: &Value, name: &str) -> Result<bool, String> {
@@ -313,6 +463,44 @@ mod tests {
         assert!(e.contains("cursor.blink"), "{e}");
         let e = ev("this is not lua").unwrap_err();
         assert!(e.contains("init.lua"), "{e}");
+    }
+
+    #[test]
+    fn mux_config() {
+        let c = ev(r#"require("proteus").config {
+            ui = { hint_bar = "always", tab_bar = "never" },
+            panes = { confirm_close = false, confirm_close_ignore = { "less" } },
+            session = { restore = "always", restore_commands = { "nvim" } },
+            keys = {
+              preset = "leader", leader = "ctrl+space", sticky = true,
+              normal = { ["alt+x"] = "pane.close", ["alt+t"] = "none", ["alt+n"] = false },
+              pane = { V = "pane.split_down" },
+            },
+        }"#)
+        .unwrap();
+        let k = &c.keys;
+        assert_eq!(k.preset, Preset::Leader);
+        assert_eq!(k.leader, Chord::parse("ctrl+space").unwrap());
+        assert!(k.sticky && !c.confirm_close);
+        assert_eq!(c.hint_bar, HintBar::Always);
+        assert_eq!(c.tab_bar, TabBar::Never);
+        assert_eq!(c.confirm_close_ignore, ["less"]);
+        assert_eq!((c.restore, c.restore_commands.clone()), (Restore::Always, vec!["nvim".to_string()]));
+        assert_eq!(k.binds.len(), 4);
+        assert!(k.binds.contains(&(Mode::Normal, Chord::parse("alt+x").unwrap(), Some(Action::ClosePane))));
+        assert!(k.binds.contains(&(Mode::Normal, Chord::parse("alt+n").unwrap(), None)));
+        assert!(k.binds.contains(&(Mode::Pane, Chord::parse("shift+v").unwrap(), Some(Action::Split(crate::layout::Axis::Y)))));
+        assert_eq!(Config::default().keys.preset, Preset::Zellij);
+        for (src, want) in [
+            (r#"keys = { leader = "ctrl+nope" }"#, "keys.leader"),
+            (r#"keys = { normal = { ["alt+x"] = "pane.explode" } }"#, "unknown action `pane.explode`"),
+            (r#"keys = { normal = { ["hyper+x"] = "pane.close" } }"#, "keys.normal"),
+            (r#"keys = { insert = {} }"#, "keys.insert"),
+            (r#"ui = { tab_bar = "top" }"#, "ui.tab_bar"),
+        ] {
+            let e = ev(&format!(r#"require("proteus").config {{ {src} }}"#)).unwrap_err();
+            assert!(e.contains(want), "{e}");
+        }
     }
 
     #[test]

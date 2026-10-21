@@ -231,6 +231,13 @@ impl Pty {
         Some(ForegroundProcess { pid, name, cwd })
     }
 
+    /// The application reads keys itself (canonical mode is off), as a
+    /// shell's line editor does while it waits at the prompt. Typed-ahead
+    /// input before that is echoed by the kernel and again by the editor.
+    pub fn raw_input(&self) -> bool {
+        termios::tcgetattr(&self.master).is_ok_and(|t| !t.local_modes.contains(termios::LocalModes::ICANON))
+    }
+
     /// True when something other than the shell we started is in the foreground.
     pub fn has_foreground_job(&self) -> bool {
         self.foreground_pgrp().is_some_and(|p| p != self.child_pid())
@@ -319,5 +326,19 @@ mod tests {
         let out = read_all(&pty);
         assert!(out.contains("30 100"), "{out:?}");
         pty.wait().unwrap();
+    }
+
+    #[test]
+    fn detects_raw_input() {
+        let spec = CommandSpec::new("/bin/sh").arg("-c").arg("stty -icanon; echo raw; sleep 0.3");
+        let pty = Pty::spawn(&spec, WindowSize::new(80, 24)).unwrap();
+        let mut f = pty.try_clone_master().unwrap();
+        let mut buf = [0u8; 64];
+        let mut out = Vec::new();
+        while !String::from_utf8_lossy(&out).contains("raw") {
+            let n = std::io::Read::read(&mut f, &mut buf).unwrap();
+            out.extend_from_slice(&buf[..n]);
+        }
+        assert!(pty.raw_input());
     }
 }

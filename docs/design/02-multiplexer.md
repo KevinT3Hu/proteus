@@ -101,7 +101,28 @@ return {
 - Window close with running processes: one confirmation listing them.
 - Last pane closed closes the tab; last tab closes the window (configurable to keep an empty shell).
 
-## Open questions
+## Decisions
 
-1. Leader key: `Ctrl+g` (zellij unlock-first convention) or `Ctrl+Space`? (Proposed: `Ctrl+g`.)
-2. Sticky modes default on or off? (Proposed: off.)
+1. Default keys follow zellij (`keys.preset = "zellij"`): `Ctrl+p/t/n/h/s` enter Pane/Tab/Resize/Move/Scroll directly (pressing the entry key again leaves the mode), `Ctrl+g` locks/unlocks. `keys.preset = "leader"` keeps the single-leader menu for people who need those chords in the shell.
+2. One-step quick keys in Normal mode, in both presets: `Alt+h/j/k/l` focus (`h`/`l` continue into the previous/next tab at the window edge), `Alt+n` new pane, `Alt+t` new tab, `Alt+[`/`Alt+]` prev/next tab, `Alt+1-9` go to tab.
+3. Every operation is a named action (`proteus --list-actions`). Each mode is a table of key → action; the config overrides single keys per mode (`"none"` unbinds), so presets are only defaults.
+4. Sticky modes default off (`keys.sticky = false`); Resize, Move and Scroll always stay active after an action.
+
+```lua
+keys = {
+  preset = "zellij", leader = "ctrl+g", sticky = false,
+  normal = { ["alt+x"] = "pane.close", ["ctrl+h"] = "none" },
+  pane = { v = "pane.split_right" },
+},
+ui = { hint_bar = "in-mode", tab_bar = "auto" },
+panes = { confirm_close = true, confirm_close_ignore = { "less", "man" } },
+```
+
+
+5. Scroll mode (`Ctrl+s`) has a keyboard cursor with vi motions (`hjkl`, `w/b/e`, `0/$`, `g/G`, `H/M/L`, `d/u`, `[`/`]` prompts). `v`/`V`/`Ctrl+v` select by character, line or block. `y`/`Enter` copies to the clipboard and the primary selection and returns to Normal; with no selection it copies the cursor line. `Esc` first clears the selection, then the search, then leaves the mode. Leaving Scroll mode scrolls back to the bottom.
+6. Search: `/`, `?` or `s` in Scroll mode, or `Ctrl+Shift+f` from Normal. It is incremental and searches upward from the cursor. Case is smart; `Ctrl+r` toggles regex. `Enter` moves the cursor to the match, and `n`/`N` go to the next older/newer match. The input line takes over the hint bar.
+7. Rename: `r` in Tab mode, `c` in Pane mode (zellij keys). An empty name goes back to the automatic title.
+8. Session mode (`Ctrl+o`): `s` saves the window as `layouts/NAME.lua`, `l` opens a layout's tabs after the existing ones.
+9. Layout node keys: `cmd` replaces the shell (a string runs through `$SHELL -c`; the pane closes when it exits). `run` is typed into the shell (the pane stays). `split = "vertical"` places children side by side and `"horizontal"` stacks them. More than two children get equal shares. Plugin panes are rejected until M5.
+10. Saved layouts and the session record only foreground commands listed in `session.restore_commands`, stored as `run`. The two use the same file format and parser.
+11. Session file: only the instance holding `$XDG_STATE_HOME/proteus/session.lock` saves and restores. It saves every 2 s when the file's contents would change, marked `clean = false`. Closing the window writes `clean = true`; the last pane ending deletes the file. `"ask"` (default) offers a restore only when the file is unclean, `"always"` restores whenever a file exists, and `"never"` neither saves nor restores. An explicit `--layout` or `-- COMMAND` skips restore.

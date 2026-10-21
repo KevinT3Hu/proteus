@@ -2,6 +2,7 @@
 
 use std::ffi::OsString;
 use std::io;
+use std::path::PathBuf;
 
 use proteus_core::Config;
 use proteus_pty::shell::{self, Shell};
@@ -14,6 +15,9 @@ pub fn spawn_pty(opts: &SpawnOptions) -> io::Result<(Pty, Option<Shell>)> {
         Some(argv) if !argv.is_empty() => CommandSpec::new(&argv[0]).args(argv[1..].iter().cloned()),
         _ => CommandSpec::default_shell(),
     };
+    if let Some(dir) = opts.cwd.as_ref().filter(|d| d.is_dir()) {
+        spec.cwd = Some(dir.clone());
+    }
     let terminfo = shell::data_dir().and_then(|d| shell::install_terminfo(&d.join("terminfo")));
     shell::apply_term(&mut spec, terminfo.as_deref());
     let mut sh = None;
@@ -48,6 +52,8 @@ pub struct SpawnOptions {
     /// Program and arguments; `None` runs the user's shell.
     pub command: Option<Vec<OsString>>,
     pub integration: bool,
+    /// Working directory; `None` inherits ours.
+    pub cwd: Option<PathBuf>,
     pub cols: u16,
     pub rows: u16,
     /// Cell size in pixels, if known (reported to apps and used for images).

@@ -79,17 +79,76 @@ struct AtlasGlyph {
     h: u32,
 }
 
-/// Everything about the frame the renderer needs besides the terminal.
-pub struct FrameInfo {
+/// One terminal grid to draw, with its top-left corner in physical pixels.
+pub struct PaneFrame<'a> {
+    pub term: &'a Terminal,
+    pub x: f32,
+    pub y: f32,
+    /// Has keyboard focus: solid (blinking) cursor; others get a hollow one.
     pub focused: bool,
-    /// Padding around the grid in physical pixels.
-    pub pad: (u32, u32),
-    /// Preedit text could go here later (IME).
+    /// Input method composition, drawn at the cursor.
+    pub preedit: Option<Preedit>,
+    /// Scroll-mode cursor (column, viewport row); hides the terminal cursor.
+    pub copy_cursor: Option<(usize, usize)>,
+    /// Search matches to highlight (absolute points, inclusive).
+    pub marks: Vec<Mark>,
+    /// Viewport rows hidden at the top: the grid is drawn this many rows
+    /// higher, so its last row clears an overlay at the bottom.
+    pub skip: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mark {
+    pub start: Point,
+    pub end: Point,
+    /// The match the search is on.
+    pub current: bool,
+}
+
+impl Mark {
+    fn contains(&self, p: Point) -> bool {
+        p >= self.start && p <= self.end
+    }
+}
+
+/// Text in the window chrome (tab bar, hint bar), on the cell grid.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Label {
+    pub x: f32,
+    pub y: f32,
+    /// Width in cells; the background fills it and text is truncated to it.
+    pub cols: usize,
+    pub text: String,
+    pub fg: Rgb,
+    pub bg: Option<Rgb>,
+    pub bold: bool,
+}
+
+/// Chrome colors, taken from the focused pane's palette.
+#[derive(Debug, Clone, Copy)]
+pub struct Theme {
+    pub fg: Rgb,
+    pub bg: Rgb,
+    pub accent: Rgb,
+    /// Tab/hint bar background.
+    pub bar: Rgb,
+    /// Inactive text and pane dividers.
+    pub dim: Rgb,
+}
+
+/// Everything the renderer draws in one frame.
+pub struct FrameInfo<'a> {
+    pub panes: Vec<PaneFrame<'a>>,
+    /// Window padding in physical pixels (indent of the overlay text).
+    pub pad: f32,
+    pub theme: Theme,
     pub cursor_blink_off: bool,
     /// Shape runs of text so fonts can apply ligatures.
     pub ligatures: bool,
-    /// Input method composition, drawn at the cursor.
-    pub preedit: Option<Preedit>,
+    /// Solid chrome rectangles (x, y, w, h), drawn over the grids.
+    pub rects: Vec<([f32; 4], Rgb)>,
+    /// Chrome text, drawn over `rects`.
+    pub labels: Vec<Label>,
     /// Prompt or notice drawn over the bottom rows.
     pub overlay: Option<Overlay>,
 }
@@ -388,7 +447,7 @@ impl Renderer {
 
     /// Render one frame. Returns false if the surface was not available
     /// (the caller should retry on the next frame).
-    pub fn draw(&mut self, term: &Terminal, fonts: &mut Fonts, info: &FrameInfo) -> bool {
+    pub fn draw(&mut self, fonts: &mut Fonts, info: &FrameInfo) -> bool {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
@@ -398,14 +457,14 @@ impl Renderer {
             _ => return false,
         };
         let view = frame.texture.create_view(&Default::default());
-        let enc = self.encode(term, fonts, info, &view);
+        let enc = self.encode(fonts, info, &view);
         self.queue.submit([enc]);
         self.queue.present(frame);
         true
     }
 
     /// Render the current state offscreen and return it as RGBA8.
-    pub fn snapshot(&mut self, term: &Terminal, fonts: &mut Fonts, info: &FrameInfo) -> (u32, u32, Vec<u8>) {
+    pub fn snapshot(&mut self, fonts: &mut Fonts, info: &FrameInfo) -> (u32, u32, Vec<u8>) {
         let (w, h) = (self.config.width, self.config.height);
         let format = self.config.format;
         let tex = self.device.create_texture(&wgpu::TextureDescriptor {
@@ -419,7 +478,7 @@ impl Renderer {
             view_formats: &[],
         });
         let view = tex.create_view(&Default::default());
-        let draw = self.encode(term, fonts, info, &view);
+        let draw = self.encode(fonts, info, &view);
         let stride = (w * 4).div_ceil(256) * 256;
         let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("snapshot readback"),
@@ -455,12 +514,12 @@ impl Renderer {
     }
 
     /// Build instances and record the render pass into `view`.
-    fn encode(&mut self, term: &Terminal, fonts: &mut Fonts, info: &FrameInfo, view: &wgpu::TextureView) -> wgpu::CommandBuffer {
+    fn encode(&mut self, fonts: &mut Fonts, info: &FrameInfo, view: &wgpu::TextureView) -> wgpu::CommandBuffer {
         let m = fonts.metrics();
-        let bg_default = term.palette().background();
+        let bg_default = info.theme.bg;
         self.scratch.clear();
         self.fg.clear();
-        self.build(term, fonts, info, m);
+        self.build(fonts, info, m);
         let mut all = std::mem::take(&mut self.scratch);
         all.append(&mut self.fg);
         if all.len() > self.capacity {
@@ -514,18 +573,44 @@ impl Renderer {
         self.scratch.push(Instance { pos: [x, y], size: [w, h], uv: [0.0; 4], color: c, kind: SOLID });
     }
 
-    /// Build all instances for the viewport.
-    fn build(&mut self, t: &Terminal, fonts: &mut Fonts, info: &FrameInfo, m: Metrics) {
+    /// Build all instances: grids, then chrome, then the overlay.
+    fn build(&mut self, fonts: &mut Fonts, info: &FrameInfo, m: Metrics) {
+        for p in &info.panes {
+            self.build_pane(fonts, p, info, m);
+        }
+        let cw = m.cell_w as f32;
+        for &([x, y, w, h], c) in &info.rects {
+            self.fg.push(solid(x, y, w, h, rgba(c, 1.0)));
+        }
+        for l in &info.labels {
+            if let Some(bg) = l.bg {
+                self.fg.push(solid(l.x, l.y, l.cols as f32 * cw, m.cell_h as f32, rgba(bg, 1.0)));
+            }
+            let style = if l.bold { BOLD } else { 0 };
+            self.text_line(fonts, &l.text, l.x, l.y, l.cols, style, rgba(l.fg, 1.0), m, cw);
+        }
+        if let Some(o) = &info.overlay {
+            self.build_overlay(fonts, o, info, m);
+        }
+    }
+
+    /// Build the instances of one terminal grid.
+    fn build_pane(&mut self, fonts: &mut Fonts, p: &PaneFrame, info: &FrameInfo, m: Metrics) {
+        let t = p.term;
         let pal = t.palette();
         let (cw, ch) = (m.cell_w as f32, m.cell_h as f32);
-        let (px, py) = (info.pad.0 as f32, info.pad.1 as f32);
+        let skip = p.skip.min(t.lines() - 1);
+        let (px, py) = (p.x, p.y - skip as f32 * ch);
         let default_bg = pal.background();
         let reverse = t.mode().contains(TermMode::REVERSE_VIDEO);
         let selection = t.selection_range();
         let cursor = t.cursor();
-        let show_cursor = t.cursor_visible() && !info.cursor_blink_off && info.preedit.is_none();
+        let blink_off = info.cursor_blink_off && p.focused;
+        let show_cursor = t.cursor_visible() && !blink_off && p.preedit.is_none() && p.copy_cursor.is_none();
         let grid = t.grid();
-        for y in 0..t.lines() {
+        let (first, last) = (grid.viewport_line(0), grid.viewport_line(t.lines() - 1));
+        let marks: Vec<Mark> = p.marks.iter().copied().filter(|m| m.end.line >= first && m.start.line <= last).collect();
+        for y in skip..t.lines() {
             let line = grid.viewport_line(y);
             let row = grid.viewport_row(y);
             let top = py + y as f32 * ch;
@@ -553,7 +638,15 @@ impl Renderer {
                 if style.attrs.contains(Attrs::INVERSE) ^ reverse ^ selected {
                     std::mem::swap(&mut fg, &mut bg);
                 }
-                let is_cursor = show_cursor && y == cursor.y && x == cursor.x && info.focused;
+                if let Some(m) = marks.iter().find(|m| m.contains(Point::new(line, x))) {
+                    bg = pal.indexed(if m.current { 208 } else { 3 });
+                    fg = pal.indexed(0);
+                }
+                if p.copy_cursor == Some((x, y)) {
+                    bg = info.theme.accent;
+                    fg = info.theme.bg;
+                }
+                let is_cursor = show_cursor && y == cursor.y && x == cursor.x && p.focused;
                 let is_cursor_block = is_cursor && t.cursor_shape() == CursorShape::Block;
                 if is_cursor_block {
                     let cc = pal.cursor().unwrap_or(fg);
@@ -676,7 +769,7 @@ impl Renderer {
                     let cc = pal.cursor().unwrap_or(pal.resolve(style.fg, true));
                     let c = rgba(cc, 1.0);
                     let thick = (cw / 8.0).round().max(1.0);
-                    if !info.focused {
+                    if !p.focused {
                         self.fg.push(solid(left, top, w, thick, c));
                         self.fg.push(solid(left, top + ch - thick, w, thick, c));
                         self.fg.push(solid(left, top, thick, ch, c));
@@ -694,37 +787,34 @@ impl Renderer {
                 self.rect(px + start as f32 * cw, top, (row.cells.len() - start) as f32 * cw, ch, rgba(c, 1.0));
             }
         }
-        if let Some(p) = &info.preedit {
-            self.build_preedit(t, fonts, p, info, m);
-        }
-        if let Some(o) = &info.overlay {
-            self.build_overlay(t, fonts, o, info, m);
+        if let Some(pre) = &p.preedit {
+            self.build_preedit(t, fonts, pre, (px, py), m);
         }
     }
 
     /// Message bar over the last rows, in inverted colors with a top rule.
-    fn build_overlay(&mut self, t: &Terminal, fonts: &mut Fonts, o: &Overlay, info: &FrameInfo, m: Metrics) {
-        let pal = t.palette();
+    fn build_overlay(&mut self, fonts: &mut Fonts, o: &Overlay, info: &FrameInfo, m: Metrics) {
         let (cw, ch) = (m.cell_w as f32, m.cell_h as f32);
-        let (px, py) = (info.pad.0 as f32, info.pad.1 as f32);
-        let (fg, bg) = (pal.background(), pal.foreground());
+        let px = info.pad;
+        let (fg, bg) = (info.theme.bg, info.theme.fg);
+        let width = self.config.width as f32;
+        let height = self.config.height as f32;
+        let cols = ((width - 2.0 * px) / cw).max(1.0) as usize;
+        let max_rows = ((height / ch) as usize).max(1);
         let mut lines: Vec<(&str, f32)> = vec![(o.title.as_str(), 1.0)];
         if let Some(d) = &o.detail {
             lines.push((d.as_str(), 0.7));
         }
         lines.push((o.keys.as_str(), 0.85));
-        let rows = lines.len().min(t.lines());
-        let first = t.lines() - rows;
-        let top = py + first as f32 * ch;
+        let rows = lines.len().min(max_rows);
+        let top = (height - px - rows as f32 * ch).max(0.0);
         // Cover the padding too so the bar reaches the window edges.
-        let width = self.config.width as f32;
-        let height = self.config.height as f32 - top;
-        self.fg.push(solid(0.0, top, width, height, rgba(bg, 1.0)));
-        self.fg.push(solid(0.0, top, width, (m.underline_h as f32).max(1.0), rgba(pal.indexed(4), 1.0)));
+        self.fg.push(solid(0.0, top, width, height - top, rgba(bg, 1.0)));
+        self.fg.push(solid(0.0, top, width, (m.underline_h as f32).max(1.0), rgba(info.theme.accent, 1.0)));
         for (i, (text, alpha)) in lines.into_iter().take(rows).enumerate() {
             let y = top + i as f32 * ch;
             let style = if i == 0 { BOLD } else { 0 };
-            self.text_line(fonts, text, px, y, t.cols(), style, rgba(fg, alpha), m, cw);
+            self.text_line(fonts, text, px, y, cols, style, rgba(fg, alpha), m, cw);
         }
     }
 
@@ -758,10 +848,10 @@ impl Renderer {
     /// Draw the input method's composition over the grid at the cursor:
     /// opaque background, underline, thicker underline under the selected
     /// segment, and a bar cursor.
-    fn build_preedit(&mut self, t: &Terminal, fonts: &mut Fonts, p: &Preedit, info: &FrameInfo, m: Metrics) {
+    fn build_preedit(&mut self, t: &Terminal, fonts: &mut Fonts, p: &Preedit, origin: (f32, f32), m: Metrics) {
         let pal = t.palette();
         let (cw, ch) = (m.cell_w as f32, m.cell_h as f32);
-        let (px, py) = (info.pad.0 as f32, info.pad.1 as f32);
+        let (px, py) = origin;
         let cursor = t.cursor();
         let row = cursor.y + t.grid().display_offset();
         if row >= t.lines() {

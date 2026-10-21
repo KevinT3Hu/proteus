@@ -154,7 +154,7 @@ impl Dispatch2<ZwpTextInputV3, App> for ImeData {
                 }
                 if changed {
                     app.mark_dirty();
-                    app.term.scroll_to_bottom();
+                    app.scroll_focused_to_bottom();
                 }
                 app.update_ime_rect();
             }
