@@ -18,7 +18,7 @@
 ## Lua config
 
 - Entry: `$XDG_CONFIG_HOME/proteus/init.lua`; `require` resolves within that dir.
-- Typed API stubs shipped as LuaLS annotations (`proteus --emit-lua-types <dir>`) for completion and diagnostics in nvim/VS Code.
+- Typed API stubs shipped as LuaLS annotations (`proteus --emit-lua-types <dir>` writes `<dir>/proteus.lua`; add the dir to `workspace.library`) for completion and diagnostics in nvim/VS Code.
 - No config required; `init.lua` overrides defaults.
 - Errors: config error at startup or reload shows a non-modal banner, keeps the last good config.
 
@@ -26,13 +26,11 @@
 local p = require("proteus")
 
 p.config {
-  font = { family = "JetBrains Mono", size = 11, cjk_family = "Noto Sans Mono CJK SC", lang = "zh-CN" },
-  theme = { dark = "tokyonight", light = "github-light" },
-  keys = { preset = "default", leader = "<C-g>" },
-  ai = { enabled = nil }, -- nil = ask on first run
+  font = { family = "JetBrains Mono", size = 11 },
+  keys = { preset = "zellij", leader = "ctrl+g" },
 }
 
-p.keymap("normal", "<A-t>", p.action.new_tab { cwd = "inherit" })
+p.keymap("normal", "alt+t", "tab.new")
 p.keymap("pane", "g", function(ctx) ctx.pane:split { cmd = "lazygit" } end)
 
 p.on("command_finished", function(ev)
@@ -41,6 +39,17 @@ end)
 
 p.status.segment("right", function() return os.date("%H:%M") end)
 ```
+
+### Lua API (v1)
+
+- Only while `init.lua` runs: `p.config{...}`, `p.keymap(mode, key, action)` (action name, `"none"`/`false`, or a function; `keys.MODE` tables also accept functions).
+- Any time: `p.on(event, f)`, `p.status.segment("left"|"right", f)`, `p.palette.add(name, f)`, `p.after(secs, f)` / `p.every(secs, f)` (return a timer with `:stop()`), `p.version`.
+- In callbacks only (they need the terminal): `p.panes.list/focused/get/new_tab/float`, `p.run_action(name)`, `p.notify(text, { level, timeout })`, and pane objects: fields `id title name cwd process command window tab focused floating cols rows` (read live), methods `split{dir, cmd, cwd}`, `send_text`, `insert_text` (as a paste), `close` (asks if something runs), `focus`, `set_name`, `read_screen{scrollback}`, `read_blocks`, `block_text(id, part)`, `info`, `exists`.
+- Events: `pane_opened`, `pane_closed`, `focus_changed` (`previous`), `cwd_changed`, `title_changed`, `command_started`, `command_finished` (`command`, `exit_code`, `duration`), `bell`, `config_changed`. `theme_changed` comes with themes; `key` and `block_state_changed` with plugin surfaces.
+- Callbacks never run inside an event handler: events are queued and run before the next frame, so a hook can cause more events (at most 1000 calls per pass). Status segments run after events and once a second.
+- Budget: time in the callback itself (not in host calls such as starting a shell) over 5 ms warns once per function; over 2 s the callback is stopped. `init.lua` itself may run 5 s.
+- Errors in callbacks and messages show as toasts in the top right corner (the same error at most once per 30 s) and on stderr.
+- Hot reload: the config directory and its subdirectories (not `layouts/`) are watched; a changed `.lua` file reloads after 150 ms. A failing reload shows the error and keeps the running config and script. Fonts, keys, bars and limits apply at once; terminal settings (scrollback, clipboard, image limits, shell) apply to new panes. Command-line `--font`/`--font-size` keep winning.
 
 ## WASM plugins
 

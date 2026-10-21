@@ -369,6 +369,8 @@ pub enum Action {
     Hints(HintAction),
     /// Open the newest image on screen in the image viewer.
     ViewImage,
+    /// Run a Lua function registered by the config (`p.keymap`).
+    Lua(crate::script::FnId),
 }
 
 /// Cells per resize step.
@@ -461,6 +463,7 @@ impl Action {
             Action::BlockInfo => "block.info".into(),
             Action::Hints(h) => format!("hints.{}", h.key()),
             Action::ViewImage => "image.view".into(),
+            Action::Lua(n) => format!("lua.{n}"),
         }
     }
 
@@ -598,7 +601,7 @@ impl Action {
             Action::BlockInfo => "info",
             Action::Hints(_) if mode.passes_keys() => return None,
             Action::Hints(_) => "hints",
-            Action::ViewImage => return None,
+            Action::ViewImage | Action::Lua(_) => return None,
         })
     }
 }

@@ -17,10 +17,13 @@ mod notify;
 mod pane;
 mod render;
 mod rows;
+mod scripting;
 mod scroll;
 mod textinput;
 mod viewer;
 mod workspace;
+
+pub use scripting::Overrides;
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
@@ -35,6 +38,8 @@ use proteus_core::event::{ClipboardKind, Terminator};
 use proteus_core::input::{self, KeyAction, MouseAction, MouseButton, MouseEvent};
 use proteus_core::selection::SelectionKind;
 use proteus_core::{ClipboardRead, Event, Point, TermMode};
+
+use crate::script::{ScriptEvent, Val};
 use raw_window_handle::{
     DisplayHandle, HandleError, HasDisplayHandle, RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle,
     WaylandWindowHandle,
@@ -342,6 +347,10 @@ struct Win {
     hints: Option<hint::HintState>,
     /// The image viewer, over everything; it takes keys and the mouse.
     viewer: Option<viewer::Viewer>,
+    /// Messages in the top right corner (scripts, config errors).
+    toasts: Vec<scripting::Toast>,
+    /// Status segments from scripts: left and right of the tab bar.
+    status: (Vec<String>, Vec<String>),
 }
 
 /// A tab being dragged to another window (Wayland drag and drop).
@@ -426,6 +435,8 @@ struct App {
     clipboard_image: Option<(CopyPasteSource, std::sync::Arc<Vec<u8>>)>,
     primary: Option<(PrimarySelectionSource, String)>,
     exit: bool,
+    /// Lua: the config's script, its queued calls, reloading.
+    sc: scripting::Scripting,
 }
 
 /// Wayland and GPU objects of a new window.
@@ -506,18 +517,23 @@ fn make_win(
         hover: None,
         hints: None,
         viewer: None,
+        toasts: Vec::new(),
+        status: Default::default(),
     })
 }
 
 /// Run the GUI. `command` runs in the first pane instead of the shell;
 /// `layout` opens a layout file instead.
 pub fn run(
-    cfg: Config,
+    loaded: crate::config::Loaded,
+    config_path: Option<PathBuf>,
+    overrides: Overrides,
     config_error: Option<String>,
     command: Option<Vec<OsString>>,
     layout: Option<LayoutSpec>,
 ) -> io::Result<i32> {
     let err = |e: String| io::Error::other(e);
+    let crate::config::Loaded { config: cfg, script } = loaded;
     let conn = Connection::connect_to_env().map_err(|e| err(format!("cannot connect to Wayland: {e}")))?;
     let (globals, queue) = registry_queue_init::<App>(&conn).map_err(|e| err(format!("Wayland registry: {e}")))?;
     let qh = queue.handle();
@@ -625,9 +641,14 @@ pub fn run(
         clipboard_image: None,
         primary: None,
         exit: false,
+        sc: scripting::Scripting::default(),
     };
+    app.sc.config_path = config_path;
+    app.sc.overrides = overrides;
+    app.install_script(script);
+    app.watch_config();
     if let Some(e) = config_error {
-        app.notice(format!("config error: {e}"));
+        app.toast(format!("config error (using the defaults): {e}"), true, Some(Duration::from_secs(15)));
     }
 
     // What to open: a layout, the saved session, or one pane.
@@ -669,7 +690,9 @@ pub fn run(
         });
     }
     while !app.exit {
+        app.run_scripts();
         event_loop.dispatch(None, &mut app)?;
+        app.run_scripts();
         app.draw_all();
         let _ = app.conn.flush();
     }
@@ -880,7 +903,7 @@ impl App {
         match self.cfg.tab_bar {
             TabBar::Always => true,
             TabBar::Never => false,
-            TabBar::Auto => self.w.tabs.len() > 1,
+            TabBar::Auto => self.w.tabs.len() > 1 || !self.w.status.0.is_empty() || !self.w.status.1.is_empty(),
         }
     }
 
@@ -1075,6 +1098,7 @@ impl App {
             })
             .collect();
         let cols = ((pw as f32 - 2.0 * p) / cw).max(1.0) as usize;
+        let cols = cols.saturating_sub(self.status_cols(cols)).max(1);
         chrome::tab_bar(&titles, self.w.active, p, p, cols, cw, theme)
     }
 
@@ -1217,7 +1241,9 @@ impl App {
         let mut labels = Vec::new();
         if self.tab_bar_visible() {
             rects.push(([0.0, 0.0, pw as f32, 1.5 * p + ch], theme.bar));
-            labels.extend(self.tab_labels(&theme));
+            let tabs = self.tab_labels(&theme);
+            labels.extend(self.status_labels(&tabs, &theme));
+            labels.extend(tabs);
         }
         if self.hint_bar_visible() {
             let y = ph as f32 - p - ch;
@@ -1267,6 +1293,9 @@ impl App {
 
         labels.extend(self.hint_labels(&theme));
         labels.extend(self.hover_label(&theme));
+        let (r, l) = self.toast_labels(&theme);
+        rects.extend(r);
+        labels.extend(l);
 
         FrameParts {
             panes,
@@ -1380,6 +1409,7 @@ impl App {
             self.w.sync_since = None;
         }
         let mut changed = std::mem::take(&mut self.w.dirty);
+        changed |= self.expire_toasts();
         // Animated images advance only while their pane is on screen.
         let now = Instant::now();
         let mut next_frame: Option<Instant> = None;
@@ -1463,30 +1493,41 @@ impl App {
         })));
         let pane = Pane::spawn(id, &opts, core, (cw, ch), self.sender.clone())?;
         self.panes.insert(id, pane);
+        self.emit(ScriptEvent::new("pane_opened").pane(id));
         Ok(id)
     }
 
     /// Split the focused pane (`None`: along its longer side). With a
     /// floating pane focused, `None` opens another floating pane.
     fn split(&mut self, axis: Option<Axis>) {
-        self.split_with(axis, None, None);
+        if let Err(e) = self.split_with(axis, None, None) {
+            // Too small to split: nothing happens, as before.
+            if e.starts_with("cannot") {
+                self.notice(e);
+            }
+        }
     }
 
     /// Split, running `command` (else the shell) in `cwd` (else the
-    /// focused pane's directory).
-    fn split_with(&mut self, axis: Option<Axis>, cwd: Option<PathBuf>, command: Option<Vec<OsString>>) {
+    /// focused pane's directory). Returns the new pane.
+    fn split_with(
+        &mut self,
+        axis: Option<Axis>,
+        cwd: Option<PathBuf>,
+        command: Option<Vec<OsString>>,
+    ) -> Result<PaneId, String> {
         let (area, m) = (self.area(), self.layout_metrics());
         let tab = &self.w.tabs[self.w.active];
         if axis.is_none() && tab.focus_is_float() && command.is_none() {
-            return self.new_floating();
+            return self.new_floating_with(cwd, None);
         }
         let id = tab.last_tiled;
-        let Some(r) = tab.full_layout(area, m).rect(id) else { return };
+        let Some(r) = tab.full_layout(area, m).rect(id) else { return Err("no pane to split".into()) };
         let (cols, rows) = (r.w / m.cell_w, r.h / m.cell_h);
         // Cells are about twice as tall as wide.
         let axis = axis.unwrap_or(if cols >= 2 * rows { Axis::X } else { Axis::Y });
         if !Tab::can_split(r, axis, m) {
-            return;
+            return Err("the pane is too small to split".into());
         }
         let (c, rw) = match axis {
             Axis::X => (cols / 2, rows),
@@ -1499,38 +1540,57 @@ impl App {
                 self.w.tabs[self.w.active].split(new, axis);
                 self.relayout();
                 self.after_focus(old);
+                Ok(new)
             }
-            Err(e) => self.notice(format!("cannot start shell: {e}")),
+            Err(e) => Err(format!("cannot start shell: {e}")),
         }
     }
 
     fn new_floating(&mut self) {
+        if let Err(e) = self.new_floating_with(None, None) {
+            self.notice(e);
+        }
+    }
+
+    fn new_floating_with(&mut self, cwd: Option<PathBuf>, command: Option<Vec<OsString>>) -> Result<PaneId, String> {
         let (area, m) = (self.area(), self.layout_metrics());
-        let cwd = self.focused_pane().cwd(&self.hostname);
+        let cwd = cwd.or_else(|| self.focused_pane().cwd(&self.hostname));
         let id = self.next_id;
         let f = self.w.tabs[self.w.active].default_float(id, area, m);
-        match self.spawn_pane(f.cols as u16, f.rows as u16, cwd, None) {
+        let old = self.focused_id();
+        match self.spawn_pane(f.cols as u16, f.rows as u16, cwd, command) {
             Ok(new) => {
                 self.w.tabs[self.w.active].add_float(layout::Float { id: new, ..f });
                 self.relayout();
+                self.after_focus(old);
+                Ok(new)
             }
-            Err(e) => self.notice(format!("cannot start shell: {e}")),
+            Err(e) => Err(format!("cannot start shell: {e}")),
         }
     }
 
     fn new_tab(&mut self) {
-        let cwd = self.focused_pane().cwd(&self.hostname);
+        if let Err(e) = self.new_tab_with(None, None) {
+            self.notice(e);
+        }
+    }
+
+    fn new_tab_with(&mut self, cwd: Option<PathBuf>, command: Option<Vec<OsString>>) -> Result<PaneId, String> {
+        let cwd = cwd.or_else(|| self.focused_pane().cwd(&self.hostname));
         let (cols, rows) = {
             let t = &self.focused_pane().term;
             (t.cols() as u16, t.lines() as u16)
         };
-        match self.spawn_pane(cols, rows, cwd, None) {
+        let old = self.focused_id();
+        match self.spawn_pane(cols, rows, cwd, command) {
             Ok(id) => {
                 self.w.tabs.insert(self.w.active + 1, Tab::new(id));
                 self.w.active += 1;
                 self.relayout();
+                self.after_focus(old);
+                Ok(id)
             }
-            Err(e) => self.notice(format!("cannot start shell: {e}")),
+            Err(e) => Err(format!("cannot start shell: {e}")),
         }
     }
 
@@ -1709,7 +1769,9 @@ impl App {
     /// program.
     fn close_pane(&mut self, id: PaneId) {
         if !self.activate_pane(id) {
-            self.panes.remove(&id);
+            if self.panes.remove(&id).is_some() {
+                self.emit(ScriptEvent::new("pane_closed").pane(id));
+            }
             return;
         }
         let Some(ti) = self.w.tabs.iter().position(|t| t.contains(id)) else { return };
@@ -1730,6 +1792,7 @@ impl App {
             self.w.active = self.w.active.min(self.w.tabs.len().saturating_sub(1));
         }
         self.panes.remove(&id);
+        self.emit(ScriptEvent::new("pane_closed").pane(id));
         self.w.prompts.retain(|p| match p {
             Prompt::ClipboardRead(p, ..) | Prompt::Paste(p, _) => *p != id,
             _ => true,
@@ -1928,6 +1991,7 @@ impl App {
             Action::BlockInfo => self.block_info(),
             Action::Hints(h) => self.hints_start(h),
             Action::ViewImage => self.view_last_image(),
+            Action::Lua(f) => self.queue_lua(f),
         }
         if !self.exit {
             self.after_focus(old);
@@ -2043,10 +2107,23 @@ impl App {
         let mut title = p.refresh_proc_title();
         for ev in events {
             match ev {
-                Event::TitleChanged(_) => title = true,
+                Event::TitleChanged(t) => {
+                    title = true;
+                    self.emit(ScriptEvent::new("title_changed").pane(id).with("title", Val::Str(t)));
+                }
+                Event::CwdChanged(c) => {
+                    self.emit(ScriptEvent::new("cwd_changed").pane(id).with("cwd", Val::Str(c.path)));
+                }
+                Event::CommandStarted { command, .. } => {
+                    let command = command.map_or(Val::Nil, Val::Str);
+                    self.emit(ScriptEvent::new("command_started").pane(id).with("command", command));
+                }
                 Event::ClipboardStore { kind, text } => self.set_selection(kind, text),
                 Event::ClipboardLoad { kind, terminator } => self.clipboard_load(id, kind, terminator),
-                Event::Bell => self.bell(id),
+                Event::Bell => {
+                    self.emit(ScriptEvent::new("bell").pane(id));
+                    self.bell(id)
+                }
                 Event::Notification { title, body } => {
                     if self.cfg.notify_osc {
                         let summary =
@@ -2055,6 +2132,14 @@ impl App {
                     }
                 }
                 Event::CommandFinished { block, exit_code, duration } => {
+                    let command = self.panes.get(&id).and_then(|p| p.term.blocks().get(block)?.command.clone());
+                    self.emit(
+                        ScriptEvent::new("command_finished")
+                            .pane(id)
+                            .with("command", command.map_or(Val::Nil, Val::Str))
+                            .with("exit_code", exit_code.map_or(Val::Nil, |c| Val::Int(c as i64)))
+                            .with("duration", duration.map_or(Val::Nil, |d| Val::Num(d.as_secs_f64()))),
+                    );
                     self.command_finished(id, block, exit_code, duration)
                 }
                 _ => {}

@@ -93,6 +93,8 @@ enum Item {
     Tab(usize),
     Pane(PaneId),
     Layout(String),
+    /// `p.palette.add` entry.
+    Lua(crate::script::FnId),
 }
 
 fn recent_path() -> Option<PathBuf> {
@@ -488,6 +490,7 @@ impl App {
     fn palette_items(&self) -> Vec<(String, Item)> {
         let mut v: Vec<(String, Item)> = Action::all().into_iter().map(|a| (a.name(), Item::Action(a))).collect();
         v.sort_by(|a, b| a.0.cmp(&b.0));
+        v.extend(self.sc.palette.iter().map(|(name, f)| (name.clone(), Item::Lua(*f))));
         for (i, t) in self.w.tabs.iter().enumerate() {
             let title =
                 t.name.clone().unwrap_or_else(|| self.panes.get(&t.focus).map_or("", |p| p.title()).to_string());
@@ -579,6 +582,10 @@ impl App {
             Item::Layout(name) => {
                 self.remember(label);
                 self.load_layout(&name);
+            }
+            Item::Lua(f) => {
+                self.remember(label);
+                self.queue_lua(f);
             }
         }
     }

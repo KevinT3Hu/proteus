@@ -8,6 +8,7 @@ mod gui;
 mod icat;
 mod layout;
 mod modes;
+mod script;
 mod session;
 mod spec;
 
@@ -47,6 +48,9 @@ struct Cli {
     /// Print the names of all actions that keys can be bound to, and exit.
     #[arg(long)]
     list_actions: bool,
+    /// Write Lua type annotations (lua-language-server) to DIR/proteus.lua, and exit.
+    #[arg(long, value_name = "DIR")]
+    emit_lua_types: Option<PathBuf>,
     /// Program and arguments to run (overrides `shell.command`).
     #[arg(last = true, value_name = "COMMAND")]
     command: Vec<OsString>,
@@ -60,18 +64,19 @@ enum Tool {
     Icat(icat::Icat),
 }
 
-fn load_config(cli: &Cli) -> (config::Config, Option<String>) {
+/// The config, the file it came from (watched for changes) and its error.
+fn load_config(cli: &Cli) -> (config::Loaded, Option<PathBuf>, Option<String>) {
     if cli.no_config {
-        return (config::Config::default(), None);
+        return (config::defaults(), None, None);
     }
     let (path, explicit) = match &cli.config {
         Some(p) => (Some(p.clone()), true),
         None => (config::default_path(), false),
     };
-    let Some(path) = path else { return (config::Config::default(), None) };
+    let Some(path) = path else { return (config::defaults(), None, None) };
     match config::load(&path, explicit) {
-        Ok(c) => (c, None),
-        Err(e) => (config::Config::default(), Some(e)),
+        Ok(c) => (c, Some(path), None),
+        Err(e) => (config::defaults(), Some(path), Some(e)),
     }
 }
 
@@ -87,16 +92,26 @@ fn main() -> ExitCode {
         println!("tab.goto_N");
         return ExitCode::SUCCESS;
     }
-    let (mut cfg, error) = load_config(&cli);
+    if let Some(dir) = &cli.emit_lua_types {
+        let path = dir.join("proteus.lua");
+        return match std::fs::create_dir_all(dir).and_then(|_| std::fs::write(&path, script::TYPES)) {
+            Ok(()) => {
+                println!("{}", path.display());
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("proteus: {}: {e}", path.display());
+                ExitCode::from(2)
+            }
+        };
+    }
+    let (mut loaded, config_path, error) = load_config(&cli);
     if let Some(e) = &error {
         eprintln!("proteus: config error, using defaults: {e}");
     }
-    if let Some(f) = cli.font {
-        cfg.font_family = f;
-    }
-    if let Some(s) = cli.font_size {
-        cfg.font_size = s.clamp(4.0, 96.0);
-    }
+    // Command-line font options win over the config (also after reloads).
+    let overrides = gui::Overrides { font: cli.font, font_size: cli.font_size.map(|s| s.clamp(4.0, 96.0)) };
+    overrides.apply(&mut loaded.config);
     // The command runs in the first pane; new panes start the shell.
     let command = (!cli.command.is_empty()).then_some(cli.command);
     let layout =
@@ -111,7 +126,7 @@ fn main() -> ExitCode {
                 }
             },
         };
-    match gui::run(cfg, error, command, layout) {
+    match gui::run(loaded, config_path, overrides, error, command, layout) {
         Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
         Err(e) => {
             eprintln!("proteus: {e}");

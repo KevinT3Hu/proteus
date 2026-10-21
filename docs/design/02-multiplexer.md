@@ -134,4 +134,4 @@ panes = { confirm_close = true, confirm_close_ignore = { "less", "man" } },
 16. `keys.preset = "tmux"`: the prefix (`Ctrl+b`, or `keys.leader`) followed by tmux keys: `c n p 1-9 % " o x & z ! { } , [ / : w s r m`, `Ctrl+arrows` to resize; pressing the prefix twice sends it to the application. No Alt quick keys.
 17. Palette: `Ctrl+Shift+p` (tmux: prefix `:`). Type words of an action name, use `Tab`/arrows to choose, `Enter` to run.
 18. `panes.keep_last_shell = true`: closing a window's last pane starts a new shell instead of closing the window.
-19. Status-bar segments from Lua functions and plugins remain for M5 (plugin API).
+19. Status-bar segments: Lua functions (`p.status.segment`, doc 05) are drawn in the tab bar, left ones after the tabs and right ones at the end; with `ui.tab_bar = "auto"` the bar also shows for a single tab while a segment has text. Plugin segments come with the plugin API.

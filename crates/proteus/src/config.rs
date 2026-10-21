@@ -30,22 +30,31 @@
 //!     pane = { ["v"] = "pane.split_right" },
 //!   },
 //! }
+//!
+//! -- Keys can run Lua; hooks, status segments, palette entries, timers:
+//! p.keymap("pane", "g", function(ctx) ctx.pane:split { cmd = "lazygit" } end)
+//! p.on("command_finished", function(ev)
+//!   if ev.exit_code ~= 0 and ev.duration > 30 then p.notify("failed: " .. ev.command) end
+//! end)
+//! p.status.segment("right", function() return os.date("%H:%M") end)
+//! p.palette.add("Git status", function(ctx) ctx.pane:send_text("git status\r") end)
 //! ```
 //!
 //! `p.config` may be called several times; later calls override earlier
 //! keys. `require` resolves modules inside the config directory. Unknown
 //! keys and wrong types are errors, so typos do not go unnoticed. No config
-//! file is required.
+//! file is required. The scripting API is in [`crate::script`].
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use mlua::{Lua, LuaOptions, StdLib, Table, Value};
+use mlua::{Table, Value};
 use proteus_core::ClipboardRead;
 
 use crate::modes::{Action, Chord, KeyConfig, Mode, Preset};
+use crate::script::{Registrar, Script};
 
 /// Cursor blinking policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -251,54 +260,91 @@ pub fn default_path() -> Option<PathBuf> {
     Some(base.join("proteus").join("init.lua"))
 }
 
+/// A loaded config: the settings, and the Lua state the file ran in (with
+/// the hooks, key functions and segments it registered).
+pub struct Loaded {
+    pub config: Config,
+    pub script: Script,
+}
+
 /// Load `path`. A missing default file is not an error; a missing file
 /// given explicitly is.
-pub fn load(path: &Path, explicit: bool) -> Result<Config, String> {
+pub fn load(path: &Path, explicit: bool) -> Result<Loaded, String> {
     let src = match std::fs::read_to_string(path) {
         Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !explicit => return Ok(Config::default()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !explicit => return eval("", path),
         Err(e) => return Err(format!("{}: {e}", path.display())),
     };
     eval(&src, path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// Built-in defaults, with an empty script.
+pub fn defaults() -> Loaded {
+    Loaded { config: Config::default(), script: Script::new(None).expect("a Lua state can be created") }
+}
+
 /// Evaluate config source; `path` names the chunk and sets the module dir.
-pub fn eval(src: &str, path: &Path) -> Result<Config, String> {
-    let lua = Lua::new_with(StdLib::ALL_SAFE, LuaOptions::default()).map_err(|e| e.to_string())?;
+pub fn eval(src: &str, path: &Path) -> Result<Loaded, String> {
+    let script = Script::new(path.parent())?;
     let cfg = Rc::new(RefCell::new(Config::default()));
+    // `p.config` and `p.keymap` only work while the file runs.
+    let loading = Rc::new(Cell::new(true));
     let setup = || -> mlua::Result<()> {
-        let module = lua.create_table()?;
-        let c = cfg.clone();
+        let lua = script.lua();
+        let module = script.module()?;
+        let (c, reg, on) = (cfg.clone(), script.registrar(), loading.clone());
         module.set(
             "config",
-            lua.create_function(move |_, t: Table| apply(&mut c.borrow_mut(), &t).map_err(mlua::Error::external))?,
+            lua.create_function(move |_, t: Table| {
+                if !on.get() {
+                    return Err(mlua::Error::runtime("p.config: only while the config loads"));
+                }
+                apply(&mut c.borrow_mut(), &t, &reg).map_err(mlua::Error::external)
+            })?,
         )?;
-        let package: Table = lua.globals().get("package")?;
-        let loaded: Table = package.get("loaded")?;
-        loaded.set("proteus", module)?;
-        if let Some(dir) = path.parent().and_then(Path::to_str) {
-            package.set("path", format!("{dir}/?.lua;{dir}/?/init.lua"))?;
-        }
-        package.set("cpath", "")?;
+        let (c, reg, on) = (cfg.clone(), script.registrar(), loading.clone());
+        module.set(
+            "keymap",
+            lua.create_function(move |_, (mode, key, action): (String, String, Value)| {
+                if !on.get() {
+                    return Err(mlua::Error::runtime("p.keymap: only while the config loads"));
+                }
+                let m = Mode::from_key(&mode).ok_or_else(|| {
+                    mlua::Error::runtime(format!("p.keymap: unknown mode `{mode}` (normal, locked, pane, ...)"))
+                })?;
+                let bind = binding(&key, &action, &format!("p.keymap(\"{mode}\", \"{key}\")"), &reg)
+                    .map_err(mlua::Error::runtime)?;
+                c.borrow_mut().keys.binds.push((m, bind.0, bind.1));
+                Ok(())
+            })?,
+        )?;
         Ok(())
     };
     setup().map_err(|e| e.to_string())?;
-    lua.load(src).set_name(format!("@{}", path.display())).exec().map_err(|e| clean(&e))?;
-    drop(lua);
-    Ok(Rc::try_unwrap(cfg).map(RefCell::into_inner).unwrap_or_else(|rc| rc.borrow().clone()))
+    script.exec(src, path)?;
+    loading.set(false);
+    let config = cfg.borrow().clone();
+    Ok(Loaded { config, script })
 }
 
-/// First line of a Lua error, without mlua's traceback noise.
-fn clean(e: &mlua::Error) -> String {
-    let s = match e {
-        mlua::Error::CallbackError { cause, .. } => return clean(cause),
-        mlua::Error::ExternalError(e) => e.to_string(),
-        e => e.to_string(),
+/// A key binding: `key` = action name, "none"/false, or a Lua function.
+fn binding(key: &str, action: &Value, name: &str, reg: &Registrar) -> Result<(Chord, Option<Action>), String> {
+    let chord = Chord::parse(key).map_err(|e| format!("{name}: {e}"))?;
+    let action = match action {
+        Value::Boolean(false) => None,
+        Value::Function(f) => Some(Action::Lua(reg.add(f.clone()).map_err(|e| e.to_string())?)),
+        _ => match string(action, name)?.as_str() {
+            "none" => None,
+            a => Some(
+                Action::from_name(a)
+                    .ok_or_else(|| format!("{name}: unknown action `{a}` (see `proteus --list-actions`)"))?,
+            ),
+        },
     };
-    s.lines().next().unwrap_or("").trim_start_matches("runtime error: ").to_string()
+    Ok((chord, action))
 }
 
-fn apply(c: &mut Config, t: &Table) -> Result<(), String> {
+fn apply(c: &mut Config, t: &Table, reg: &Registrar) -> Result<(), String> {
     for pair in t.pairs::<String, Value>() {
         let (k, v) = pair.map_err(|e| format!("config: {e}"))?;
         match k.as_str() {
@@ -427,18 +473,7 @@ fn apply(c: &mut Config, t: &Table) -> Result<(), String> {
                         let mode = Mode::from_key(m).ok_or_else(|| unknown("keys", m))?;
                         let name = format!("keys.{m}");
                         section(v, &name, |key, action| {
-                            let chord = Chord::parse(key).map_err(|e| format!("{name}: {e}"))?;
-                            let action = match action {
-                                Value::Boolean(false) => None,
-                                _ => match string(action, &format!("{name}[\"{key}\"]"))?.as_str() {
-                                    "none" => None,
-                                    a => Some(Action::from_name(a).ok_or_else(|| {
-                                        format!(
-                                            "{name}[\"{key}\"]: unknown action `{a}` (see `proteus --list-actions`)"
-                                        )
-                                    })?),
-                                },
-                            };
+                            let (chord, action) = binding(key, action, &format!("{name}[\"{key}\"]"), reg)?;
                             c.keys.binds.push((mode, chord, action));
                             Ok(())
                         })?;
@@ -611,7 +646,39 @@ mod tests {
     use super::*;
 
     fn ev(src: &str) -> Result<Config, String> {
-        eval(src, Path::new("/nonexistent/init.lua"))
+        eval(src, Path::new("/nonexistent/init.lua")).map(|l| l.config)
+    }
+
+    #[test]
+    fn lua_bindings() {
+        let l = eval(
+            r#"
+            local p = require("proteus")
+            p.keymap("pane", "g", function(ctx) end)
+            p.keymap("normal", "alt+x", "pane.close")
+            p.keymap("normal", "alt+t", false)
+            p.config { keys = { tab = { ["shift+g"] = function() end } } }
+            later = function() p.keymap("normal", "alt+y", "pane.close") end
+        "#,
+            Path::new("/nonexistent/init.lua"),
+        )
+        .unwrap();
+        let b = &l.config.keys.binds;
+        assert_eq!(b[0], (Mode::Pane, Chord::parse("g").unwrap(), Some(Action::Lua(0))));
+        assert_eq!(b[1], (Mode::Normal, Chord::parse("alt+x").unwrap(), Some(Action::ClosePane)));
+        assert_eq!(b[2], (Mode::Normal, Chord::parse("alt+t").unwrap(), None));
+        assert_eq!(b[3], (Mode::Tab, Chord::parse("G").unwrap(), Some(Action::Lua(1))));
+        // Only while loading.
+        let e = l.script.lua().load("later()").exec().unwrap_err();
+        assert!(crate::script::clean(&e).contains("only while the config loads"), "{e}");
+        for (src, want) in [
+            (r#"keymap("insert", "a", "copy")"#, "unknown mode `insert`"),
+            (r#"keymap("normal", "hyper+a", "copy")"#, "p.keymap(\"normal\", \"hyper+a\")"),
+            (r#"keymap("normal", "a", "explode")"#, "unknown action `explode`"),
+        ] {
+            let e = ev(&format!(r#"require("proteus").{src}"#)).unwrap_err();
+            assert!(e.contains(want), "{e}");
+        }
     }
 
     #[test]
@@ -763,10 +830,10 @@ mod tests {
         std::fs::write(dir.join("theme.lua"), "return { size = 20 }").unwrap();
         let init = dir.join("init.lua");
         std::fs::write(&init, r#"require("proteus").config { font = require("theme") }"#).unwrap();
-        let c = load(&init, true).unwrap();
+        let c = load(&init, true).unwrap().config;
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(c.font_size, 20.0);
-        assert_eq!(load(&dir.join("missing.lua"), false).unwrap(), Config::default());
+        assert_eq!(load(&dir.join("missing.lua"), false).unwrap().config, Config::default());
         assert!(load(&dir.join("missing.lua"), true).is_err());
     }
 }

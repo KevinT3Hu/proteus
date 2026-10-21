@@ -218,7 +218,9 @@ impl App {
                         std::env::var("VISUAL").ok().filter(|s| !s.is_empty()).or_else(|| std::env::var("EDITOR").ok());
                     let argv = editor_command(editor.as_deref().unwrap_or("vi"), &path, line, col);
                     let dir = path.parent().map(Path::to_path_buf);
-                    self.split_with(None, dir, Some(argv));
+                    if let Err(e) = self.split_with(None, dir, Some(argv)) {
+                        self.notice(e);
+                    }
                 } else {
                     self.xdg_open(&path.display().to_string(), base.as_deref());
                 }
