@@ -39,6 +39,137 @@ pub enum Key {
     Delete,
     /// F1–F35.
     F(u8),
+    /// A keypad key (see [`Keypad`]).
+    Keypad(Keypad),
+    /// A key that only the kitty protocol can report, by its kitty code:
+    /// modifiers ([`code`] `LEFT_SHIFT`...), locks, Print, Pause, Menu, media keys.
+    Code(u32),
+}
+
+/// Keypad keys. Without the kitty protocol they act like their main-block
+/// counterparts (digits and operators send their text).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Keypad {
+    Digit(u8),
+    Decimal,
+    Divide,
+    Multiply,
+    Subtract,
+    Add,
+    Enter,
+    Equal,
+    Separator,
+    Left,
+    Right,
+    Up,
+    Down,
+    PageUp,
+    PageDown,
+    Home,
+    End,
+    Insert,
+    Delete,
+    Begin,
+}
+
+impl Keypad {
+    /// Kitty key code (KP_0 = 57399 ... KP_BEGIN = 57427).
+    fn code(self) -> u32 {
+        57399
+            + match self {
+                Keypad::Digit(d) => d.min(9) as u32,
+                Keypad::Decimal => 10,
+                Keypad::Divide => 11,
+                Keypad::Multiply => 12,
+                Keypad::Subtract => 13,
+                Keypad::Add => 14,
+                Keypad::Enter => 15,
+                Keypad::Equal => 16,
+                Keypad::Separator => 17,
+                Keypad::Left => 18,
+                Keypad::Right => 19,
+                Keypad::Up => 20,
+                Keypad::Down => 21,
+                Keypad::PageUp => 22,
+                Keypad::PageDown => 23,
+                Keypad::Home => 24,
+                Keypad::End => 25,
+                Keypad::Insert => 26,
+                Keypad::Delete => 27,
+                Keypad::Begin => 28,
+            }
+    }
+
+    /// The main-block key it stands for, given the text it types: what
+    /// key bindings and prompts see.
+    pub fn main_key(self, text: &str) -> Key {
+        match (self.legacy(), self) {
+            (Some(k), _) => k,
+            (None, Keypad::Begin) => Key::Keypad(self),
+            (None, _) => text.chars().next().filter(|c| !c.is_control()).map_or(Key::Keypad(self), Key::Char),
+        }
+    }
+
+    /// The main-block key it stands for in legacy encoding (`None`: its text).
+    fn legacy(self) -> Option<Key> {
+        Some(match self {
+            Keypad::Enter => Key::Enter,
+            Keypad::Left => Key::Left,
+            Keypad::Right => Key::Right,
+            Keypad::Up => Key::Up,
+            Keypad::Down => Key::Down,
+            Keypad::PageUp => Key::PageUp,
+            Keypad::PageDown => Key::PageDown,
+            Keypad::Home => Key::Home,
+            Keypad::End => Key::End,
+            Keypad::Insert => Key::Insert,
+            Keypad::Delete => Key::Delete,
+            _ => return None,
+        })
+    }
+}
+
+/// Kitty codes of keys without a legacy encoding.
+pub mod code {
+    pub const CAPS_LOCK: u32 = 57358;
+    pub const SCROLL_LOCK: u32 = 57359;
+    pub const NUM_LOCK: u32 = 57360;
+    pub const PRINT_SCREEN: u32 = 57361;
+    pub const PAUSE: u32 = 57362;
+    pub const MENU: u32 = 57363;
+    pub const LEFT_SHIFT: u32 = 57441;
+    pub const LEFT_CONTROL: u32 = 57442;
+    pub const LEFT_ALT: u32 = 57443;
+    pub const LEFT_SUPER: u32 = 57444;
+    pub const LEFT_HYPER: u32 = 57445;
+    pub const LEFT_META: u32 = 57446;
+    pub const RIGHT_SHIFT: u32 = 57447;
+    pub const RIGHT_CONTROL: u32 = 57448;
+    pub const RIGHT_ALT: u32 = 57449;
+    pub const RIGHT_SUPER: u32 = 57450;
+    pub const RIGHT_HYPER: u32 = 57451;
+    pub const RIGHT_META: u32 = 57452;
+    pub const ISO_LEVEL3_SHIFT: u32 = 57453;
+    pub const ISO_LEVEL5_SHIFT: u32 = 57454;
+
+    /// Modifier and lock keys: reported only with "report all keys as escape codes".
+    pub fn is_modifier(c: u32) -> bool {
+        (CAPS_LOCK..=NUM_LOCK).contains(&c) || (LEFT_SHIFT..=ISO_LEVEL5_SHIFT).contains(&c)
+    }
+
+    /// The modifier bit a modifier key controls.
+    pub(super) fn modifier_bit(c: u32) -> Option<super::Mods> {
+        use super::Mods;
+        Some(match c {
+            LEFT_SHIFT | RIGHT_SHIFT => Mods::SHIFT,
+            LEFT_CONTROL | RIGHT_CONTROL => Mods::CTRL,
+            LEFT_ALT | RIGHT_ALT => Mods::ALT,
+            LEFT_SUPER | RIGHT_SUPER => Mods::SUPER,
+            LEFT_HYPER | RIGHT_HYPER => Mods::HYPER,
+            LEFT_META | RIGHT_META => Mods::META,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -119,6 +250,21 @@ fn legacy(ev: &KeyEvent, mode: TermMode) -> Option<Vec<u8>> {
     if ev.action == KeyAction::Release {
         return None;
     }
+    match ev.key {
+        Key::Code(_) => return None,
+        Key::Keypad(k) => {
+            return match k.legacy() {
+                Some(key) => legacy(&KeyEvent { key, ..*ev }, mode),
+                None if k == Keypad::Begin => Some(b"\x1b[E".to_vec()),
+                // Digits and operators: their text (Ctrl/Alt as for the main keys).
+                None => {
+                    let c = ev.text.chars().next().filter(|c| !c.is_control())?;
+                    legacy(&KeyEvent { key: Key::Char(c), ..*ev }, mode)
+                }
+            };
+        }
+        _ => {}
+    }
     let m = ev.mods & (Mods::SHIFT | Mods::ALT | Mods::CTRL | Mods::SUPER);
     let alt = m.contains(Mods::ALT);
     let mut out = Vec::new();
@@ -185,6 +331,8 @@ fn kitty_code(key: Key) -> Option<(u32, char)> {
         Key::Backspace => (127, 'u'),
         Key::F(3) => (13, '~'),
         Key::F(n @ 13..=35) => (57376 + (n as u32 - 13), 'u'),
+        Key::Keypad(k) => (k.code(), 'u'),
+        Key::Code(c) => (c, 'u'),
         k => match func(k)? {
             Func::Letter(l) => (1, l as char),
             Func::Tilde(n) => (n as u32, '~'),
@@ -198,11 +346,31 @@ fn kitty(ev: &KeyEvent, mode: TermMode, flags: KeyboardFlags) -> Option<Vec<u8>>
     if ev.action == KeyAction::Release && !events {
         return None;
     }
-    let mods = ev.mods;
-    let active = mods - (Mods::CAPS_LOCK | Mods::NUM_LOCK);
+    let mut mods = ev.mods;
+    let locks = Mods::CAPS_LOCK | Mods::NUM_LOCK;
+    let active = mods - locks;
+    if let Key::Code(c) = ev.key {
+        if code::is_modifier(c) && !report_all {
+            return None;
+        }
+        // A modifier key's own bit reflects the state after the event.
+        if let Some(bit) = code::modifier_bit(c) {
+            mods.set(bit, ev.action != KeyAction::Release);
+        }
+    }
+    let text_key = match ev.key {
+        Key::Char(_) => true,
+        // Digits and operators with Num Lock.
+        Key::Keypad(_) => !ev.text.is_empty() && !ev.text.chars().any(char::is_control),
+        _ => false,
+    };
     if !report_all {
+        // Lock modifiers are not reported for text keys.
+        if text_key {
+            mods -= locks;
+        }
         // Text keys (optionally with Shift) still send plain text.
-        if matches!(ev.key, Key::Char(_)) && (active - Mods::SHIFT).is_empty() && !ev.text.is_empty() {
+        if text_key && (active - Mods::SHIFT).is_empty() && !ev.text.is_empty() {
             return (ev.action != KeyAction::Release).then(|| ev.text.as_bytes().to_vec());
         }
         // Unmodified Enter/Tab/Backspace stay legacy so a crashed app leaves a usable shell.
@@ -449,6 +617,40 @@ mod tests {
         assert_eq!(encode_key(&ev, m, d | KeyboardFlags::REPORT_EVENTS), None);
         let all_ev = KeyboardFlags::REPORT_ALL_AS_ESCAPES | KeyboardFlags::REPORT_EVENTS;
         assert_eq!(encode_key(&ev, m, all_ev).unwrap(), b"\x1b[97;1:3u");
+        // Lock modifiers: not on text keys unless all keys are escapes.
+        assert_eq!(key(Key::Char('a'), Mods::CTRL | Mods::CAPS_LOCK, "", m, d), b"\x1b[97;5u");
+        assert_eq!(key(Key::Up, Mods::NUM_LOCK, "", m, d), b"\x1b[1;129A");
+        assert_eq!(key(Key::Char('a'), Mods::CAPS_LOCK, "A", m, KeyboardFlags::REPORT_ALL_AS_ESCAPES), b"\x1b[97;65u");
+    }
+
+    #[test]
+    fn kitty_keypad_and_modifiers() {
+        let m = TermMode::default();
+        let (none, d) = (KeyboardFlags::empty(), KeyboardFlags::DISAMBIGUATE);
+        let all = KeyboardFlags::REPORT_ALL_AS_ESCAPES;
+        let kp = |k| Key::Keypad(k);
+        // Legacy: like the main keys.
+        assert_eq!(key(kp(Keypad::Digit(1)), Mods::NUM_LOCK, "1", m, none), b"1");
+        assert_eq!(key(kp(Keypad::Up), Mods::empty(), "", m, none), b"\x1b[A");
+        assert_eq!(key(kp(Keypad::Enter), Mods::empty(), "\r", m, none), b"\r");
+        assert_eq!(key(kp(Keypad::Begin), Mods::empty(), "", m, none), b"\x1b[E");
+        // Disambiguate: text keypad keys still send text, the others CSI u.
+        assert_eq!(key(kp(Keypad::Digit(1)), Mods::NUM_LOCK, "1", m, d), b"1");
+        assert_eq!(key(kp(Keypad::Up), Mods::empty(), "", m, d), b"\x1b[57419u");
+        assert_eq!(key(kp(Keypad::Enter), Mods::empty(), "\r", m, d), b"\x1b[57414u");
+        assert_eq!(key(kp(Keypad::Digit(1)), Mods::NUM_LOCK, "1", m, all), b"\x1b[57400;129u");
+        // Modifier keys: only with report-all; their own bit follows the event.
+        let shift = Key::Code(code::LEFT_SHIFT);
+        assert_eq!(encode_key(&KeyEvent::new(shift, Mods::empty(), ""), m, d), None);
+        assert_eq!(encode_key(&KeyEvent::new(shift, Mods::empty(), ""), m, none), None);
+        assert_eq!(key(shift, Mods::empty(), "", m, all), b"\x1b[57441;2u");
+        let mut up = KeyEvent::new(shift, Mods::SHIFT, "");
+        up.action = KeyAction::Release;
+        let ev = all | KeyboardFlags::REPORT_EVENTS;
+        assert_eq!(encode_key(&up, m, ev).unwrap(), b"\x1b[57441;1:3u");
+        // Other kitty-only keys: CSI u with any enhancement, nothing in legacy mode.
+        assert_eq!(key(Key::Code(code::MENU), Mods::empty(), "", m, d), b"\x1b[57363u");
+        assert_eq!(encode_key(&KeyEvent::new(Key::Code(code::MENU), Mods::empty(), ""), m, none), None);
     }
 
     #[test]

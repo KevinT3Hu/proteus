@@ -5,6 +5,7 @@
 
 mod config;
 mod gui;
+mod icat;
 mod layout;
 mod modes;
 mod session;
@@ -19,7 +20,15 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[command(name = "proteus", version, about = "proteus — a Wayland terminal")]
 #[command(after_help = "Without COMMAND, `shell.command` from the config or $SHELL is started.")]
+#[command(
+    args_conflicts_with_subcommands = true,
+    disable_help_subcommand = true,
+    subcommand_value_name = "+TOOL",
+    subcommand_help_heading = "Tools"
+)]
 struct Cli {
+    #[command(subcommand)]
+    tool: Option<Tool>,
     /// Config file [default: $XDG_CONFIG_HOME/proteus/init.lua].
     #[arg(short, long, value_name = "FILE", conflicts_with = "no_config")]
     config: Option<PathBuf>,
@@ -43,6 +52,14 @@ struct Cli {
     command: Vec<OsString>,
 }
 
+/// Helpers run inside a terminal instead of opening a window.
+#[derive(clap::Subcommand, Debug)]
+enum Tool {
+    /// Show images in the terminal (kitty graphics protocol).
+    #[command(name = "+icat")]
+    Icat(icat::Icat),
+}
+
 fn load_config(cli: &Cli) -> (config::Config, Option<String>) {
     if cli.no_config {
         return (config::Config::default(), None);
@@ -60,6 +77,9 @@ fn load_config(cli: &Cli) -> (config::Config, Option<String>) {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if let Some(Tool::Icat(args)) = cli.tool {
+        return ExitCode::from(icat::run(args));
+    }
     if cli.list_actions {
         for a in modes::Action::all() {
             println!("{}", a.name());
@@ -116,5 +136,16 @@ mod tests {
         assert!(Cli::try_parse_from(["proteus", "run"]).is_err());
         assert_eq!(Cli::try_parse_from(["proteus", "-l", "dev"]).unwrap().layout.as_deref(), Some("dev"));
         assert!(Cli::try_parse_from(["proteus", "-l", "dev", "--", "htop"]).is_err());
+        // Tools are subcommands.
+        let c = Cli::try_parse_from(["proteus", "+icat", "--place", "40x20@1x2", "--scale", "a.png"]).unwrap();
+        let Some(Tool::Icat(a)) = c.tool else { panic!("not +icat") };
+        assert_eq!(a.place, Some(icat::Place { cols: 40, rows: 20, x: 1, y: 2 }));
+        assert!(a.scale && !a.clear && a.files == ["a.png"]);
+        assert!(Cli::try_parse_from(["proteus", "+icat"]).is_err());
+        assert!(Cli::try_parse_from(["proteus", "+icat", "--clear"]).is_ok());
+        assert!(Cli::try_parse_from(["proteus", "+icat", "--place", "4x2", "a"]).is_err());
+        // Window options do not mix with tools.
+        assert!(Cli::try_parse_from(["proteus", "--no-config", "+icat", "a.png"]).is_err());
+        assert!(Cli::try_parse_from(["proteus", "--", "htop"]).unwrap().tool.is_none());
     }
 }

@@ -14,6 +14,9 @@
 //!   session = { restore = "ask", restore_commands = { "nvim", "htop" } },
 //!   notify = { min_duration = 10, osc = true },  -- min_duration = false: never
 //!   bell = { visual = true },
+//!   -- Inline images (kitty, Sixel, iTerm2). Sizes in MiB.
+//!   graphics = { enabled = true, max_image = 64, pane_memory = 256, total_memory = 1024,
+//!                gpu_memory = 512, local_files = true },
 //!   hints = {
 //!     alphabet = "asdfghjkl",
 //!     patterns = { { name = "jira", regex = "\\b[A-Z]+-\\d+\\b", url = "https://jira.example/browse/{}" } },
@@ -99,6 +102,39 @@ pub struct Config {
     pub hint_alphabet: String,
     /// Extra hint patterns, tried before the built-in ones.
     pub hint_patterns: Vec<HintPatternConfig>,
+    pub graphics: Graphics,
+}
+
+/// Inline image settings (`graphics = { ... }`); sizes in bytes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Graphics {
+    /// Accept image protocols at all.
+    pub enabled: bool,
+    /// Largest single decoded image (all frames).
+    pub max_image: usize,
+    /// Decoded image memory per pane.
+    pub pane_memory: usize,
+    /// Decoded image memory of all panes together.
+    pub total_memory: usize,
+    /// GPU texture memory per window before least recently drawn images are
+    /// dropped (and uploaded again when needed).
+    pub gpu_memory: usize,
+    /// Let local programs send images as files or shared memory (kitty `t=f/t/s`).
+    pub local_files: bool,
+}
+
+impl Default for Graphics {
+    fn default() -> Self {
+        const MIB: usize = 1 << 20;
+        Self {
+            enabled: true,
+            max_image: 64 * MIB,
+            pane_memory: 256 * MIB,
+            total_memory: 1024 * MIB,
+            gpu_memory: 512 * MIB,
+            local_files: true,
+        }
+    }
 }
 
 /// A user-defined hint pattern: `{ name = "jira", regex = "[A-Z]+-\\d+", url = "https://x/browse/{}" }`.
@@ -179,6 +215,7 @@ impl Default for Config {
             visual_bell: true,
             hint_alphabet: proteus_core::hints::DEFAULT_ALPHABET.into(),
             hint_patterns: Vec::new(),
+            graphics: Graphics::default(),
         }
     }
 }
@@ -192,6 +229,11 @@ impl Config {
         c.osc52_write = self.osc52_write;
         c.osc52_read = self.osc52_read;
         c.grapheme_clustering = self.grapheme_clustering;
+        let g = &mut c.graphics;
+        g.enabled = self.graphics.enabled;
+        g.max_image_bytes = self.graphics.max_image;
+        g.pane_budget = self.graphics.pane_memory;
+        g.allow_local_files = self.graphics.local_files;
         c
     }
 
@@ -466,6 +508,26 @@ fn apply(c: &mut Config, t: &Table) -> Result<(), String> {
                 }
                 Ok(())
             })?,
+            "graphics" => section(&v, "graphics", |k, v| {
+                let mib = |v: &Value, name: &str| -> Result<usize, String> {
+                    let n = number(v, name)?;
+                    if !(1.0..=1048576.0).contains(&n) {
+                        return Err(format!("{name}: expected a size in MiB (1 or more)"));
+                    }
+                    Ok((n * 1048576.0) as usize)
+                };
+                let g = &mut c.graphics;
+                match k {
+                    "enabled" => g.enabled = boolean(v, "graphics.enabled")?,
+                    "max_image" => g.max_image = mib(v, "graphics.max_image")?,
+                    "pane_memory" => g.pane_memory = mib(v, "graphics.pane_memory")?,
+                    "total_memory" => g.total_memory = mib(v, "graphics.total_memory")?,
+                    "gpu_memory" => g.gpu_memory = mib(v, "graphics.gpu_memory")?,
+                    "local_files" => g.local_files = boolean(v, "graphics.local_files")?,
+                    _ => return Err(unknown("graphics", k)),
+                }
+                Ok(())
+            })?,
             _ => return Err(format!("unknown config key `{k}`")),
         }
     }
@@ -666,6 +728,28 @@ mod tests {
             (r#"hints = { patterns = { { regex = "(" } } }"#, "hints.patterns[1].regex"),
             (r#"hints = { patterns = { { name = "x" } } }"#, "`regex` is required"),
             (r#"notify = { when = 1 }"#, "notify.when"),
+        ] {
+            let e = ev(&format!(r#"require("proteus").config {{ {src} }}"#)).unwrap_err();
+            assert!(e.contains(want), "{e}");
+        }
+    }
+
+    #[test]
+    fn graphics_config() {
+        let c = ev(r#"require("proteus").config {
+            graphics = { enabled = false, max_image = 8, pane_memory = 32, total_memory = 100, gpu_memory = 64.5, local_files = false },
+        }"#)
+        .unwrap();
+        let g = &c.graphics;
+        assert!(!g.enabled && !g.local_files);
+        assert_eq!((g.max_image, g.pane_memory, g.total_memory), (8 << 20, 32 << 20, 100 << 20));
+        assert_eq!(g.gpu_memory, (64.5 * 1048576.0) as usize);
+        let core = c.core();
+        assert!(!core.graphics.enabled && !core.graphics.allow_local_files);
+        assert_eq!((core.graphics.max_image_bytes, core.graphics.pane_budget), (8 << 20, 32 << 20));
+        for (src, want) in [
+            (r#"graphics = { max_image = 0 }"#, "graphics.max_image"),
+            (r#"graphics = { sixel = true }"#, "graphics.sixel"),
         ] {
             let e = ev(&format!(r#"require("proteus").config {{ {src} }}"#)).unwrap_err();
             assert!(e.contains(want), "{e}");

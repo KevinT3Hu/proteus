@@ -101,3 +101,44 @@ pub fn decode_image(data: &[u8], max_bytes: usize) -> Result<DecodedImage, Decod
 pub fn image_dimensions(data: &[u8]) -> Option<(u32, u32)> {
     ImageReader::new(Cursor::new(data)).with_guessed_format().ok()?.into_dimensions().ok()
 }
+
+type Job = Box<dyn FnOnce() + Send>;
+
+/// Run `job` on a small pool of decoder threads shared by all terminals.
+pub(crate) fn run_in_background(job: Job) {
+    use std::sync::mpsc::{Sender, channel};
+    use std::sync::{Arc, Mutex, OnceLock};
+    static POOL: OnceLock<Option<Sender<Job>>> = OnceLock::new();
+    let pool = POOL.get_or_init(|| {
+        let (tx, rx) = channel::<Job>();
+        let rx = Arc::new(Mutex::new(rx));
+        let n = std::thread::available_parallelism().map_or(2, |n| n.get()).clamp(1, 4);
+        let mut started = 0;
+        for i in 0..n {
+            let rx = rx.clone();
+            let spawned = std::thread::Builder::new().name(format!("image-decode-{i}")).spawn(move || {
+                loop {
+                    let job = match rx.lock() {
+                        Ok(rx) => rx.recv(),
+                        Err(_) => return,
+                    };
+                    match job {
+                        Ok(job) => job(),
+                        Err(_) => return,
+                    }
+                }
+            });
+            started += spawned.is_ok() as usize;
+        }
+        (started > 0).then_some(tx)
+    });
+    match pool {
+        Some(tx) => {
+            if let Err(e) = tx.send(job) {
+                (e.0)();
+            }
+        }
+        // No threads: decode right here.
+        None => job(),
+    }
+}

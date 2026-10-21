@@ -1,5 +1,5 @@
-// Instanced quads: solid rectangles, alpha-mask glyphs, color glyphs and
-// curly underlines. Output is premultiplied alpha.
+// Instanced quads: solid rectangles, alpha-mask glyphs, color glyphs,
+// curly underlines and images. Output is premultiplied alpha.
 
 struct Globals {
     screen: vec2<f32>,
@@ -13,6 +13,8 @@ struct Globals {
 @group(0) @binding(2) var color_tex: texture_2d<f32>;
 @group(0) @binding(3) var nearest: sampler;
 @group(0) @binding(4) var linear_sampler: sampler;
+// The image drawn by IMAGE instances (a 1x1 dummy otherwise).
+@group(1) @binding(0) var image_tex: texture_2d<f32>;
 
 struct VsIn {
     @builtin(vertex_index) vi: u32,
@@ -77,6 +79,18 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
             let center = in.params.w * 0.5 + amp * sin(in.local.x * 6.2831853 / in.params.y);
             let a = clamp(in.params.x * 0.5 + 0.5 - abs(h - center), 0.0, 1.0) * c.a;
             return vec4<f32>(c.rgb * a, a);
+        }
+        case 4u, 5u: {
+            // Image (straight alpha); color.a is the opacity. 5: unsmoothed.
+            var t = textureSampleLevel(image_tex, linear_sampler, in.uv, 0.0);
+            if in.kind == 5u {
+                t = textureSampleLevel(image_tex, nearest, in.uv, 0.0);
+            }
+            if g.linear == 1u {
+                t = vec4<f32>(to_linear(t.rgb), t.a);
+            }
+            let a = t.a * c.a;
+            return vec4<f32>(t.rgb * a, a);
         }
         default: {
             return vec4<f32>(c.rgb * c.a, c.a);

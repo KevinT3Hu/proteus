@@ -363,3 +363,94 @@ fn graphics_disabled() {
     assert_eq!(out(&mut t), "");
     assert_eq!(t.row_text(0), "ok");
 }
+
+/// A config decoding in the background; the waker counts wake-ups.
+fn background() -> (Config, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let woken = Arc::new(AtomicUsize::new(0));
+    let w = woken.clone();
+    let mut c = Config::default();
+    c.graphics.waker = Some(proteus_core::graphics::DecodeWaker(Arc::new(move || {
+        w.fetch_add(1, Ordering::SeqCst);
+    })));
+    (c, woken)
+}
+
+/// Feed nothing until `n` decodes have woken us.
+fn settle(t: &mut Terminal, woken: &std::sync::atomic::AtomicUsize, n: usize) {
+    let start = Instant::now();
+    while woken.load(std::sync::atomic::Ordering::SeqCst) < n {
+        assert!(start.elapsed() < Duration::from_secs(10), "decode timed out");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    t.advance(b"");
+}
+
+#[test]
+fn background_decode_places_first_and_replies_later() {
+    let (c, woken) = background();
+    let mut t = term_with(20, 10, c);
+    feed(&mut t, &apc("a=T,f=100,i=3", &png(30, 40, [1, 2, 3, 255])));
+    // Placed with its header's size right away; the cursor moved past it.
+    assert_eq!(t.images().placements()[0].cells(), (3, 2));
+    assert_eq!(cursor(&t), (3, 1));
+    let img = t.images().image_by_id(3).unwrap();
+    assert!(img.is_loading() && img.pixels().is_none());
+    assert!(t.visible_images()[0].loading);
+    assert_eq!(out(&mut t), "");
+    settle(&mut t, &woken, 1);
+    let img = t.images().image_by_id(3).unwrap();
+    assert!(!img.is_loading());
+    assert_eq!(&img.pixels().unwrap()[..4], &[1, 2, 3, 255]);
+    assert_eq!(out(&mut t), "\x1b_Gi=3;OK\x1b\\");
+}
+
+#[test]
+fn background_decode_failure_removes_the_image() {
+    let (c, woken) = background();
+    let mut t = term_with(20, 10, c);
+    let mut bad = png(30, 40, [1, 2, 3, 255]);
+    bad.truncate(bad.len() / 2);
+    feed(&mut t, &apc("a=T,f=100,i=4", &bad));
+    settle(&mut t, &woken, 1);
+    assert!(t.images().image_by_id(4).is_none());
+    assert!(t.images().placements().is_empty());
+    assert!(out(&mut t).starts_with("\x1b_Gi=4;EBADPNG"));
+}
+
+#[test]
+fn background_iterm_gif_animates() {
+    use image::codecs::gif::GifEncoder;
+    let (c, woken) = background();
+    let mut t = term_with(20, 10, c);
+    let mut buf = Vec::new();
+    {
+        let mut enc = GifEncoder::new(&mut buf);
+        for color in [[255, 0, 0, 255], [0, 0, 255, 255]] {
+            let f = image::Frame::from_parts(
+                image::RgbaImage::from_pixel(8, 8, image::Rgba(color)),
+                0,
+                0,
+                image::Delay::from_numer_denom_ms(200, 1),
+            );
+            enc.encode_frame(f).unwrap();
+        }
+    }
+    feed(&mut t, &format!("\x1b]1337;File=inline=1:{}\x07", B64.encode(&buf)));
+    settle(&mut t, &woken, 1);
+    let img = t.images().images().next().unwrap();
+    assert_eq!(img.frame_count(), 2);
+    assert_eq!(img.animation_state(), AnimationState::Running);
+}
+
+#[test]
+fn frame_commands_wait_for_decodes() {
+    let (c, _) = background();
+    let mut t = term_with(20, 10, c);
+    feed(&mut t, &apc("a=t,f=100,i=5,q=2", &png(4, 4, [0, 0, 0, 255])));
+    // Adding a frame needs the decoded root frame.
+    feed(&mut t, &apc("a=f,i=5,f=32,s=4,v=4", &rgba(4, 4, [9, 9, 9, 255])));
+    assert_eq!(out(&mut t), "\x1b_Gi=5;OK\x1b\\");
+    assert_eq!(t.images().image_by_id(5).unwrap().frame_count(), 2);
+}

@@ -161,6 +161,7 @@ pub struct Terminal {
     apc_buf: Vec<u8>,
     apc_overflow: bool,
     iterm_multipart: Option<(String, Vec<u8>)>,
+    decodes: graphics::Decodes,
 }
 
 fn default_tabs(cols: usize) -> Vec<bool> {
@@ -216,11 +217,13 @@ impl Terminal {
             apc_buf: Vec::new(),
             apc_overflow: false,
             iterm_multipart: None,
+            decodes: Default::default(),
         }
     }
 
     /// Feed bytes read from the PTY.
     pub fn advance(&mut self, bytes: &[u8]) {
+        self.poll_images();
         let mut parser = std::mem::take(&mut self.parser);
         self.feed(&mut parser, bytes);
         self.parser = parser;

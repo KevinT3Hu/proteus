@@ -107,6 +107,8 @@ impl Chord {
             Key::Insert => "ins".into(),
             Key::Delete => "del".into(),
             Key::F(n) => format!("f{n}"),
+            Key::Keypad(k) => format!("kp_{k:?}").to_lowercase(),
+            Key::Code(c) => format!("key{c}"),
         };
         mods_prefix(self.mods) + &key
     }
@@ -365,6 +367,8 @@ pub enum Action {
     BlockInfo,
     /// Label on-screen URLs, paths, hashes...; typing a label picks one.
     Hints(HintAction),
+    /// Open the newest image on screen in the image viewer.
+    ViewImage,
 }
 
 /// Cells per resize step.
@@ -456,6 +460,7 @@ impl Action {
             Action::BlockRerun => "block.rerun".into(),
             Action::BlockInfo => "block.info".into(),
             Action::Hints(h) => format!("hints.{}", h.key()),
+            Action::ViewImage => "image.view".into(),
         }
     }
 
@@ -513,6 +518,7 @@ impl Action {
         v.extend(PARTS.map(Action::BlockSelect));
         v.extend([Action::BlockFold, Action::BlockUnfoldAll, Action::BlockRerun, Action::BlockInfo]);
         v.extend([HintAction::Open, HintAction::Copy, HintAction::Insert].map(Action::Hints));
+        v.push(Action::ViewImage);
         v
     }
 
@@ -592,6 +598,7 @@ impl Action {
             Action::BlockInfo => "info",
             Action::Hints(_) if mode.passes_keys() => return None,
             Action::Hints(_) => "hints",
+            Action::ViewImage => return None,
         })
     }
 }

@@ -1345,9 +1345,11 @@ checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
 name = "proteus"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "bytemuck",
  "clap",
  "image",
+ "miniz_oxide 0.9.1",
  "mlua",
  "naga",
  "pollster",

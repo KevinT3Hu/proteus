@@ -10,6 +10,7 @@ mod chrome;
 mod copy;
 mod font;
 mod hint;
+mod images;
 mod ime;
 mod keys;
 mod notify;
@@ -18,6 +19,7 @@ mod render;
 mod rows;
 mod scroll;
 mod textinput;
+mod viewer;
 mod workspace;
 
 use std::collections::{HashMap, VecDeque};
@@ -143,6 +145,8 @@ pub(crate) enum Msg {
     /// A desktop notification about this pane was clicked (with an
     /// xdg-activation token, if the daemon sent one).
     NotifyActivated(PaneId, Option<String>),
+    /// Images of this pane finished decoding in the background.
+    ImagesDecoded(PaneId),
 }
 
 /// Lets wgpu's GL backend reach the Wayland display.
@@ -238,6 +242,8 @@ enum Drag {
     FloatMove(PaneId, (i32, i32)),
     /// Floating pane resized by its corner.
     FloatResize(PaneId),
+    /// Image in the viewer panned; the last pointer position.
+    Viewer((f64, f64)),
 }
 
 /// One pane of a frame, without borrows (see [`FrameParts`]).
@@ -313,7 +319,8 @@ struct Win {
     frame_pending: bool,
     dirty: bool,
     sync_since: Option<Instant>,
-    retry_scheduled: bool,
+    /// When the pending redraw timer fires (see [`App::schedule`]).
+    wake_at: Option<Instant>,
     /// Has keyboard focus.
     focused: bool,
     /// Never empty while the window is open.
@@ -333,6 +340,8 @@ struct Win {
     hover: Option<(PaneId, proteus_core::blocks::BlockId)>,
     /// Hint mode: labels are shown and keys pick one.
     hints: Option<hint::HintState>,
+    /// The image viewer, over everything; it takes keys and the mouse.
+    viewer: Option<viewer::Viewer>,
 }
 
 /// A tab being dragged to another window (Wayland drag and drop).
@@ -398,6 +407,8 @@ struct App {
     hint_patterns: Vec<proteus_core::hints::HintPattern>,
     /// Palette entries used recently, most recent first.
     recent: Vec<String>,
+    /// Decoded image memory shared by all panes (`graphics.total_memory`).
+    image_budget: std::sync::Arc<proteus_core::ImageBudget>,
 
     keyboard: Option<WlKeyboard>,
     pointer: Option<ThemedPointer>,
@@ -411,6 +422,8 @@ struct App {
     /// Serial of the last pointer button press (starts drags).
     press_serial: u32,
     clipboard: Option<(CopyPasteSource, String)>,
+    /// An image (PNG) we offer on the clipboard instead of text.
+    clipboard_image: Option<(CopyPasteSource, std::sync::Arc<Vec<u8>>)>,
     primary: Option<(PrimarySelectionSource, String)>,
     exit: bool,
 }
@@ -462,7 +475,8 @@ fn make_win(
         })
     }
     .map_err(|e| err(format!("cannot create GPU surface: {e}")))?;
-    let renderer = Renderer::new(instance, wsurface, size).map_err(err)?;
+    let mut renderer = Renderer::new(instance, wsurface, size).map_err(err)?;
+    renderer.images.budget = cfg.graphics.gpu_memory;
     Ok(Win {
         renderer,
         window,
@@ -477,7 +491,7 @@ fn make_win(
         frame_pending: false,
         dirty: true,
         sync_since: None,
-        retry_scheduled: false,
+        wake_at: None,
         focused: false,
         tabs: Vec::new(),
         active: 0,
@@ -491,6 +505,7 @@ fn make_win(
         defer_pty_resize: false,
         hover: None,
         hints: None,
+        viewer: None,
     })
 }
 
@@ -547,6 +562,7 @@ pub fn run(
             channel::Event::Msg(Msg::PtyClosed(id)) => app.close_pane(id),
             channel::Event::Msg(Msg::Clipboard(target, text)) => app.clipboard_received(target, text),
             channel::Event::Msg(Msg::NotifyActivated(pane, token)) => app.notification_clicked(pane, token),
+            channel::Event::Msg(Msg::ImagesDecoded(id)) => app.pty_output(id, &[]),
             channel::Event::Closed => app.exit = true,
         })
         .map_err(|e| err(e.to_string()))?;
@@ -554,6 +570,7 @@ pub fn run(
     let notifier = notify::Notifier::new(sender.clone());
     let activation = ActivationState::bind(&globals, &qh).ok();
     let hint_patterns = hint::patterns(&cfg.hint_patterns);
+    let cfg_total_memory = cfg.graphics.total_memory;
     let mut app = App {
         w: first,
         parked: Vec::new(),
@@ -594,6 +611,7 @@ pub fn run(
         activation,
         hint_patterns,
         recent: scroll::load_recent(),
+        image_budget: proteus_core::ImageBudget::new(cfg_total_memory),
         keyboard: None,
         pointer: None,
         data_device: None,
@@ -604,6 +622,7 @@ pub fn run(
         serial: 0,
         press_serial: 0,
         clipboard: None,
+        clipboard_image: None,
         primary: None,
         exit: false,
     };
@@ -811,7 +830,9 @@ impl App {
                 p.preedit = Some(ime::Preedit { text: text.clone(), cursor });
             }
         }
-        let info = parts.resolve(&self.panes);
+        let area = self.viewer_area();
+        let mut info = parts.resolve(&self.panes);
+        info.viewer = self.w.viewer.as_ref().map(|v| v.frame(area));
         let (w, h, px) = self.w.renderer.snapshot(&mut self.w.fonts, &info);
         drop(info);
         if let Err(e) = image::save_buffer(path, &px, w, h, image::ColorType::Rgba8) {
@@ -864,7 +885,7 @@ impl App {
     }
 
     fn hint_bar_visible(&self) -> bool {
-        if self.w.input.is_some() || self.w.hints.is_some() {
+        if self.w.input.is_some() || self.w.hints.is_some() || self.w.viewer.is_some() {
             return true;
         }
         match self.cfg.hint_bar {
@@ -1210,6 +1231,19 @@ impl App {
                     chrome::input_bar(i.purpose.badge(), &i.text, caret_cols, &i.status, p, y, cols, cw, &theme);
                 labels.extend(l);
                 rects.push(([x, y, (cw / 8.0).round().max(1.0), ch], theme.fg));
+            } else if let Some(v) = &self.w.viewer {
+                let hints = [
+                    ("wheel +-", "zoom"),
+                    ("0", "fit"),
+                    ("1", "1:1"),
+                    ("drag ←→", "pan"),
+                    ("c", "copy"),
+                    ("s", "save"),
+                    ("esc", "close"),
+                ]
+                .map(|(k, a)| (k.to_string(), a))
+                .to_vec();
+                labels.extend(chrome::hint_bar(&v.title(self.viewer_area()), &hints, p, y, cols, cw, &theme));
             } else if let Some(h) = &self.w.hints {
                 let hints = vec![
                     ("a-z".to_string(), h.action.key()),
@@ -1247,6 +1281,7 @@ impl App {
                 rects,
                 labels,
                 overlay: self.w.prompts.front().map(Prompt::overlay),
+                viewer: None,
             },
         }
     }
@@ -1308,15 +1343,18 @@ impl App {
         ime.set_cursor_rect((lx, ly, w.max(1), h.max(1)));
     }
 
+    /// Redraw the window after `after`, unless a redraw is already due
+    /// sooner. Only the earliest timer counts; superseded ones do nothing.
     fn schedule(&mut self, after: Duration) {
-        if self.w.retry_scheduled {
+        let at = Instant::now() + after;
+        if self.w.wake_at.is_some_and(|w| w <= at) {
             return;
         }
-        self.w.retry_scheduled = true;
+        self.w.wake_at = Some(at);
         let id = self.w.id;
-        let _ = self.handle.insert_source(Timer::from_duration(after), move |_, _, app| {
-            if app.activate(id) {
-                app.w.retry_scheduled = false;
+        let _ = self.handle.insert_source(Timer::from_deadline(at), move |_, _, app| {
+            if app.activate(id) && app.w.wake_at == Some(at) {
+                app.w.wake_at = None;
                 app.w.dirty = true;
             }
             TimeoutAction::Drop
@@ -1342,6 +1380,16 @@ impl App {
             self.w.sync_since = None;
         }
         let mut changed = std::mem::take(&mut self.w.dirty);
+        // Animated images advance only while their pane is on screen.
+        let now = Instant::now();
+        let mut next_frame: Option<Instant> = None;
+        for id in &visible {
+            if let Some(p) = self.panes.get_mut(id)
+                && let Some(t) = p.term.tick_images(now)
+            {
+                next_frame = Some(next_frame.map_or(t, |n| n.min(t)));
+            }
+        }
         for id in &mine {
             // Hidden panes' damage is dropped: they redraw fully when shown.
             if let Some(p) = self.panes.get_mut(id)
@@ -1351,12 +1399,17 @@ impl App {
                 changed = true;
             }
         }
+        if let Some(t) = next_frame {
+            self.schedule(t.saturating_duration_since(now));
+        }
         if !changed {
             return;
         }
         let surface = self.w.window.wl_surface().clone();
         surface.frame(&self.qh, FrameCallbackData(surface.clone()));
-        let info = self.frame_parts().resolve(&self.panes);
+        let area = self.viewer_area();
+        let mut info = self.frame_parts().resolve(&self.panes);
+        info.viewer = self.w.viewer.as_ref().map(|v| v.frame(area));
         let ok = self.w.renderer.draw(&mut self.w.fonts, &info);
         drop(info);
         if ok {
@@ -1400,7 +1453,15 @@ impl App {
             rows: rows.max(1),
             cell: Some((cw as u16, ch as u16)),
         };
-        let pane = Pane::spawn(id, &opts, self.cfg.core(), (cw, ch), self.sender.clone())?;
+        let mut core = self.cfg.core();
+        core.graphics.window_budget = Some(self.image_budget.clone());
+        let tx = std::sync::Mutex::new(self.sender.clone());
+        core.graphics.waker = Some(proteus_core::graphics::DecodeWaker(std::sync::Arc::new(move || {
+            if let Ok(tx) = tx.lock() {
+                let _ = tx.send(Msg::ImagesDecoded(id));
+            }
+        })));
+        let pane = Pane::spawn(id, &opts, core, (cw, ch), self.sender.clone())?;
         self.panes.insert(id, pane);
         Ok(id)
     }
@@ -1866,6 +1927,7 @@ impl App {
             Action::BlockRerun => self.block_rerun(),
             Action::BlockInfo => self.block_info(),
             Action::Hints(h) => self.hints_start(h),
+            Action::ViewImage => self.view_last_image(),
         }
         if !self.exit {
             self.after_focus(old);
@@ -1915,6 +1977,18 @@ impl App {
                     name.strip_prefix("key:").filter(|_| app.w.hints.is_some()).and_then(|k| k.chars().next())
                 {
                     app.hint_key(input::Key::Char(c), input::Mods::empty());
+                    continue;
+                }
+                if let Some(k) = name.strip_prefix("key:").filter(|_| app.w.viewer.is_some()) {
+                    let key = match k {
+                        "esc" => input::Key::Escape,
+                        "left" => input::Key::Left,
+                        "right" => input::Key::Right,
+                        "up" => input::Key::Up,
+                        "down" => input::Key::Down,
+                        _ => input::Key::Char(k.chars().next().unwrap_or(' ')),
+                    };
+                    app.viewer_key(key, input::Mods::empty());
                     continue;
                 }
                 if let Some(text) = name.strip_prefix("type:") {
@@ -2091,12 +2165,30 @@ impl App {
     // --- keyboard ------------------------------------------------------------
 
     fn key(&mut self, event: KeyEvent, action: KeyAction) {
-        if keys::is_modifier(event.keysym) {
-            return;
-        }
         self.activate_kbd();
+        if keys::is_modifier(event.keysym) {
+            // Only for applications that asked for every key (kitty flag 8),
+            // and only when nothing of ours takes the keys.
+            let ours = !self.w.prompts.is_empty()
+                || self.w.input.is_some()
+                || self.w.hints.is_some()
+                || self.w.viewer.is_some()
+                || !self.w.mode.passes_keys();
+            let wants =
+                self.focused_pane().term.keyboard_flags().contains(proteus_core::KeyboardFlags::REPORT_ALL_AS_ESCAPES);
+            if ours || !wants {
+                return;
+            }
+        }
         let mods = keys::mods(&self.mods);
         let Some((key, shifted)) = self.levels.key(event.keysym, event.raw_code) else { return };
+        // The key as our own UI sees it (keypad keys as their main keys);
+        // the application gets `pane_key`.
+        let pane_key = key;
+        let key = match key {
+            input::Key::Keypad(k) => k.main_key(event.utf8.as_deref().unwrap_or("")),
+            k => k,
+        };
         if action == KeyAction::Release {
             // The press went to the multiplexer: so does the release.
             if let Some(i) = self.consumed.iter().position(|&c| c == event.raw_code) {
@@ -2110,6 +2202,18 @@ impl App {
                 if action == KeyAction::Press {
                     self.answer_prompt(key);
                 }
+                return;
+            }
+            if self.w.viewer.is_some() {
+                self.consume(event.raw_code);
+                // `+` is typed as Shift+`=` on most layouts.
+                let key = match (key, shifted) {
+                    (input::Key::Char(_), Some(c)) if mods.contains(input::Mods::SHIFT) && "+".contains(c) => {
+                        input::Key::Char(c)
+                    }
+                    _ => key,
+                };
+                self.viewer_key(key, mods);
                 return;
             }
             if self.w.input.is_some() {
@@ -2156,7 +2260,7 @@ impl App {
             }
         }
         let text = event.utf8.as_deref().unwrap_or("");
-        let ev = input::KeyEvent { key, mods, action, text, shifted };
+        let ev = input::KeyEvent { key: pane_key, mods, action, text, shifted };
         let p = self.focused_pane_mut();
         if let Some(bytes) = input::encode_key(&ev, p.term.mode(), p.term.keyboard_flags()) {
             if action != KeyAction::Release {
@@ -2199,6 +2303,7 @@ impl App {
                 let src = mgr.create_copy_paste_source(&self.qh, MIMES);
                 src.set_selection(dev, self.serial);
                 self.clipboard = Some((src, text));
+                self.clipboard_image = None;
             }
             ClipboardKind::Primary => {
                 let (Some(mgr), Some(dev)) = (&self.primary_manager, &self.primary_device) else { return };
@@ -2442,6 +2547,9 @@ impl App {
 
     fn pointer_event(&mut self, ev: &PointerEvent) {
         self.w.mouse.pos = ev.position;
+        if self.w.viewer.is_some() && self.viewer_pointer(ev) {
+            return;
+        }
         match ev.kind {
             PointerEventKind::Enter { .. } => {
                 self.w.mouse.icon = None;
@@ -2527,6 +2635,14 @@ impl App {
                     return;
                 }
                 let Some((id, part)) = self.hit_at(ev.position) else { return };
+                // Ctrl+click on an image opens the viewer.
+                if b == MouseButton::Left
+                    && self.mods.ctrl
+                    && part == layout::Part::Content
+                    && self.view_image_at(id, ev.position)
+                {
+                    return;
+                }
                 if id != self.focused_id() {
                     let old = self.focused_id();
                     self.w.tabs[self.w.active].set_focus(id);
@@ -2626,6 +2742,46 @@ impl App {
         }
     }
 
+    /// Pointer events while the viewer is open. Returns false for the ones
+    /// handled as usual (enter, leave).
+    fn viewer_pointer(&mut self, ev: &PointerEvent) -> bool {
+        match ev.kind {
+            PointerEventKind::Enter { .. } | PointerEventKind::Leave { .. } => return false,
+            PointerEventKind::Motion { .. } => {
+                if let Some(Drag::Viewer(from)) = self.w.mouse.drag {
+                    self.viewer_drag(from, ev.position);
+                    self.w.mouse.drag = Some(Drag::Viewer(ev.position));
+                }
+            }
+            PointerEventKind::Press { button, serial, .. } => {
+                self.serial = serial;
+                match button {
+                    BTN_LEFT => self.w.mouse.drag = Some(Drag::Viewer(ev.position)),
+                    BTN_RIGHT => self.close_viewer(),
+                    _ => {}
+                }
+            }
+            PointerEventKind::Release { button, .. } => {
+                if button == BTN_LEFT {
+                    self.w.mouse.drag = None;
+                }
+            }
+            PointerEventKind::Axis { vertical, .. } => {
+                let notches = if vertical.value120 != 0 {
+                    vertical.value120 as f64 / 120.0
+                } else if vertical.discrete != 0 {
+                    vertical.discrete as f64
+                } else {
+                    vertical.absolute / 40.0
+                };
+                if notches != 0.0 {
+                    self.viewer_wheel(notches, ev.position);
+                }
+            }
+        }
+        true
+    }
+
     fn divider_at(&self, pos: (f64, f64)) -> Option<layout::Divider> {
         let (x, y) = self.phys(pos);
         let slop = (3.0 * self.w.scale).round() as i32;
@@ -2690,7 +2846,7 @@ impl App {
                     self.w.dirty = true;
                 }
             }
-            None => {}
+            Some(Drag::Viewer(_)) | None => {}
         }
     }
 
@@ -2712,6 +2868,7 @@ impl App {
     /// frames, an arrow over the tab bar and titles, else a text cursor.
     fn update_pointer_icon(&mut self) {
         let icon = match (self.divider_at(self.w.mouse.pos), self.hit_at(self.w.mouse.pos)) {
+            _ if self.w.viewer.is_some() => CursorIcon::Grab,
             _ if self.w.hover.is_some() => CursorIcon::Pointer,
             (Some(d), _) if d.axis == Axis::X => CursorIcon::ColResize,
             (Some(_), _) => CursorIcon::RowResize,
@@ -3018,6 +3175,13 @@ impl DataSourceHandler for App {
             && MIMES.contains(&mime.as_str())
         {
             Self::send_selection(text, fd.into());
+        } else if let Some((_, png)) = self.clipboard_image.as_ref().filter(|(s, _)| s.inner() == src)
+            && mime == "image/png"
+        {
+            let (png, fd) = (png.clone(), OwnedFd::from(fd));
+            let _ = std::thread::Builder::new().name("copy".into()).spawn(move || {
+                let _ = File::from(fd).write_all(&png);
+            });
         }
     }
     fn cancelled(&mut self, _: &Connection, _: &QueueHandle<Self>, src: &WlDataSource) {
@@ -3032,6 +3196,9 @@ impl DataSourceHandler for App {
         }
         if self.clipboard.as_ref().is_some_and(|(s, _)| s.inner() == src) {
             self.clipboard = None;
+        }
+        if self.clipboard_image.as_ref().is_some_and(|(s, _)| s.inner() == src) {
+            self.clipboard_image = None;
         }
         src.destroy();
     }

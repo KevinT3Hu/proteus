@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
+pub(crate) use decode::run_in_background;
 pub use decode::{DecodeError, DecodedImage, decode_image, image_dimensions};
 pub use image::ImageFormat;
 
@@ -44,6 +45,20 @@ pub struct GraphicsConfig {
     pub allow_local_files: bool,
     /// This machine's hostname; an OSC 7 cwd on another host makes the pane remote.
     pub hostname: Option<String>,
+    /// Decode PNG/JPEG/GIF/WebP on background threads and call this when a
+    /// result is ready (then call [`crate::Terminal::advance`], with no bytes
+    /// if need be). `None`: decode synchronously while parsing.
+    pub waker: Option<DecodeWaker>,
+}
+
+/// Called from a decoder thread when a decoded image is ready.
+#[derive(Clone)]
+pub struct DecodeWaker(pub Arc<dyn Fn() + Send + Sync>);
+
+impl std::fmt::Debug for DecodeWaker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DecodeWaker")
+    }
 }
 
 impl Default for GraphicsConfig {
@@ -55,6 +70,7 @@ impl Default for GraphicsConfig {
             window_budget: None,
             allow_local_files: true,
             hostname: None,
+            waker: None,
         }
     }
 }
@@ -140,6 +156,8 @@ pub struct Image {
     pub(crate) generation: u64,
     last_used: AtomicU64,
     pub(crate) evicted: bool,
+    /// Pixels are still being decoded (bytes are reserved already).
+    pub(crate) loading: bool,
 }
 
 impl Image {
@@ -160,7 +178,15 @@ impl Image {
             generation: 1,
             last_used: AtomicU64::new(now_tick()),
             evicted: false,
+            loading: false,
         }
+    }
+
+    /// An image whose single frame is still being decoded.
+    pub(crate) fn loading(id: u32, number: u32, source: Source, width: u32, height: u32) -> Self {
+        let mut img = Self::new(id, number, source, width, height, Vec::new());
+        img.loading = true;
+        img
     }
 
     /// Unique, never reused key (use it to cache textures).
@@ -197,9 +223,13 @@ impl Image {
     pub fn is_evicted(&self) -> bool {
         self.evicted
     }
+    /// Still being decoded: nothing to show yet.
+    pub fn is_loading(&self) -> bool {
+        self.loading
+    }
     /// RGBA8 pixels of the current frame.
     pub fn pixels(&self) -> Option<&[u8]> {
-        if self.evicted { None } else { self.frames.get(self.current).map(|f| &f.pixels[..]) }
+        if self.evicted || self.loading { None } else { self.frames.get(self.current).map(|f| &f.pixels[..]) }
     }
     pub(crate) fn frame_bytes(&self) -> usize {
         self.width as usize * self.height as usize * 4
@@ -334,8 +364,10 @@ pub struct ImageView<'a> {
     /// Full image size in pixels.
     pub width: u32,
     pub height: u32,
-    /// Current frame (RGBA8). `None` if evicted: draw an "image evicted" placeholder.
+    /// Current frame (RGBA8). `None` if evicted (draw an "image evicted"
+    /// placeholder) or still loading (draw nothing).
     pub pixels: Option<&'a [u8]>,
+    pub loading: bool,
     pub src: SrcRect,
     pub dest: DestRect,
     /// Negative: below text; below `i32::MIN / 2`: below non-default cell backgrounds.
@@ -834,6 +866,7 @@ impl ImageStore {
                     width: img.width,
                     height: img.height,
                     pixels: img.pixels(),
+                    loading: img.loading,
                     src: SrcRect {
                         x: vp.src.x as f32 + (ax0 - ix) as f32 * sx,
                         y: vp.src.y as f32 + (ay0 - iy) as f32 * sy,
@@ -866,6 +899,7 @@ impl ImageStore {
                 width: img.width,
                 height: img.height,
                 pixels: img.pixels(),
+                loading: img.loading,
                 src: SrcRect { x: p.src.x as f32, y: p.src.y as f32, w: p.src.w as f32, h: p.src.h as f32 },
                 dest: DestRect { x: col * cw + rx, y: (line - top) * ch + ry, w: rw, h: rh },
                 z: p.z,
@@ -965,6 +999,7 @@ mod tests {
             width: 20,
             height: 20,
             pixels: None,
+            loading: false,
             src: SrcRect { x: 0.0, y: 0.0, w: 20.0, h: 20.0 },
             dest: DestRect { x: -5, y: 0, w: 10, h: 10 },
             z: 0,

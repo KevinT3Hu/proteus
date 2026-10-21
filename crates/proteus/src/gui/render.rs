@@ -10,10 +10,13 @@ use proteus_core::style::{Attrs, Underline};
 use proteus_core::{CursorShape, Point, TermMode, Terminal};
 
 use super::font::{self, BOLD, Fonts, GlyphRef, ITALIC, Metrics};
+use super::images::{self, Layer, TextureCache};
 use super::ime::Preedit;
 use super::rows::{Row, Rows};
 
 const ATLAS: u32 = 2048;
+/// GPU memory for image textures before the least recently drawn are freed.
+pub const DEFAULT_TEXTURE_BUDGET: usize = 512 << 20;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
@@ -23,12 +26,17 @@ pub struct Instance {
     uv: [f32; 4],
     color: [f32; 4],
     kind: u32,
+    /// Image texture slot (0: none); not a vertex attribute, it splits draws.
+    slot: u32,
 }
 
 const SOLID: u32 = 0;
 const MASK: u32 = 1;
 const COLOR: u32 = 2;
 const CURLY: u32 = 3;
+const IMAGE: u32 = 4;
+/// Image sampled without smoothing.
+const IMAGE_SHARP: u32 = 5;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -173,6 +181,8 @@ pub struct FrameInfo<'a> {
     pub labels: Vec<Label>,
     /// Prompt or notice drawn over the bottom rows.
     pub overlay: Option<Overlay>,
+    /// The image viewer, over the panes (under the bars).
+    pub viewer: Option<super::viewer::ViewerFrame<'a>>,
 }
 
 /// A message bar at the bottom of the window.
@@ -215,6 +225,7 @@ pub struct Renderer {
     pub adapter_info: String,
     /// An atlas filled up mid-frame: draw again so every glyph is valid.
     pub redraw_needed: bool,
+    pub images: TextureCache,
 }
 
 fn rgba(c: Rgb, a: f32) -> [f32; 4] {
@@ -344,9 +355,10 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&smooth) },
             ],
         });
+        let images = TextureCache::new(&device, &queue, DEFAULT_TEXTURE_BUDGET);
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
-            bind_group_layouts: &[Some(&layout)],
+            bind_group_layouts: &[Some(&layout), Some(images.layout())],
             immediate_size: 0,
         });
         let attrs =
@@ -403,6 +415,7 @@ impl Renderer {
             out: Vec::new(),
             adapter_info,
             redraw_needed: false,
+            images,
         })
     }
 
@@ -554,6 +567,7 @@ impl Renderer {
         self.scratch.clear();
         self.fg.clear();
         self.out.clear();
+        self.images.begin();
         self.build(fonts, info, m);
         self.flush_layer();
         let mut all = std::mem::take(&mut self.out);
@@ -595,17 +609,27 @@ impl Renderer {
             if !all.is_empty() {
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.bind_group, &[]);
-                pass.set_vertex_buffer(0, self.instances.slice(..));
-                pass.draw(0..4, 0..all.len() as u32);
+                // One draw per run of instances sampling the same image.
+                let size = std::mem::size_of::<Instance>() as u64;
+                let mut i = 0;
+                while i < all.len() {
+                    let slot = all[i].slot;
+                    let n = all[i..].iter().take_while(|x| x.slot == slot).count();
+                    pass.set_bind_group(1, self.images.bind(slot), &[]);
+                    pass.set_vertex_buffer(0, self.instances.slice(i as u64 * size..(i + n) as u64 * size));
+                    pass.draw(0..4, 0..n as u32);
+                    i += n;
+                }
             }
         }
+        self.images.trim();
         all.clear();
         self.out = all;
         enc.finish()
     }
 
     fn rect(&mut self, x: f32, y: f32, w: f32, h: f32, c: [f32; 4]) {
-        self.scratch.push(Instance { pos: [x, y], size: [w, h], uv: [0.0; 4], color: c, kind: SOLID });
+        self.scratch.push(Instance { pos: [x, y], size: [w, h], uv: [0.0; 4], color: c, kind: SOLID, slot: 0 });
     }
 
     /// Build all instances: grids, then chrome, then the overlay.
@@ -649,6 +673,24 @@ impl Renderer {
             self.chrome(fonts, &[], &p.labels, m);
             self.flush_layer();
         }
+        if let Some(v) = &info.viewer {
+            let (w, h) = (self.config.width as f32, self.config.height as f32);
+            self.fg.push(solid(0.0, 0.0, w, h, [0.0, 0.0, 0.0, 0.92]));
+            let slot = self.images.slot(&self.device, &self.queue, v.key, 1, v.size, Some(v.pixels));
+            if let Some(slot) = slot {
+                let [x, y, w, h] = v.rect;
+                let kind = if v.sharp { IMAGE_SHARP } else { IMAGE };
+                self.fg.push(Instance {
+                    pos: [x, y],
+                    size: [w, h],
+                    uv: [0.0, 0.0, 1.0, 1.0],
+                    color: [1.0; 4],
+                    kind,
+                    slot,
+                });
+            }
+            self.flush_layer();
+        }
         self.chrome(fonts, &info.rects, &info.labels, m);
         self.flush_layer();
         if let Some(o) = &info.overlay {
@@ -676,6 +718,11 @@ impl Renderer {
             p.marks.iter().copied().filter(|m| m.end.line >= first && m.start.line <= last).collect();
         let cursor_row = p.rows.row_of(grid.abs_line(cursor.y)).filter(|_| show_cursor || p.preedit.is_some());
         let cols = t.cols();
+        let cell = (m.cell_w, m.cell_h);
+        let views =
+            images::place(t.visible_images(), &p.rows, grid.viewport_line(0), cols, cell, t.cell_pixel_size(), skip);
+        self.pane_images(fonts, &views, Layer::UnderBackground, (px, py), pal.foreground(), m);
+        self.pane_images(fonts, &views, Layer::UnderText, (px, py), pal.foreground(), m);
         for (y, r) in p.rows.0.iter().enumerate().skip(skip) {
             let top = py + y as f32 * ch;
             let line = match *r {
@@ -838,6 +885,7 @@ impl Renderer {
                             uv: [th, cw.max(4.0), 0.0, h],
                             color: rgba(uc, alpha),
                             kind: CURLY,
+                            slot: 0,
                         });
                     }
                 }
@@ -871,6 +919,7 @@ impl Renderer {
                 self.rect(px + start as f32 * cw, top, (row.cells.len() - start) as f32 * cw, ch, rgba(c, 1.0));
             }
         }
+        self.pane_images(fonts, &views, Layer::OverText, (px, py), pal.foreground(), m);
         if let (Some(pre), Some(row)) = (&p.preedit, cursor_row) {
             self.build_preedit(t, fonts, pre, (px, py), row, m);
         }
@@ -880,6 +929,55 @@ impl Renderer {
             let c = rgba(pal.foreground(), 1.0);
             let veil = [c[0] * a, c[1] * a, c[2] * a, a];
             self.fg.push(solid(px, p.y, cols as f32 * cw, (t.lines() - skip) as f32 * ch, veil));
+        }
+    }
+
+    /// Draw the images of `layer` (see [`images::place`]) with the grid's
+    /// viewport row 0 at `origin`. Images under the backgrounds go before
+    /// them; the others are drawn in order with the glyphs.
+    fn pane_images(
+        &mut self,
+        fonts: &mut Fonts,
+        views: &[proteus_core::ImageView],
+        layer: Layer,
+        origin: (f32, f32),
+        fg: Rgb,
+        m: Metrics,
+    ) {
+        for v in views.iter().filter(|v| Layer::of(v.z) == layer && !v.loading) {
+            let d = v.dest;
+            let (x, y, w, h) = (origin.0 + d.x as f32, origin.1 + d.y as f32, d.w as f32, d.h as f32);
+            let slot = self.images.slot(&self.device, &self.queue, v.key, v.generation, (v.width, v.height), v.pixels);
+            let quad = match slot {
+                Some(slot) => {
+                    Instance { pos: [x, y], size: [w, h], uv: images::uv(v), color: [1.0; 4], kind: IMAGE, slot }
+                }
+                None => {
+                    self.evicted_placeholder(fonts, (x, y, w, h), fg, m);
+                    continue;
+                }
+            };
+            if layer == Layer::UnderBackground { self.scratch.push(quad) } else { self.fg.push(quad) }
+        }
+    }
+
+    /// Where an image whose pixels were dropped (memory quota) would be: a
+    /// faint box with a note.
+    fn evicted_placeholder(&mut self, fonts: &mut Fonts, (x, y, w, h): (f32, f32, f32, f32), fg: Rgb, m: Metrics) {
+        let veil = |a: f32| {
+            let c = rgba(fg, 1.0);
+            [c[0] * a, c[1] * a, c[2] * a, a]
+        };
+        let t = 1.0f32.max((m.cell_w as f32 / 10.0).round());
+        self.fg.push(solid(x, y, w, h, veil(0.05)));
+        for (bx, by, bw, bh) in [(x, y, w, t), (x, y + h - t, w, t), (x, y, t, h), (x + w - t, y, t, h)] {
+            self.fg.push(solid(bx, by, bw, bh, veil(0.25)));
+        }
+        let (cw, ch) = (m.cell_w as f32, m.cell_h as f32);
+        let cols = ((w - 2.0 * cw) / cw).floor();
+        if cols >= 3.0 && h >= ch {
+            let text_y = y + ((h - ch) / 2.0).floor();
+            self.text_line(fonts, "image evicted", x + cw, text_y, cols as usize, ITALIC, rgba(fg, 0.5), m, cw);
         }
     }
 
@@ -1049,7 +1147,14 @@ impl Renderer {
             x = left + (box_w - w) / 2.0;
             y = y.clamp(top, top + ch - h);
         }
-        self.fg.push(Instance { pos: [x, y], size: [w, h], uv: a.uv, color, kind: if a.color { COLOR } else { MASK } });
+        self.fg.push(Instance {
+            pos: [x, y],
+            size: [w, h],
+            uv: a.uv,
+            color,
+            kind: if a.color { COLOR } else { MASK },
+            slot: 0,
+        });
     }
 }
 
@@ -1112,7 +1217,7 @@ pub fn group_digits(n: u64) -> String {
 }
 
 fn solid(x: f32, y: f32, w: f32, h: f32, c: [f32; 4]) -> Instance {
-    Instance { pos: [x, y], size: [w, h], uv: [0.0; 4], color: c, kind: SOLID }
+    Instance { pos: [x, y], size: [w, h], uv: [0.0; 4], color: c, kind: SOLID, slot: 0 }
 }
 
 #[cfg(test)]
@@ -1125,7 +1230,7 @@ mod tests {
         naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty())
             .validate(&module)
             .expect("WGSL validates");
-        assert_eq!(std::mem::size_of::<Instance>(), 52);
+        assert_eq!(std::mem::size_of::<Instance>(), 56);
     }
 
     #[test]

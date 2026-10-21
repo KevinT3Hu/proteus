@@ -40,3 +40,16 @@ unsafe_op_in_unsafe_fn = "deny"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+
+
+# Image decoding is unusably slow unoptimized (a 4K JPEG takes seconds).
+[profile.dev.package]
+image = { opt-level = 3 }
+zune-jpeg = { opt-level = 3 }
+zune-core = { opt-level = 3 }
+png = { opt-level = 3 }
+fdeflate = { opt-level = 3 }
+image-webp = { opt-level = 3 }
+gif = { opt-level = 3 }
+weezl = { opt-level = 3 }
+miniz_oxide = { opt-level = 3 }

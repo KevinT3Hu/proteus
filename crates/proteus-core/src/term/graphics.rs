@@ -2,6 +2,7 @@
 //! and iTerm2 inline images (`OSC 1337 File=`), plus the APC pre-filter that
 //! `vte` lacks.
 
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
 use super::{BASE64, Terminal, join_params};
@@ -10,8 +11,8 @@ use crate::graphics::kitty::{self, Command, Error, err};
 use crate::graphics::media::{self, Medium};
 use crate::graphics::sixel::SixelDecoder;
 use crate::graphics::{
-    AnimationState, DEFAULT_GAP, FALLBACK_CELL_PX, Fit, Frame, Image, ImageStore, ImageView, MAX_RELATIVE_DEPTH,
-    Placement, PxRect, Source, Upload, decode_image,
+    AnimationState, DEFAULT_GAP, DecodeError, DecodedImage, FALLBACK_CELL_PX, Fit, Frame, Image, ImageStore, ImageView,
+    MAX_RELATIVE_DEPTH, Placement, PxRect, Source, Upload, decode_image, image_dimensions, run_in_background,
 };
 use crate::modes::TermMode;
 use base64::Engine as _;
@@ -30,6 +31,40 @@ pub(super) enum Apc {
 
 /// Largest GIF frame delay treated as "as fast as possible" (browser convention).
 const MIN_GIF_DELAY_MS: u32 = 10;
+
+/// Frame gap for a GIF delay.
+fn gif_gap(d: u32) -> i32 {
+    if d <= MIN_GIF_DELAY_MS { 100 } else { d.min(i32::MAX as u32) as i32 }
+}
+
+/// A kitty reply held back until the image is decoded.
+pub(super) struct HeldReply {
+    cmd: Command,
+    id: u32,
+    number: u32,
+    pid: u32,
+}
+
+/// Result of a background decode.
+pub(super) struct Decoded {
+    key: u64,
+    result: Result<DecodedImage, DecodeError>,
+    reply: Option<HeldReply>,
+}
+
+/// Images being decoded on background threads (see [`crate::GraphicsConfig::waker`]).
+pub(super) struct Decodes {
+    tx: Sender<Decoded>,
+    rx: Receiver<Decoded>,
+    pending: usize,
+}
+
+impl Default for Decodes {
+    fn default() -> Self {
+        let (tx, rx) = channel();
+        Self { tx, rx, pending: 0 }
+    }
+}
 
 fn ceil_div(a: u64, b: u64) -> u32 {
     a.div_ceil(b.max(1)).min(u32::MAX as u64) as u32
@@ -231,6 +266,10 @@ impl Terminal {
             self.kitty_reply(&cmd, id, number, 0, Err(err("EINVAL", "Must not specify both i and I")));
             return;
         }
+        // Frame and animation commands need the pixels of earlier images.
+        if matches!(cmd.action(), b'f' | b'a' | b'c') {
+            self.wait_images();
+        }
         match cmd.action() {
             b't' | b'T' | b'q' => self.kitty_transmit(cmd),
             b'f' => {
@@ -335,6 +374,10 @@ impl Terminal {
 
     fn kitty_transmit(&mut self, cmd: Command) {
         let (id, number) = (cmd.id(), cmd.number());
+        let png = cmd.has(b'f') && cmd.u(b'f') == 100;
+        if png && cmd.action() != b'q' && self.config.graphics.waker.is_some() {
+            return self.kitty_transmit_later(cmd);
+        }
         let px = match self.kitty_pixels(&cmd, (0, 0)) {
             Ok(p) => p,
             Err(e) => {
@@ -366,6 +409,137 @@ impl Terminal {
             self.kitty_reply(&cmd, id, number, cmd.placement(), r);
         } else {
             self.kitty_reply(&cmd, id, number, 0, Ok(()));
+        }
+    }
+
+    /// `a=t`/`a=T` of a compressed image: store and place it with its
+    /// declared size right away, decode in the background, reply when done.
+    fn kitty_transmit_later(&mut self, cmd: Command) {
+        let (id, number) = (cmd.id(), cmd.number());
+        let data = match self.kitty_data(&cmd) {
+            Ok(d) => d,
+            Err(e) => return self.kitty_reply(&cmd, id, number, 0, Err(e)),
+        };
+        let max = self.config.graphics.max_image_bytes;
+        let (w, h) = match image_dimensions(&data) {
+            Some((w, h)) if w > 0 && h > 0 => (w, h),
+            _ => return self.kitty_reply(&cmd, id, number, 0, Err(err("EBADPNG", "Failed to decode image"))),
+        };
+        let bytes = w as usize * h as usize * 4;
+        if bytes > max {
+            return self.kitty_reply(&cmd, id, number, 0, Err(err("EFBIG", "Image too large")));
+        }
+        let id = if number != 0 { self.images.alloc_id() } else { id };
+        if let Some(old) = self.images.key_for_id(id) {
+            self.images.remove_image(old);
+            self.damage.images = true;
+        }
+        let other = self.images_inactive.bytes();
+        if let Err(e) = self.images.reserve(bytes, other, &self.config.graphics, None) {
+            return self.kitty_reply(&cmd, id, number, 0, Err(e));
+        }
+        let key = self.images.insert(Image::loading(id, number, Source::Kitty, w, h));
+        let mut pid = 0;
+        if cmd.action() == b'T' {
+            pid = cmd.placement();
+            if let Err(e) = self.kitty_put(&cmd, Some(key)) {
+                if id == 0 {
+                    self.images.remove_image(key);
+                }
+                return self.kitty_reply(&cmd, id, number, pid, Err(e));
+            }
+        }
+        let mut held = cmd;
+        held.payload = Vec::new();
+        self.decode_later(key, data, Some(HeldReply { cmd: held, id, number, pid }));
+    }
+
+    // --- background decoding -------------------------------------------------
+
+    fn decode_later(&mut self, key: u64, data: Vec<u8>, reply: Option<HeldReply>) {
+        let tx = self.decodes.tx.clone();
+        let waker = self.config.graphics.waker.clone();
+        let max = self.config.graphics.max_image_bytes;
+        self.decodes.pending += 1;
+        run_in_background(Box::new(move || {
+            let decode = std::panic::AssertUnwindSafe(|| decode_image(&data, max));
+            let result = std::panic::catch_unwind(decode).unwrap_or_else(|_| Err(DecodeError::Invalid("panic".into())));
+            if tx.send(Decoded { key, result, reply }).is_ok()
+                && let Some(w) = waker
+            {
+                (w.0)();
+            }
+        }));
+    }
+
+    /// Apply finished background decodes.
+    pub(super) fn poll_images(&mut self) {
+        while self.decodes.pending > 0 {
+            match self.decodes.rx.try_recv() {
+                Ok(d) => self.finish_decode(d),
+                Err(_) => break,
+            }
+        }
+    }
+
+    /// Wait for every background decode to finish.
+    fn wait_images(&mut self) {
+        while self.decodes.pending > 0 {
+            match self.decodes.rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(d) => self.finish_decode(d),
+                Err(_) => self.decodes.pending = 0,
+            }
+        }
+    }
+
+    fn finish_decode(&mut self, d: Decoded) {
+        self.decodes.pending = self.decodes.pending.saturating_sub(1);
+        self.damage.images = true;
+        let key = d.key;
+        let primary = self.images.image(key).is_some();
+        let (store, other) = if primary {
+            (&mut self.images, self.images_inactive.bytes())
+        } else {
+            (&mut self.images_inactive, self.images.bytes())
+        };
+        let outcome = match d.result {
+            Err(DecodeError::TooLarge) => Err(err("EFBIG", "Image too large")),
+            Err(DecodeError::Invalid(_)) => Err(err("EBADPNG", "Failed to decode image")),
+            Ok(dec) => match store.image_mut(key) {
+                // Deleted meanwhile, or evicted: nothing to fill in.
+                None => Ok(()),
+                Some(img) if img.evicted => {
+                    img.loading = false;
+                    Ok(())
+                }
+                Some(img) if (dec.width, dec.height) != img.size() => {
+                    Err(err("EBADPNG", "Image size differs from its header"))
+                }
+                Some(img) => {
+                    let mut frames = dec.frames.into_iter();
+                    let (first, delay) = frames.next().expect("decoders yield a frame");
+                    img.frames[0].pixels = first;
+                    img.loading = false;
+                    img.generation += 1;
+                    // Animated (iTerm2 GIF): the other frames need room too.
+                    let rest: Vec<(Vec<u8>, u32)> = if d.reply.is_none() { frames.collect() } else { Vec::new() };
+                    let need = rest.len() * img.frame_bytes();
+                    if !rest.is_empty() && store.reserve(need, other, &self.config.graphics, Some(key)).is_ok() {
+                        let img = store.image_mut(key).expect("protected from eviction");
+                        img.frames[0].gap = gif_gap(delay);
+                        img.frames.extend(rest.into_iter().map(|(pixels, d)| Frame { pixels, gap: gif_gap(d) }));
+                        img.state = AnimationState::Running;
+                    }
+                    Ok(())
+                }
+            },
+        };
+        if outcome.is_err() {
+            store.remove_image(key);
+            store.free_anonymous();
+        }
+        if let Some(r) = d.reply {
+            self.kitty_reply(&r.cmd, r.id, r.number, r.pid, outcome);
         }
     }
 
@@ -681,7 +855,7 @@ impl Terminal {
 
     pub(super) fn sixel_finish(&mut self, dec: SixelDecoder) {
         if let Some(s) = dec.finish() {
-            self.place_anonymous(Source::Sixel, s.width, s.height, vec![(s.rgba, 0)], None);
+            self.place_anonymous(Source::Sixel, s.width, s.height, Some(vec![(s.rgba, 0)]), None);
         }
     }
 
@@ -691,9 +865,9 @@ impl Terminal {
         source: Source,
         w: u32,
         h: u32,
-        frames: Vec<(Vec<u8>, u32)>,
+        frames: Option<Vec<(Vec<u8>, u32)>>,
         size: Option<(u32, u32)>,
-    ) {
+    ) -> Option<u64> {
         let (cw, ch) = self.cell_pixel_size();
         let (dw, dh) = size.unwrap_or((w, h));
         let cols = ceil_div(dw as u64, cw as u64).max(1);
@@ -704,21 +878,27 @@ impl Terminal {
         // Replace earlier images drawn at the same spot (before inserting the new one).
         self.images.remove_covered(line, col, cols, rows);
 
-        let need = frames.iter().map(|f| f.0.len()).sum();
+        // Still being decoded: room for the first frame.
+        let need = frames.as_ref().map_or(w as usize * h as usize * 4, |f| f.iter().map(|f| f.0.len()).sum());
         let other = self.images_inactive.bytes();
         if self.images.reserve(need, other, &self.config.graphics, None).is_err() {
-            return;
+            return None;
         }
-        let animated = frames.len() > 1;
-        let mut frames = frames.into_iter();
-        let (first, first_delay) = frames.next().expect("at least one frame");
-        let mut img = Image::new(0, 0, source, w, h, first);
-        let gif_gap = |d: u32| if d <= MIN_GIF_DELAY_MS { 100 } else { d.min(i32::MAX as u32) as i32 };
-        if animated {
-            img.frames[0].gap = gif_gap(first_delay);
-            img.frames.extend(frames.map(|(pixels, d)| Frame { pixels, gap: gif_gap(d) }));
-            img.state = AnimationState::Running;
-        }
+        let img = match frames {
+            None => Image::loading(0, 0, source, w, h),
+            Some(frames) => {
+                let animated = frames.len() > 1;
+                let mut frames = frames.into_iter();
+                let (first, first_delay) = frames.next().expect("at least one frame");
+                let mut img = Image::new(0, 0, source, w, h, first);
+                if animated {
+                    img.frames[0].gap = gif_gap(first_delay);
+                    img.frames.extend(frames.map(|(pixels, d)| Frame { pixels, gap: gif_gap(d) }));
+                    img.state = AnimationState::Running;
+                }
+                img
+            }
+        };
         let key = self.images.insert(img);
         let fit = if size.is_some() { Fit::Pixels(dw, dh) } else { Fit::Natural };
         let mut p = Placement::new(key, line, col, PxRect { x: 0, y: 0, w, h }, cols, rows, fit);
@@ -737,6 +917,7 @@ impl Terminal {
             }
             _ => self.cursor_after_image(cols, rows),
         }
+        Some(key)
     }
 
     /// OSC 1337 (iTerm2): `File=`, multipart files and `ReportCellSize`.
@@ -789,7 +970,21 @@ impl Terminal {
             return;
         }
         let Ok(bytes) = BASE64.decode(data) else { return };
-        let Ok(img) = decode_image(&bytes, max) else { return };
+        // Decode now, or only read the size and decode in the background.
+        let (img, (iw, ih)) = if self.config.graphics.waker.is_some() {
+            match image_dimensions(&bytes) {
+                Some((w, h)) if w > 0 && h > 0 && w as usize * h as usize * 4 <= max => (None, (w, h)),
+                _ => return,
+            }
+        } else {
+            match decode_image(&bytes, max) {
+                Ok(img) => {
+                    let size = (img.width, img.height);
+                    (Some(img), size)
+                }
+                Err(_) => return,
+            }
+        };
         let (cw, ch) = self.cell_pixel_size();
         let (tw, th) = (self.cols() as u64 * cw as u64, self.lines() as u64 * ch as u64);
         let px = |d: Dim, cell: u32, total: u64| -> Option<u64> {
@@ -800,7 +995,7 @@ impl Terminal {
                 Dim::Percent(p) => Some(total * p as u64 / 100),
             }
         };
-        let (iw, ih) = (img.width as u64, img.height as u64);
+        let (iw, ih) = (iw as u64, ih as u64);
         let (w, h) = match (px(dw, cw, tw), px(dh, ch, th)) {
             (None, None) if iw > tw => (tw, ih * tw / iw),
             (None, None) => (iw, ih),
@@ -817,7 +1012,17 @@ impl Terminal {
         };
         let clamp = |v: u64| v.clamp(1, 1 << 15) as u32;
         let size = (clamp(w), clamp(h));
-        self.place_anonymous(Source::Iterm, img.width, img.height, img.frames, Some(size));
+        let (w, h) = (iw as u32, ih as u32);
+        match img {
+            Some(img) => {
+                self.place_anonymous(Source::Iterm, w, h, Some(img.frames), Some(size));
+            }
+            None => {
+                if let Some(key) = self.place_anonymous(Source::Iterm, w, h, None, Some(size)) {
+                    self.decode_later(key, bytes, None);
+                }
+            }
+        }
     }
 
     // --- interaction with the rest of the emulator ------------------------------
