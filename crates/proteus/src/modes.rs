@@ -36,11 +36,8 @@ impl Chord {
     pub fn parse(s: &str) -> Result<Chord, String> {
         let s = s.trim();
         let bad = || format!("invalid key `{s}`");
-        let (mods_part, key_part) = if let Some(m) = s.strip_suffix("++") {
-            (m, "+")
-        } else {
-            s.rsplit_once('+').unwrap_or(("", s))
-        };
+        let (mods_part, key_part) =
+            if let Some(m) = s.strip_suffix("++") { (m, "+") } else { s.rsplit_once('+').unwrap_or(("", s)) };
         let mut mods = Mods::empty();
         for m in mods_part.split('+').filter(|m| !m.is_empty()) {
             mods |= match m.to_ascii_lowercase().as_str() {
@@ -664,7 +661,9 @@ fn bind(t: &mut Table, keys: &[&str], a: Action) {
 }
 
 fn dirs(t: &mut Table, mods: &str, f: impl Fn(Dir) -> Action) {
-    for (d, k, arrow) in [(Dir::Left, "h", "left"), (Dir::Down, "j", "down"), (Dir::Up, "k", "up"), (Dir::Right, "l", "right")] {
+    for (d, k, arrow) in
+        [(Dir::Left, "h", "left"), (Dir::Down, "j", "down"), (Dir::Up, "k", "up"), (Dir::Right, "l", "right")]
+    {
         bind(t, &[&format!("{mods}{k}"), &format!("{mods}{arrow}")], f(d));
     }
 }
@@ -742,7 +741,8 @@ fn tmux_table(t: &mut Table) {
     bind(t, &["s"], Action::Mode(Mode::Session));
     bind(t, &["r"], Action::Mode(Mode::Resize));
     bind(t, &["m"], Action::Mode(Mode::Move));
-    for (k, d) in [("ctrl+left", Dir::Left), ("ctrl+right", Dir::Right), ("ctrl+up", Dir::Up), ("ctrl+down", Dir::Down)] {
+    for (k, d) in [("ctrl+left", Dir::Left), ("ctrl+right", Dir::Right), ("ctrl+up", Dir::Up), ("ctrl+down", Dir::Down)]
+    {
         bind(t, &[k], Action::Resize(d, RESIZE_STEP));
     }
     bind(t, &["esc"], Action::Mode(Mode::Normal));

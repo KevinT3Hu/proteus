@@ -59,7 +59,15 @@ pub fn tab_at(labels: &[Label], x: f32, cw: f32) -> Option<usize> {
 }
 
 /// Mode badge followed by `keys label` pairs, cut off at `cols`.
-pub fn hint_bar(mode: &str, hints: &[(String, &str)], x0: f32, y: f32, cols: usize, cw: f32, theme: &Theme) -> Vec<Label> {
+pub fn hint_bar(
+    mode: &str,
+    hints: &[(String, &str)],
+    x0: f32,
+    y: f32,
+    cols: usize,
+    cw: f32,
+    theme: &Theme,
+) -> Vec<Label> {
     let mut out = Vec::new();
     let badge = format!(" {mode} ");
     let mut col = width(&badge).min(cols);
@@ -70,9 +78,25 @@ pub fn hint_bar(mode: &str, hints: &[(String, &str)], x0: f32, y: f32, cols: usi
         if col + kw + 1 + lw > cols {
             break;
         }
-        out.push(Label { x: x0 + col as f32 * cw, y, cols: kw, text: keys.clone(), fg: theme.accent, bg: None, bold: true });
+        out.push(Label {
+            x: x0 + col as f32 * cw,
+            y,
+            cols: kw,
+            text: keys.clone(),
+            fg: theme.accent,
+            bg: None,
+            bold: true,
+        });
         col += kw + 1;
-        out.push(Label { x: x0 + col as f32 * cw, y, cols: lw, text: label.to_string(), fg: theme.fg, bg: None, bold: false });
+        out.push(Label {
+            x: x0 + col as f32 * cw,
+            y,
+            cols: lw,
+            text: label.to_string(),
+            fg: theme.fg,
+            bg: None,
+            bold: false,
+        });
         col += lw + 2;
     }
     out
@@ -113,7 +137,15 @@ pub fn input_bar(
         }
         (s, room.saturating_sub(1))
     };
-    out.push(Label { x: x0 + start as f32 * cw, y, cols: room, text: shown.clone(), fg: theme.fg, bg: None, bold: false });
+    out.push(Label {
+        x: x0 + start as f32 * cw,
+        y,
+        cols: room,
+        text: shown.clone(),
+        fg: theme.fg,
+        bg: None,
+        bold: false,
+    });
     let after = start + width(&shown) + 2;
     if !status.is_empty() && after + width(status) <= cols {
         out.push(Label {
@@ -140,7 +172,8 @@ mod tests {
 
     #[test]
     fn tabs_share_the_row() {
-        let titles: Vec<String> = ["zsh", "a very long title for a tab that goes on", "nvim"].map(String::from).to_vec();
+        let titles: Vec<String> =
+            ["zsh", "a very long title for a tab that goes on", "nvim"].map(String::from).to_vec();
         let l = tab_bar(&titles, 1, 0.0, 0.0, 60, 10.0, &theme());
         assert_eq!(l.len(), 3);
         assert_eq!(l[0].text, " 1 zsh ");

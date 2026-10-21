@@ -70,10 +70,18 @@ impl Rect {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Node {
     Leaf(PaneId),
-    Split { axis: Axis, ratio: f32, a: Box<Node>, b: Box<Node> },
+    Split {
+        axis: Axis,
+        ratio: f32,
+        a: Box<Node>,
+        b: Box<Node>,
+    },
     /// Panes sharing one area: `active` is expanded, the others show as
     /// one-row title bars above and below it.
-    Stack { panes: Vec<PaneId>, active: usize },
+    Stack {
+        panes: Vec<PaneId>,
+        active: usize,
+    },
 }
 
 /// Sizes that shape a layout, in physical pixels.
@@ -378,7 +386,11 @@ impl Node {
                 let bottom = rect.bottom() - n_below as i32 * ch;
                 out.panes.push((id, Rect::new(rect.x, y, rect.w, (bottom - y).max(ch.min(rect.h)))));
                 for (i, &id) in panes[active + 1..active + 1 + n_below].iter().enumerate() {
-                    out.titles.push(Title { id, rect: Rect::new(rect.x, bottom + i as i32 * ch, rect.w, ch), collapsed: true });
+                    out.titles.push(Title {
+                        id,
+                        rect: Rect::new(rect.x, bottom + i as i32 * ch, rect.w, ch),
+                        collapsed: true,
+                    });
                 }
             }
         }
@@ -392,7 +404,11 @@ impl Node {
                 true
             }
             (Node::Split { a, b, .. }, Some((&second, rest))) => {
-                if second { b.set_ratio(rest, value) } else { a.set_ratio(rest, value) }
+                if second {
+                    b.set_ratio(rest, value)
+                } else {
+                    a.set_ratio(rest, value)
+                }
             }
             _ => false,
         }
@@ -764,7 +780,8 @@ impl Tab {
             return false;
         }
         self.zoomed = false;
-        self.last_tiled = self.history.iter().rev().copied().find(|&p| self.root.contains(p)).unwrap_or(first_leaf(&self.root));
+        self.last_tiled =
+            self.history.iter().rev().copied().find(|&p| self.root.contains(p)).unwrap_or(first_leaf(&self.root));
         self.root.activate(self.last_tiled);
         let f = self.default_float(id, area, m);
         self.floats.push(f);
@@ -797,7 +814,8 @@ impl Tab {
         self.history.retain(|&p| p != id && (root.contains(p) || floats.iter().any(|f| f.id == p)));
         if !self.root.contains(self.last_tiled) {
             self.zoomed = false;
-            self.last_tiled = self.history.iter().rev().copied().find(|&p| self.root.contains(p)).unwrap_or(first_leaf(&self.root));
+            self.last_tiled =
+                self.history.iter().rev().copied().find(|&p| self.root.contains(p)).unwrap_or(first_leaf(&self.root));
             self.root.activate(self.last_tiled);
         }
         if self.focus == id {
@@ -890,7 +908,16 @@ impl Tab {
 
     /// Place a float's grid at a physical position / size (mouse drags).
     #[allow(clippy::too_many_arguments)]
-    pub fn set_float_rect(&mut self, id: PaneId, col: i32, row: i32, cols: i32, rows: i32, area: Rect, m: Metrics) -> bool {
+    pub fn set_float_rect(
+        &mut self,
+        id: PaneId,
+        col: i32,
+        row: i32,
+        cols: i32,
+        rows: i32,
+        area: Rect,
+        m: Metrics,
+    ) -> bool {
         let Some(f) = self.floats.iter_mut().find(|f| f.id == id) else { return false };
         let before = *f;
         *f = Float { id, col, row, cols: cols.max(2), rows: rows.max(1) };
@@ -1039,17 +1066,20 @@ mod tests {
         t.split(4, Axis::Y);
         // 2, 3 and 4 share the right column; stack 4 with its sibling 3.
         assert!(t.toggle_stack());
-        assert_eq!(t.root, Node::Split {
-            axis: Axis::X,
-            ratio: 0.5,
-            a: Box::new(Node::Leaf(1)),
-            b: Box::new(Node::Split {
-                axis: Axis::Y,
+        assert_eq!(
+            t.root,
+            Node::Split {
+                axis: Axis::X,
                 ratio: 0.5,
-                a: Box::new(Node::Leaf(2)),
-                b: Box::new(Node::Stack { panes: vec![3, 4], active: 1 }),
-            }),
-        });
+                a: Box::new(Node::Leaf(1)),
+                b: Box::new(Node::Split {
+                    axis: Axis::Y,
+                    ratio: 0.5,
+                    a: Box::new(Node::Leaf(2)),
+                    b: Box::new(Node::Stack { panes: vec![3, 4], active: 1 }),
+                }),
+            }
+        );
         let l = t.layout(AREA, M);
         // Collapsed 3 above, then 4's title and grid.
         let right: Vec<_> = l.titles.iter().map(|x| (x.id, x.rect.y, x.collapsed)).collect();
@@ -1065,7 +1095,9 @@ mod tests {
         // Splitting a stacked pane splits the stack; closing leaves a leaf.
         t.set_focus(3);
         assert!(t.remove(3));
-        assert!(matches!(&t.root, Node::Split { b, .. } if matches!(&**b, Node::Split { b, .. } if **b == Node::Leaf(4))));
+        assert!(
+            matches!(&t.root, Node::Split { b, .. } if matches!(&**b, Node::Split { b, .. } if **b == Node::Leaf(4)))
+        );
         // Unstack restores rows.
         t.set_focus(2);
         assert!(t.toggle_stack());

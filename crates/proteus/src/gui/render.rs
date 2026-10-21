@@ -317,11 +317,14 @@ impl Renderer {
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
             entries: &[
-                entry(0, wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                }),
+                entry(
+                    0,
+                    wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                ),
                 entry(1, texture_ty),
                 entry(2, texture_ty),
                 entry(3, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
@@ -346,7 +349,8 @@ impl Renderer {
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
-        let attrs = wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4, 3 => Float32x4, 4 => Uint32];
+        let attrs =
+            wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4, 3 => Float32x4, 4 => Uint32];
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("proteus"),
             layout: Some(&pipeline_layout),
@@ -513,7 +517,12 @@ impl Renderer {
         });
         let mut enc = self.device.create_command_encoder(&Default::default());
         enc.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo {
+                texture: &tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
             wgpu::TexelCopyBufferInfo {
                 buffer: &buf,
                 layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(stride), rows_per_image: None },
@@ -663,7 +672,8 @@ impl Renderer {
         let grid = t.grid();
         let first = (0..p.rows.0.len()).find_map(|y| p.rows.line(y)).unwrap_or(0);
         let last = p.rows.last_line().unwrap_or(0);
-        let marks: Vec<Mark> = p.marks.iter().copied().filter(|m| m.end.line >= first && m.start.line <= last).collect();
+        let marks: Vec<Mark> =
+            p.marks.iter().copied().filter(|m| m.end.line >= first && m.start.line <= last).collect();
         let cursor_row = p.rows.row_of(grid.abs_line(cursor.y)).filter(|_| show_cursor || p.preedit.is_some());
         let cols = t.cols();
         for (y, r) in p.rows.0.iter().enumerate().skip(skip) {
@@ -747,7 +757,8 @@ impl Renderer {
                 let hidden = style.attrs.contains(Attrs::HIDDEN);
                 let blank = cell.ch == ' ' || cell.flags.contains(CellFlags::LEADING_WIDE_SPACER);
                 let color = rgba(fg, alpha);
-                let st = (style.attrs.contains(Attrs::BOLD) as u8 * BOLD) | (style.attrs.contains(Attrs::ITALIC) as u8 * ITALIC);
+                let st = (style.attrs.contains(Attrs::BOLD) as u8 * BOLD)
+                    | (style.attrs.contains(Attrs::ITALIC) as u8 * ITALIC);
                 let drawable = !hidden && !blank && cell.ch != proteus_core::graphics::placeholder::PLACEHOLDER;
                 let text = cell_text(cell, &mut cell_buf);
                 let wide = width == 2;
@@ -901,7 +912,18 @@ impl Renderer {
     /// Lay out `text` grapheme by grapheme on the grid, truncated with `…`
     /// to `cols` columns.
     #[allow(clippy::too_many_arguments)]
-    fn text_line(&mut self, fonts: &mut Fonts, text: &str, left: f32, top: f32, cols: usize, style: u8, color: [f32; 4], m: Metrics, cw: f32) {
+    fn text_line(
+        &mut self,
+        fonts: &mut Fonts,
+        text: &str,
+        left: f32,
+        top: f32,
+        cols: usize,
+        style: u8,
+        color: [f32; 4],
+        m: Metrics,
+        cw: f32,
+    ) {
         use unicode_segmentation::UnicodeSegmentation;
         use unicode_width::UnicodeWidthStr;
         let mut col = 0;
@@ -929,7 +951,15 @@ impl Renderer {
     /// opaque background, underline, thicker underline under the selected
     /// segment, and a bar cursor.
     #[allow(clippy::too_many_arguments)]
-    fn build_preedit(&mut self, t: &Terminal, fonts: &mut Fonts, p: &Preedit, origin: (f32, f32), row: usize, m: Metrics) {
+    fn build_preedit(
+        &mut self,
+        t: &Terminal,
+        fonts: &mut Fonts,
+        p: &Preedit,
+        origin: (f32, f32),
+        row: usize,
+        m: Metrics,
+    ) {
         let pal = t.palette();
         let (cw, ch) = (m.cell_w as f32, m.cell_h as f32);
         let (px, py) = origin;
@@ -1019,13 +1049,7 @@ impl Renderer {
             x = left + (box_w - w) / 2.0;
             y = y.clamp(top, top + ch - h);
         }
-        self.fg.push(Instance {
-            pos: [x, y],
-            size: [w, h],
-            uv: a.uv,
-            color,
-            kind: if a.color { COLOR } else { MASK },
-        });
+        self.fg.push(Instance { pos: [x, y], size: [w, h], uv: a.uv, color, kind: if a.color { COLOR } else { MASK } });
     }
 }
 

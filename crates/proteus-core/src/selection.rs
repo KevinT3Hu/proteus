@@ -45,7 +45,6 @@ impl SelectionRange {
     }
 }
 
-
 impl Selection {
     pub fn new(kind: SelectionKind, at: Point) -> Self {
         Self { kind, anchor: at, cursor: at }
@@ -57,7 +56,13 @@ impl Selection {
 
     /// Resolve against the grid. `blocks` is needed for semantic selection;
     /// `live_end` is the line after the cursor (end of a running block).
-    pub fn range(&self, grid: &Grid, blocks: Option<&Blocks>, separators: &str, live_end: Line) -> Option<SelectionRange> {
+    pub fn range(
+        &self,
+        grid: &Grid,
+        blocks: Option<&Blocks>,
+        separators: &str,
+        live_end: Line,
+    ) -> Option<SelectionRange> {
         let (a, b) = if self.anchor <= self.cursor { (self.anchor, self.cursor) } else { (self.cursor, self.anchor) };
         let last_col = grid.cols() - 1;
         let r = match self.kind {
@@ -91,12 +96,12 @@ impl Selection {
         if r.end.line < first || r.start.line > last {
             return None;
         }
-        let start = if r.start.line < first { Point::new(first, if r.rect { r.start.col } else { 0 }) } else { r.start };
+        let start =
+            if r.start.line < first { Point::new(first, if r.rect { r.start.col } else { 0 }) } else { r.start };
         let end = if r.end.line > last { Point::new(last, if r.rect { r.end.col } else { last_col }) } else { r.end };
         Some(SelectionRange { start, end, rect: r.rect })
     }
 }
-
 
 /// Last row of the logical line containing `line`.
 fn logical_end(grid: &Grid, mut line: Line) -> Line {

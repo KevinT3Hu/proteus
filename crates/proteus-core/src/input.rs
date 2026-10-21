@@ -49,7 +49,6 @@ pub enum KeyAction {
     Release,
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyEvent<'a> {
     pub key: Key,
@@ -94,7 +93,6 @@ enum Func {
     Tilde(u16),
 }
 
-
 fn func(key: Key) -> Option<Func> {
     Some(match key {
         Key::Up => Func::Letter(b'A'),
@@ -131,7 +129,9 @@ fn legacy(ev: &KeyEvent, mode: TermMode) -> Option<Vec<u8>> {
     };
     match ev.key {
         Key::Char(c) => {
-            if m.contains(Mods::CTRL) && let Some(b) = ctrl_byte(c) {
+            if m.contains(Mods::CTRL)
+                && let Some(b) = ctrl_byte(c)
+            {
                 prefix_alt(&mut out);
                 out.push(b);
             } else if !ev.text.is_empty() {
@@ -174,7 +174,6 @@ fn legacy(ev: &KeyEvent, mode: TermMode) -> Option<Vec<u8>> {
     }
     Some(out)
 }
-
 
 /// Kitty key code and terminator for `key`.
 fn kitty_code(key: Key) -> Option<(u32, char)> {
@@ -262,7 +261,6 @@ fn kitty(ev: &KeyEvent, mode: TermMode, flags: KeyboardFlags) -> Option<Vec<u8>>
     Some(s.into_bytes())
 }
 
-
 // --- mouse ------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -316,7 +314,6 @@ pub struct MouseEvent {
     pub pixel: Option<(u32, u32)>,
     pub mods: Mods,
 }
-
 
 /// Encode a mouse event per the active tracking mode, or `None` if the app
 /// did not ask for it (the host then handles the mouse itself).
@@ -387,7 +384,6 @@ pub fn alternate_scroll(lines: i32, mode: TermMode) -> Option<Vec<u8>> {
     Some(seq.repeat(lines.unsigned_abs() as usize))
 }
 
-
 // --- focus & paste ------------------------------------------------------------
 
 pub fn encode_focus(focused: bool, mode: TermMode) -> Option<&'static [u8]> {
@@ -457,7 +453,14 @@ mod tests {
 
     #[test]
     fn mouse() {
-        let ev = MouseEvent { action: MouseAction::Press, button: Some(MouseButton::Left), col: 4, line: 2, pixel: None, mods: Mods::empty() };
+        let ev = MouseEvent {
+            action: MouseAction::Press,
+            button: Some(MouseButton::Left),
+            col: 4,
+            line: 2,
+            pixel: None,
+            mods: Mods::empty(),
+        };
         assert_eq!(encode_mouse(&ev, TermMode::default()), None);
         let sgr = TermMode::MOUSE_NORMAL | TermMode::MOUSE_SGR;
         assert_eq!(encode_mouse(&ev, sgr).unwrap(), b"\x1b[<0;5;3M");

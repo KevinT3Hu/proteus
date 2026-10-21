@@ -15,10 +15,7 @@ impl Rgb {
 
     /// X11 `rgb:rrrr/gggg/bbbb` form used in OSC color query replies.
     pub fn to_x11(self) -> String {
-        format!(
-            "rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}",
-            self.r, self.r, self.g, self.g, self.b, self.b
-        )
+        format!("rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}", self.r, self.r, self.g, self.g, self.b, self.b)
     }
 
     /// Parse `#rgb`, `#rrggbb`, `#rrrgggbbb`, `#rrrrggggbbbb` or `rgb:r/g/b` (1–4 hex digits per channel).

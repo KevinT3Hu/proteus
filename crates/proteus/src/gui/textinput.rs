@@ -67,7 +67,16 @@ pub enum Edit {
 
 impl Input {
     pub fn new(purpose: Purpose, text: &str) -> Self {
-        Self { purpose, text: text.to_string(), cursor: text.len(), regex: false, tab: false, output: false, status: String::new(), choice: 0 }
+        Self {
+            purpose,
+            text: text.to_string(),
+            cursor: text.len(),
+            regex: false,
+            tab: false,
+            output: false,
+            status: String::new(),
+            choice: 0,
+        }
     }
 
     fn prev_boundary(&self) -> usize {
@@ -221,7 +230,8 @@ mod tests {
 
     #[test]
     fn palette() {
-        let names: Vec<String> = ["pane.split_right", "pane.split_down", "tab.new", "window.new"].map(String::from).to_vec();
+        let names: Vec<String> =
+            ["pane.split_right", "pane.split_down", "tab.new", "window.new"].map(String::from).to_vec();
         assert_eq!(palette_rank(&names, "new"), [2, 3]);
         assert_eq!(palette_rank(&names, "split DOW"), [1]);
         assert_eq!(palette_rank(&names, "").len(), 4);

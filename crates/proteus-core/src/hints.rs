@@ -46,7 +46,6 @@ pub struct Hint {
 
 pub const DEFAULT_ALPHABET: &str = "asdfghjkl";
 
-
 /// Hosts recognized as URLs without a scheme: `www.` names, names ending
 /// in a common top-level domain, `localhost[:port]`, `IPv4:port`. TLDs
 /// that are also common file extensions (`.rs`, `.sh`, `.py`, `.md`,
@@ -103,9 +102,8 @@ fn refine(kind: &HintKind, s: &str, range: Range<usize>) -> Option<Range<usize>>
             loop {
                 let cut = &t[..end];
                 let last = cut.chars().last()?;
-                let unbalanced = |open: char, close: char| {
-                    last == close && cut.matches(open).count() < cut.matches(close).count()
-                };
+                let unbalanced =
+                    |open: char, close: char| last == close && cut.matches(open).count() < cut.matches(close).count();
                 if ".,:;!?'\"".contains(last) || unbalanced('(', ')') || unbalanced('[', ']') {
                     end -= last.len_utf8();
                 } else {
@@ -123,11 +121,12 @@ fn refine(kind: &HintKind, s: &str, range: Range<usize>) -> Option<Range<usize>>
             let ok = t.matches(':').count() >= 2 && t.bytes().any(|b| b.is_ascii_digit());
             ok.then_some(range)
         }
-        HintKind::Path => (t.trim_end_matches(['.', ':']).len() > 1).then(|| range.start..range.start + t.trim_end_matches('.').len()),
+        HintKind::Path => {
+            (t.trim_end_matches(['.', ':']).len() > 1).then(|| range.start..range.start + t.trim_end_matches('.').len())
+        }
         _ => Some(range),
     }
 }
-
 
 /// Find non-overlapping hints in the logical lines intersecting `lines` and
 /// assign labels from `alphabet`.
@@ -187,7 +186,6 @@ pub fn labels(n: usize, alphabet: &str) -> Vec<String> {
         .collect()
 }
 
-
 /// A file path with an optional `:line[:col]` suffix.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Location {
@@ -236,7 +234,16 @@ mod tests {
         assert_eq!(find("on 10.0.0.1:3000/"), Some("10.0.0.1:3000/".into()));
         assert_eq!(find("baidu.COM/s"), Some("baidu.COM/s".into()));
         // File names, paths, mail addresses, plain IPs are not URLs.
-        for s in ["src/main.rs", "build.sh", "a/example.com/x", "./example.com", "me@example.com", "10.0.0.1", "foo.company", "lib.so"] {
+        for s in [
+            "src/main.rs",
+            "build.sh",
+            "a/example.com/x",
+            "./example.com",
+            "me@example.com",
+            "10.0.0.1",
+            "foo.company",
+            "lib.so",
+        ] {
             assert_eq!(find(s), None, "{s}");
         }
         assert_eq!(url_with_scheme("example.com/x"), "https://example.com/x");

@@ -233,7 +233,14 @@ impl Grid {
     }
 
     /// Resize with reflow of soft-wrapped lines (primary screen).
-    pub fn reflow(&mut self, cols: usize, lines: usize, cursor_x: usize, cursor_y: usize, pending_wrap: bool) -> Reflow {
+    pub fn reflow(
+        &mut self,
+        cols: usize,
+        lines: usize,
+        cursor_x: usize,
+        cursor_y: usize,
+        pending_wrap: bool,
+    ) -> Reflow {
         let cols = cols.max(2);
         let lines = lines.max(1);
         let base = self.dropped;

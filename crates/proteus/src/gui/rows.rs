@@ -69,11 +69,7 @@ impl Rows {
             let Some(l) = cur else { break };
             let start = match fold_at(l) {
                 Some((block, r)) => {
-                    rows.push(Row::Fold {
-                        block: *block,
-                        start: r.start,
-                        end: r.end,
-                    });
+                    rows.push(Row::Fold { block: *block, start: r.start, end: r.end });
                     r.start
                 }
                 None => {
@@ -94,11 +90,7 @@ impl Rows {
         while rows.len() < n && l < end {
             match fold_at(l) {
                 Some((block, r)) => {
-                    rows.push(Row::Fold {
-                        block: *block,
-                        start: r.start,
-                        end: r.end,
-                    });
+                    rows.push(Row::Fold { block: *block, start: r.start, end: r.end });
                     l = r.end;
                 }
                 None => {
@@ -167,12 +159,7 @@ mod tests {
         let t = term(5, 3, 3);
         let r = Rows::of(&t);
         let g = t.grid();
-        assert_eq!(
-            r.0,
-            (0..5)
-                .map(|y| Row::Line(g.viewport_line(y)))
-                .collect::<Vec<_>>()
-        );
+        assert_eq!(r.0, (0..5).map(|y| Row::Line(g.viewport_line(y))).collect::<Vec<_>>());
     }
 
     #[test]
@@ -185,14 +172,7 @@ mod tests {
         // Bottom: the prompt; above it the fold of 3 lines; above that more history.
         assert_eq!(r.0[4], Row::Line(bottom));
         let out = last_out.output_start.unwrap();
-        assert_eq!(
-            r.0[3],
-            Row::Fold {
-                block: last_out.id,
-                start: out,
-                end: out + 3
-            }
-        );
+        assert_eq!(r.0[3], Row::Fold { block: last_out.id, start: out, end: out + 3 });
         assert_eq!(r.0[2], Row::Line(out - 1));
         assert_eq!(r.row_of(out + 1), Some(3));
         assert_eq!(r.line(3), Some(out));

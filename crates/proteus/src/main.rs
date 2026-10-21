@@ -79,16 +79,18 @@ fn main() -> ExitCode {
     }
     // The command runs in the first pane; new panes start the shell.
     let command = (!cli.command.is_empty()).then_some(cli.command);
-    let layout = match cli.layout.as_deref().map(|l| spec::resolve(l).ok_or(l).map_err(|l| format!("{l}: no config directory"))) {
-        None => None,
-        Some(path) => match path.and_then(|p| spec::load(&p)) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                eprintln!("proteus: layout: {e}");
-                return ExitCode::from(2);
-            }
-        },
-    };
+    let layout =
+        match cli.layout.as_deref().map(|l| spec::resolve(l).ok_or(l).map_err(|l| format!("{l}: no config directory")))
+        {
+            None => None,
+            Some(path) => match path.and_then(|p| spec::load(&p)) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    eprintln!("proteus: layout: {e}");
+                    return ExitCode::from(2);
+                }
+            },
+        };
     match gui::run(cfg, error, command, layout) {
         Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
         Err(e) => {

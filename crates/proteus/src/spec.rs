@@ -265,9 +265,7 @@ fn node(t: &Table, at: &str, base: Option<&Path>, kind: Kind) -> Result<NodeSpec
         }
         (Some(_), 0 | 1) => Err(format!("{at}: a split needs at least two panes")),
         (None, _) => Err(format!("{at}: child panes need `split = \"vertical\"` or `\"horizontal\"`")),
-        (Some(_), _) if pane_keys => {
-            Err(format!("{at}: a split cannot have pane keys ({})", PANE_KEYS.join(", ")))
-        }
+        (Some(_), _) if pane_keys => Err(format!("{at}: a split cannot have pane keys ({})", PANE_KEYS.join(", "))),
         (Some(_), _) if stacked && children.iter().any(|c| !matches!(c, NodeSpec::Pane(_))) => {
             Err(format!("{at}: a stack's children must be panes"))
         }
@@ -613,7 +611,13 @@ impl NodeSpec {
                 let n = built.len();
                 let mut node = built.pop().expect("split has children");
                 for (i, child) in built.into_iter().enumerate().rev() {
-                    let share = if i == 0 && let Some(r) = ratio { *r } else { 1.0 / (n - i) as f32 };
+                    let share = if i == 0
+                        && let Some(r) = ratio
+                    {
+                        *r
+                    } else {
+                        1.0 / (n - i) as f32
+                    };
                     node = Node::Split { axis: *axis, ratio: share, a: Box::new(child), b: Box::new(node) };
                 }
                 Ok((node, focus))
@@ -698,7 +702,10 @@ mod tests {
         let mut extra = s.windows[0].clone();
         extra[0].floating = vec![
             // Floats inherit the tab's cwd.
-            FloatSpec { pane: PaneSpec { run: Some("htop".into()), cwd: Some("/src/app".into()), ..PaneSpec::default() }, geometry: Some((3, 2, 40, 10)) },
+            FloatSpec {
+                pane: PaneSpec { run: Some("htop".into()), cwd: Some("/src/app".into()), ..PaneSpec::default() },
+                geometry: Some((3, 2, 40, 10)),
+            },
             FloatSpec { pane: PaneSpec { cwd: Some("/src/app".into()), ..PaneSpec::default() }, geometry: None },
         ];
         extra[0].show_floating = true;
@@ -706,7 +713,10 @@ mod tests {
             axis: Axis::Y,
             ratio: None,
             stacked: true,
-            children: vec![NodeSpec::Pane(PaneSpec::default()), NodeSpec::Pane(PaneSpec { focus: true, ..PaneSpec::default() })],
+            children: vec![
+                NodeSpec::Pane(PaneSpec::default()),
+                NodeSpec::Pane(PaneSpec { focus: true, ..PaneSpec::default() }),
+            ],
         };
         multi.windows.push(extra);
         let src = to_lua(&multi);
@@ -727,7 +737,10 @@ mod tests {
             ("return { tabs = { { split = 'vertical', {}, { comand = 'x' } } } }", "tabs[1][2]: unknown key `comand`"),
             ("return { tabs = { { plugin = 'files' } } }", "plugin"),
             ("return { tabz = {} }", "unknown key `tabz`"),
-            ("return { tabs = { { split = 'vertical', stacked = true, {}, { split = 'vertical', {}, {} } } } }", "must be panes"),
+            (
+                "return { tabs = { { split = 'vertical', stacked = true, {}, { split = 'vertical', {}, {} } } } }",
+                "must be panes",
+            ),
             ("return { tabs = { { floating = { { x = 1 } } } } }", "x, y, width and height"),
             ("return { tabs = { { floating = { { split = 'vertical', {}, {} } } } } }", "cannot be split"),
             ("return { windows = { { tabs = {} } } }", "no tabs"),

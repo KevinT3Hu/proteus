@@ -241,7 +241,10 @@ impl App {
                 let floating = t
                     .floats
                     .iter()
-                    .map(|f| FloatSpec { pane: self.pane_spec(f.id, f.id == t.focus), geometry: Some((f.col, f.row, f.cols, f.rows)) })
+                    .map(|f| FloatSpec {
+                        pane: self.pane_spec(f.id, f.id == t.focus),
+                        geometry: Some((f.col, f.row, f.cols, f.rows)),
+                    })
                     .collect();
                 TabSpec {
                     name: t.name.clone(),
@@ -265,7 +268,10 @@ impl App {
         }
         let mut wins: Vec<&Win> = std::iter::once(&self.w).chain(&self.parked).collect();
         wins.sort_by_key(|w| w.id);
-        LayoutSpec { windows: wins.into_iter().map(|w| self.tab_specs(w)).filter(|t| !t.is_empty()).collect(), clean: None }
+        LayoutSpec {
+            windows: wins.into_iter().map(|w| self.tab_specs(w)).filter(|t| !t.is_empty()).collect(),
+            clean: None,
+        }
     }
 
     pub(super) fn save_layout(&mut self, name: &str) {

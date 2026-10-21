@@ -317,7 +317,9 @@ fn apply(c: &mut Config, t: &Table) -> Result<(), String> {
                     "command" => {
                         c.command = match v {
                             Value::Nil => None,
-                            Value::String(s) => Some(vec![OsString::from(s.to_str().map_err(|e| e.to_string())?.to_string())]),
+                            Value::String(s) => {
+                                Some(vec![OsString::from(s.to_str().map_err(|e| e.to_string())?.to_string())])
+                            }
                             Value::Table(t) => {
                                 let argv = t
                                     .sequence_values::<String>()
@@ -389,7 +391,9 @@ fn apply(c: &mut Config, t: &Table) -> Result<(), String> {
                                 _ => match string(action, &format!("{name}[\"{key}\"]"))?.as_str() {
                                     "none" => None,
                                     a => Some(Action::from_name(a).ok_or_else(|| {
-                                        format!("{name}[\"{key}\"]: unknown action `{a}` (see `proteus --list-actions`)")
+                                        format!(
+                                            "{name}[\"{key}\"]: unknown action `{a}` (see `proteus --list-actions`)"
+                                        )
                                     })?),
                                 },
                             };
@@ -619,7 +623,11 @@ mod tests {
         assert_eq!(k.binds.len(), 4);
         assert!(k.binds.contains(&(Mode::Normal, Chord::parse("alt+x").unwrap(), Some(Action::ClosePane))));
         assert!(k.binds.contains(&(Mode::Normal, Chord::parse("alt+n").unwrap(), None)));
-        assert!(k.binds.contains(&(Mode::Pane, Chord::parse("shift+v").unwrap(), Some(Action::Split(crate::layout::Axis::Y)))));
+        assert!(k.binds.contains(&(
+            Mode::Pane,
+            Chord::parse("shift+v").unwrap(),
+            Some(Action::Split(crate::layout::Axis::Y))
+        )));
         assert_eq!(Config::default().keys.preset, Preset::Zellij);
         for (src, want) in [
             (r#"keys = { leader = "ctrl+nope" }"#, "keys.leader"),
@@ -649,7 +657,10 @@ mod tests {
         assert_eq!(c.hint_patterns.len(), 2);
         assert_eq!(c.hint_patterns[0].url.as_deref(), Some("https://j/{}"));
         assert_eq!(c.hint_patterns[1].name, "pattern2");
-        assert_eq!(ev(r#"require("proteus").config { notify = { min_duration = false } }"#).unwrap().notify_after, None);
+        assert_eq!(
+            ev(r#"require("proteus").config { notify = { min_duration = false } }"#).unwrap().notify_after,
+            None
+        );
         for (src, want) in [
             (r#"hints = { alphabet = "a" }"#, "hints.alphabet"),
             (r#"hints = { patterns = { { regex = "(" } } }"#, "hints.patterns[1].regex"),

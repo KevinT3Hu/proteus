@@ -62,26 +62,17 @@ impl SearchState {
 
     /// `[regex] [tab] [output] ` for the options that are on.
     fn flags(&self) -> String {
-        [
-            (self.regex, "[regex] "),
-            (self.tab, "[tab] "),
-            (self.output, "[output] "),
-        ]
-        .iter()
-        .filter(|f| f.0)
-        .map(|f| f.1)
-        .collect()
+        [(self.regex, "[regex] "), (self.tab, "[tab] "), (self.output, "[output] ")]
+            .iter()
+            .filter(|f| f.0)
+            .map(|f| f.1)
+            .collect()
     }
 }
 
 /// Index of the nearest match after (`forward`) or before `from`, wrapping.
 /// `order` ranks panes; matches are sorted by (rank, start).
-fn nearest(
-    matches: &[(PaneId, Match)],
-    order: &[PaneId],
-    from: (PaneId, Point),
-    forward: bool,
-) -> Option<usize> {
+fn nearest(matches: &[(PaneId, Match)], order: &[PaneId], from: (PaneId, Point), forward: bool) -> Option<usize> {
     if matches.is_empty() {
         return None;
     }
@@ -91,12 +82,7 @@ fn nearest(
     if forward {
         Some(matches.iter().position(|m| key(m) > at).unwrap_or(0))
     } else {
-        Some(
-            matches
-                .iter()
-                .rposition(|m| key(m) < at)
-                .unwrap_or(matches.len() - 1),
-        )
+        Some(matches.iter().rposition(|m| key(m) < at).unwrap_or(matches.len() - 1))
     }
 }
 
@@ -118,11 +104,7 @@ pub(super) fn load_recent() -> Vec<String> {
     let Some(text) = recent_path().and_then(|p| std::fs::read_to_string(p).ok()) else {
         return Vec::new();
     };
-    text.lines()
-        .filter(|l| !l.is_empty())
-        .take(RECENT_MAX)
-        .map(String::from)
-        .collect()
+    text.lines().filter(|l| !l.is_empty()).take(RECENT_MAX).map(String::from).collect()
 }
 
 impl App {
@@ -149,16 +131,9 @@ impl App {
         let at = Point::new(g.abs_line(t.cursor().y), t.cursor().x);
         let rows = Rows::of(t);
         // Scrolled back (mouse wheel): start at the bottom of what is shown.
-        let cursor = if rows.row_of(at.line).is_some() {
-            at
-        } else {
-            Point::new(rows.last_line().unwrap_or(at.line), 0)
-        };
-        self.w.copy = Some(CopyState {
-            pane: id,
-            cursor,
-            select: None,
-        });
+        let cursor =
+            if rows.row_of(at.line).is_some() { at } else { Point::new(rows.last_line().unwrap_or(at.line), 0) };
+        self.w.copy = Some(CopyState { pane: id, cursor, select: None });
     }
 
     fn leave_scroll(&mut self) {
@@ -178,12 +153,7 @@ impl App {
                 }
             }
         }
-        if self
-            .w
-            .input
-            .as_ref()
-            .is_some_and(|i| i.purpose == Purpose::Search)
-        {
+        if self.w.input.as_ref().is_some_and(|i| i.purpose == Purpose::Search) {
             self.w.input = None;
         }
     }
@@ -227,10 +197,7 @@ impl App {
             };
         }
         // Paging moves the view along with the cursor, as in vi.
-        if matches!(
-            m,
-            Motion::HalfPageUp | Motion::HalfPageDown | Motion::PageUp | Motion::PageDown
-        ) {
+        if matches!(m, Motion::HalfPageUp | Motion::HalfPageDown | Motion::PageUp | Motion::PageDown) {
             t.scroll_display(c.cursor.line as isize - to.line as isize);
         }
         // Prompts go to the top of the view, like `scroll.prev_prompt`.
@@ -277,15 +244,10 @@ impl App {
             return;
         };
         let t = &p.term;
-        let text = t
-            .selection_text()
-            .filter(|s| !s.is_empty() && c.select.is_some())
-            .unwrap_or_else(|| {
-                let l = c.cursor.line;
-                t.text_range(Point::new(l, 0), Point::new(l, t.cols() - 1))
-                    .trim_end()
-                    .to_string()
-            });
+        let text = t.selection_text().filter(|s| !s.is_empty() && c.select.is_some()).unwrap_or_else(|| {
+            let l = c.cursor.line;
+            t.text_range(Point::new(l, 0), Point::new(l, t.cols() - 1)).trim_end().to_string()
+        });
         if !text.is_empty() {
             self.set_selection(ClipboardKind::Clipboard, text.clone());
             self.set_selection(ClipboardKind::Primary, text);
@@ -330,9 +292,7 @@ impl App {
             .w
             .search
             .as_ref()
-            .map_or((String::new(), false, false, false), |s| {
-                (s.query.clone(), s.regex, s.tab, s.output)
-            });
+            .map_or((String::new(), false, false, false), |s| (s.query.clone(), s.regex, s.tab, s.output));
         let mut input = Input::new(Purpose::Search, &query);
         input.regex = regex;
         input.tab = tab;
@@ -359,11 +319,7 @@ impl App {
             return vec![s.pane];
         }
         let view = self.view();
-        view.panes
-            .iter()
-            .map(|p| p.0)
-            .chain(view.floats.iter().map(|f| f.id))
-            .collect()
+        view.panes.iter().map(|p| p.0).chain(view.floats.iter().map(|f| f.id)).collect()
     }
 
     /// Recompute matches for the current query.
@@ -372,10 +328,7 @@ impl App {
             return;
         };
         let panes = self.search_panes(s);
-        let opts = SearchOptions {
-            regex: s.regex,
-            ..SearchOptions::default()
-        };
+        let opts = SearchOptions { regex: s.regex, ..SearchOptions::default() };
         let (mut matches, mut error) = (Vec::new(), None);
         if !s.query.is_empty() {
             match Searcher::new(&s.query, &opts) {
@@ -417,12 +370,7 @@ impl App {
         let order = self.search_panes(s);
         // A match starting at the origin counts.
         let (op, o) = s.origin;
-        let current = nearest(
-            &s.matches,
-            &order,
-            (op, Point::new(o.line, o.col + 1)),
-            false,
-        );
+        let current = nearest(&s.matches, &order, (op, Point::new(o.line, o.col + 1)), false);
         let target = current.map(|i| s.matches[i]);
         let Some(s) = self.w.search.as_mut() else { return };
         s.current = current;
@@ -456,11 +404,7 @@ impl App {
                 p.term.scroll_to_bottom();
             }
             let old = self.focused_id();
-            self.w.copy = Some(CopyState {
-                pane,
-                cursor: m.start,
-                select: None,
-            });
+            self.w.copy = Some(CopyState { pane, cursor: m.start, select: None });
             self.w.tabs[self.w.active].set_focus(pane);
             self.after_focus(old);
         } else if let Some(c) = self.w.copy.as_mut() {
@@ -480,12 +424,7 @@ impl App {
     /// Enter in the query: the match is selected (`y` copies it).
     fn search_submit(&mut self) {
         self.w.input = None;
-        match self
-            .w
-            .search
-            .as_ref()
-            .and_then(|s| Some(s.matches[s.current?]))
-        {
+        match self.w.search.as_ref().and_then(|s| Some(s.matches[s.current?])) {
             Some((pane, m)) => self.goto_match(pane, m, true),
             None => self.w.search = None,
         }
@@ -525,11 +464,7 @@ impl App {
             .map(|(i, (_, m))| Mark {
                 start: m.start,
                 end: m.end,
-                kind: if Some(i) == s.current {
-                    MarkKind::Current
-                } else {
-                    MarkKind::Match
-                },
+                kind: if Some(i) == s.current { MarkKind::Current } else { MarkKind::Match },
             })
             .collect()
     }
@@ -551,24 +486,15 @@ impl App {
     /// Every palette entry: actions, tabs of this window, panes of all
     /// windows, saved layouts.
     fn palette_items(&self) -> Vec<(String, Item)> {
-        let mut v: Vec<(String, Item)> = Action::all()
-            .into_iter()
-            .map(|a| (a.name(), Item::Action(a)))
-            .collect();
+        let mut v: Vec<(String, Item)> = Action::all().into_iter().map(|a| (a.name(), Item::Action(a))).collect();
         v.sort_by(|a, b| a.0.cmp(&b.0));
         for (i, t) in self.w.tabs.iter().enumerate() {
-            let title = t.name.clone().unwrap_or_else(|| {
-                self.panes
-                    .get(&t.focus)
-                    .map_or("", |p| p.title())
-                    .to_string()
-            });
+            let title =
+                t.name.clone().unwrap_or_else(|| self.panes.get(&t.focus).map_or("", |p| p.title()).to_string());
             v.push((format!("tab {}: {title}", i + 1), Item::Tab(i)));
         }
-        let mut ids: Vec<PaneId> = std::iter::once(&self.w)
-            .chain(&self.parked)
-            .flat_map(|w| w.tabs.iter().flat_map(|t| t.panes()))
-            .collect();
+        let mut ids: Vec<PaneId> =
+            std::iter::once(&self.w).chain(&self.parked).flat_map(|w| w.tabs.iter().flat_map(|t| t.panes())).collect();
         ids.sort();
         for id in ids {
             if let Some(p) = self.panes.get(&id) {
@@ -585,16 +511,8 @@ impl App {
     fn palette_hits(&self, query: &str) -> Vec<(String, Item)> {
         let items = self.palette_items();
         let keys: Vec<String> = items.iter().map(|i| i.0.to_lowercase()).collect();
-        let mut hits: Vec<(String, Item)> = palette_rank(&keys, query)
-            .into_iter()
-            .map(|i| items[i].clone())
-            .collect();
-        let rank = |s: &str| {
-            self.recent
-                .iter()
-                .position(|r| r == s)
-                .unwrap_or(usize::MAX)
-        };
+        let mut hits: Vec<(String, Item)> = palette_rank(&keys, query).into_iter().map(|i| items[i].clone()).collect();
+        let rank = |s: &str| self.recent.iter().position(|r| r == s).unwrap_or(usize::MAX);
         hits.sort_by_key(|h| rank(&h.0)); // stable: the rest keeps its order
         hits
     }
@@ -626,12 +544,7 @@ impl App {
             return;
         }
         i.choice = i.choice.min(hits.len() - 1);
-        let mut shown: Vec<String> = hits
-            .iter()
-            .skip(i.choice)
-            .take(8)
-            .map(|s| s.0.clone())
-            .collect();
+        let mut shown: Vec<String> = hits.iter().skip(i.choice).take(8).map(|s| s.0.clone()).collect();
         shown[0] = match chosen_key {
             Some(k) => format!("[{} · {k}]", shown[0]),
             None => format!("[{}]", shown[0]),
@@ -702,12 +615,7 @@ impl App {
                 }
             }
             Edit::Submit => {
-                let text = self
-                    .w
-                    .input
-                    .as_ref()
-                    .map(|i| i.text.trim().to_string())
-                    .unwrap_or_default();
+                let text = self.w.input.as_ref().map(|i| i.text.trim().to_string()).unwrap_or_default();
                 if purpose == Purpose::Search {
                     return self.search_submit();
                 }
@@ -763,10 +671,7 @@ mod tests {
 
     #[test]
     fn nearest_across_panes() {
-        let m = |l, c| Match {
-            start: Point::new(l, c),
-            end: Point::new(l, c + 1),
-        };
+        let m = |l, c| Match { start: Point::new(l, c), end: Point::new(l, c + 1) };
         let ms = vec![(1, m(5, 0)), (1, m(9, 0)), (2, m(1, 0)), (2, m(7, 0))];
         let order = [1, 2];
         assert_eq!(nearest(&ms, &order, (1, Point::new(9, 0)), true), Some(2));

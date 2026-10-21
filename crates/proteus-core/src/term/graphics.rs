@@ -4,7 +4,6 @@
 
 use std::time::{Duration, Instant};
 
-use base64::Engine as _;
 use super::{BASE64, Terminal, join_params};
 use crate::event::Terminator;
 use crate::graphics::kitty::{self, Command, Error, err};
@@ -15,6 +14,7 @@ use crate::graphics::{
     Placement, PxRect, Source, Upload, decode_image,
 };
 use crate::modes::TermMode;
+use base64::Engine as _;
 
 /// State of the APC pre-filter (vte discards APC strings).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -239,7 +239,11 @@ impl Terminal {
             }
             b'p' => {
                 let r = self.kitty_put(&cmd, None);
-                let id = if id == 0 { self.kitty_lookup(&cmd).ok().and_then(|k| self.images.image(k)).map_or(0, |i| i.id) } else { id };
+                let id = if id == 0 {
+                    self.kitty_lookup(&cmd).ok().and_then(|k| self.images.image(k)).map_or(0, |i| i.id)
+                } else {
+                    id
+                };
                 self.kitty_reply(&cmd, id, number, cmd.placement(), r);
             }
             b'd' => self.kitty_delete(&cmd),
@@ -407,8 +411,10 @@ impl Terminal {
                 return Err(err("EINVAL", "Virtual placements cannot be relative"));
             }
             let pk = self.images.key_for_id(cmd.u(b'P')).ok_or_else(|| err("ENOPARENT", "Parent image not found"))?;
-            let parent =
-                self.images.find_placement(pk, cmd.u(b'Q')).ok_or_else(|| err("ENOPARENT", "Parent placement not found"))?;
+            let parent = self
+                .images
+                .find_placement(pk, cmd.u(b'Q'))
+                .ok_or_else(|| err("ENOPARENT", "Parent placement not found"))?;
             let pid = parent.id;
             match self.images.chain_depth(pk, pid, (key, p.id)) {
                 None => return Err(err("ECYCLE", "Relative placement would create a cycle")),
@@ -470,7 +476,8 @@ impl Terminal {
             b'z' => select(&|p| !p.is_virtual && p.z == z),
             b'r' => {
                 let (lo, hi) = (cmd.u(b'x'), cmd.u(b'y'));
-                let keys: Vec<u64> = s.images().filter(|i| i.id != 0 && i.id >= lo && i.id <= hi).map(|i| i.key).collect();
+                let keys: Vec<u64> =
+                    s.images().filter(|i| i.id != 0 && i.id >= lo && i.id <= hi).map(|i| i.key).collect();
                 select(&|p| keys.contains(&p.image));
                 if free {
                     drop_images.extend(keys);
@@ -679,13 +686,21 @@ impl Terminal {
     }
 
     /// Store and place a Sixel or iTerm2 image at the cursor (z = -1, below text).
-    fn place_anonymous(&mut self, source: Source, w: u32, h: u32, frames: Vec<(Vec<u8>, u32)>, size: Option<(u32, u32)>) {
+    fn place_anonymous(
+        &mut self,
+        source: Source,
+        w: u32,
+        h: u32,
+        frames: Vec<(Vec<u8>, u32)>,
+        size: Option<(u32, u32)>,
+    ) {
         let (cw, ch) = self.cell_pixel_size();
         let (dw, dh) = size.unwrap_or((w, h));
         let cols = ceil_div(dw as u64, cw as u64).max(1);
         let rows = ceil_div(dh as u64, ch as u64).max(1);
         let fixed = source == Source::Sixel && self.mode.contains(TermMode::SIXEL_DISPLAY);
-        let (line, col) = if fixed { (self.grid.abs_line(0) as i64, 0) } else { (self.abs_cursor_line(), self.cursor.x) };
+        let (line, col) =
+            if fixed { (self.grid.abs_line(0) as i64, 0) } else { (self.abs_cursor_line(), self.cursor.x) };
         // Replace earlier images drawn at the same spot (before inserting the new one).
         self.images.remove_covered(line, col, cols, rows);
 
@@ -792,7 +807,11 @@ impl Terminal {
             (Some(w), None) => (w, if preserve { ih * w / iw } else { ih }),
             (None, Some(h)) => (if preserve { iw * h / ih } else { iw }, h),
             (Some(w), Some(h)) if preserve => {
-                if iw * h <= ih * w { (iw * h / ih, h) } else { (w, ih * w / iw) }
+                if iw * h <= ih * w {
+                    (iw * h / ih, h)
+                } else {
+                    (w, ih * w / iw)
+                }
             }
             (Some(w), Some(h)) => (w, h),
         };

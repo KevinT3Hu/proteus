@@ -109,7 +109,8 @@ fn zsh_blocks() {
 #[test]
 fn fish_blocks() {
     // fish has no `(exit 3)` subshell syntax.
-    if let Some(t) = run_shell("/usr/bin/fish", &["echo one\r", "fish -c 'exit 3'\r", "cd /tmp\r", "true\r", "exit\r"]) {
+    if let Some(t) = run_shell("/usr/bin/fish", &["echo one\r", "fish -c 'exit 3'\r", "cd /tmp\r", "true\r", "exit\r"])
+    {
         assert!(t.contains("command=\"echo one\"") && t.contains("    | one"), "{t}");
         assert!(t.contains("exit=3"), "{t}");
         assert!(t.contains("cwd=/tmp"), "{t}");

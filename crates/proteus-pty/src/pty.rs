@@ -40,7 +40,6 @@ pub struct CommandSpec {
     pub cwd: Option<PathBuf>,
 }
 
-
 impl CommandSpec {
     pub fn new(program: impl Into<PathBuf>) -> Self {
         Self { program: program.into(), args: Vec::new(), env: Vec::new(), cwd: None }
@@ -111,7 +110,6 @@ fn user_shell() -> PathBuf {
         .unwrap_or_else(|| "/bin/sh".into())
 }
 
-
 /// The process in the foreground of the terminal (`tcgetpgrp`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForegroundProcess {
@@ -137,11 +135,7 @@ fn open_pair() -> io::Result<(OwnedFd, OwnedFd)> {
         Ok(fd) => fd,
         Err(_) => {
             let name = rustix::pty::ptsname(&master, Vec::new())?;
-            rustix::fs::open(
-                name.as_c_str(),
-                OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC,
-                Mode::empty(),
-            )?
+            rustix::fs::open(name.as_c_str(), OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC, Mode::empty())?
         }
     };
     // Line editing in the kernel must treat input as UTF-8.
@@ -150,7 +144,6 @@ fn open_pair() -> io::Result<(OwnedFd, OwnedFd)> {
     termios::tcsetattr(&slave, OptionalActions::Now, &tio)?;
     Ok((master, slave))
 }
-
 
 impl Pty {
     /// Spawn `spec` as session leader with the PTY as controlling terminal.
@@ -215,7 +208,6 @@ impl Pty {
         self.child.id() as i32
     }
 
-
     /// Process group in the foreground of the terminal.
     pub fn foreground_pgrp(&self) -> Option<i32> {
         termios::tcgetpgrp(self.master.as_fd()).ok().map(Pid::as_raw_nonzero).map(|p| p.get())
@@ -279,7 +271,6 @@ impl Drop for Pty {
 pub fn is_eof(err: &io::Error) -> bool {
     err.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error())
 }
-
 
 #[cfg(test)]
 mod tests {

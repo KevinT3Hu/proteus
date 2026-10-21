@@ -47,7 +47,6 @@ impl Searcher {
         Ok(Self { re })
     }
 
-
     /// Matches in logical lines that intersect `lines`, in order.
     pub fn find(&self, grid: &Grid, lines: Range<Line>) -> Vec<Match> {
         let mut out = Vec::new();

@@ -24,16 +24,8 @@ pub fn extent(t: &Terminal, b: &Block) -> (Line, Line) {
     let next = t.blocks().next_prompt(b.prompt_line).unwrap_or(Line::MAX);
     let live = t.primary_grid().abs_line(t.cursor().y) + 1;
     let min_end = b.prompt_line + 1;
-    let prompt_end = b
-        .output_start
-        .unwrap_or(live.min(next))
-        .max(min_end)
-        .min(next.max(min_end));
-    let end = b
-        .output_lines(live)
-        .map_or(prompt_end, |r| r.end)
-        .min(next)
-        .max(prompt_end);
+    let prompt_end = b.output_start.unwrap_or(live.min(next)).max(min_end).min(next.max(min_end));
+    let end = b.output_lines(live).map_or(prompt_end, |r| r.end).min(next).max(prompt_end);
     (prompt_end, end)
 }
 
@@ -97,11 +89,7 @@ impl App {
             return 0;
         }
         let thick = (self.w.scale.round() as i32).max(1);
-        let room = if r.x <= self.area().x {
-            r.x - 1
-        } else {
-            self.cell().0 as i32 / 2 - thick - 1
-        };
+        let room = if r.x <= self.area().x { r.x - 1 } else { self.cell().0 as i32 / 2 - thick - 1 };
         g.min(room).max(0)
     }
 
@@ -205,30 +193,17 @@ impl App {
             return false;
         }
         let view = self.view();
-        view.panes
-            .iter()
-            .map(|p| p.0)
-            .chain(view.floats.iter().map(|f| f.id))
-            .any(|id| {
-                self.panes.get(&id).is_some_and(|p| {
-                    !p.term.is_alt_screen()
-                        && p.term
-                            .blocks()
-                            .last()
-                            .is_some_and(|b| b.state == BlockState::Running)
-                })
+        view.panes.iter().map(|p| p.0).chain(view.floats.iter().map(|f| f.id)).any(|id| {
+            self.panes.get(&id).is_some_and(|p| {
+                !p.term.is_alt_screen() && p.term.blocks().last().is_some_and(|b| b.state == BlockState::Running)
             })
+        })
     }
 
     /// Pane grids of the active tab, topmost first: (pane, grid rect).
     fn grids_topmost_first(&self) -> Vec<(PaneId, Rect)> {
         let view = self.view();
-        view.floats
-            .iter()
-            .rev()
-            .map(|f| (f.id, f.content))
-            .chain(view.panes.iter().copied())
-            .collect()
+        view.floats.iter().rev().map(|f| (f.id, f.content)).chain(view.panes.iter().copied()).collect()
     }
 
     /// Pane and display row under a logical position, with whether it is
@@ -285,10 +260,7 @@ impl App {
         let r = self.view().rect(id)?;
         let rows = Rows::of(t);
         let skip = self.row_skip(id);
-        let row = rows
-            .row_of(b.prompt_line)
-            .filter(|&y| y >= skip)
-            .unwrap_or(skip);
+        let row = rows.row_of(b.prompt_line).filter(|&y| y >= skip).unwrap_or(skip);
         let ch = self.cell().1 as i32;
         let mut y = r.y + (row - skip) as i32 * ch - ch;
         if y < r.y {
@@ -296,20 +268,8 @@ impl App {
         }
         let text = format!(" {} ", summary(b));
         let cols = super::chrome::text_width(&text).min(t.cols());
-        let bg = if b.failed() {
-            t.palette().indexed(1)
-        } else {
-            theme.fg
-        };
-        Some(Label {
-            x: r.x as f32,
-            y: y as f32,
-            cols,
-            text,
-            fg: theme.bg,
-            bg: Some(bg),
-            bold: false,
-        })
+        let bg = if b.failed() { t.palette().indexed(1) } else { theme.fg };
+        Some(Label { x: r.x as f32, y: y as f32, cols, text, fg: theme.bg, bg: Some(bg), bold: false })
     }
 
     // --- actions ---------------------------------------------------------------
@@ -327,11 +287,7 @@ impl App {
         }
         let id = self.focused_id();
         let t = &self.panes.get(&id)?.term;
-        let b = t
-            .blocks()
-            .iter()
-            .rev()
-            .find(|b| b.output_start.is_some() || b.command.is_some())?;
+        let b = t.blocks().iter().rev().find(|b| b.output_start.is_some() || b.command.is_some())?;
         Some((id, b.id))
     }
 
@@ -345,11 +301,7 @@ impl App {
             Part::Output => BlockPart::Output,
             Part::All => BlockPart::All,
         };
-        match t
-            .block_text(bid, p)
-            .map(|s| s.trim_end_matches('\n').to_string())
-            .filter(|s| !s.is_empty())
-        {
+        match t.block_text(bid, p).map(|s| s.trim_end_matches('\n').to_string()).filter(|s| !s.is_empty()) {
             Some(text) => {
                 self.set_selection(ClipboardKind::Clipboard, text.clone());
                 self.set_selection(ClipboardKind::Primary, text);
@@ -378,21 +330,13 @@ impl App {
         let (kind, start, stop) = match part {
             Part::Command => {
                 let s = b.input_start.unwrap_or(Point::new(b.prompt_line, 0));
-                (
-                    SelectionKind::Simple,
-                    s,
-                    Point::new(prompt_end - 1, last_col),
-                )
+                (SelectionKind::Simple, s, Point::new(prompt_end - 1, last_col))
             }
             Part::Output => match b.output_start {
                 Some(o) if o < end => (SelectionKind::Semantic, Point::new(o, 0), Point::new(o, 0)),
                 _ => return self.notice("this block has no output".into()),
             },
-            Part::All => (
-                SelectionKind::Line,
-                Point::new(b.prompt_line, 0),
-                Point::new(end - 1, 0),
-            ),
+            Part::All => (SelectionKind::Line, Point::new(b.prompt_line, 0), Point::new(end - 1, 0)),
         };
         t.set_block_folded(bid, false);
         t.start_selection(kind, start);
@@ -404,16 +348,8 @@ impl App {
         t.reveal_line(cursor.line);
         // `y` copies the selection; moving the cursor extends it (a
         // semantic selection always covers the whole output).
-        let select = if kind == SelectionKind::Line {
-            Select::Line
-        } else {
-            Select::Char
-        };
-        self.w.copy = Some(CopyState {
-            pane: id,
-            cursor,
-            select: Some(select),
-        });
+        let select = if kind == SelectionKind::Line { Select::Line } else { Select::Char };
+        self.w.copy = Some(CopyState { pane: id, cursor, select: Some(select) });
         self.w.dirty = true;
     }
 
@@ -431,9 +367,7 @@ impl App {
         let Some(b) = p.term.blocks().get(bid) else {
             return;
         };
-        if b.state != BlockState::Finished
-            || !b.output_lines(Line::MAX).is_some_and(|r| !r.is_empty())
-        {
+        if b.state != BlockState::Finished || !b.output_lines(Line::MAX).is_some_and(|r| !r.is_empty()) {
             return;
         }
         let fold = !b.folded;
@@ -454,13 +388,7 @@ impl App {
         let Some(p) = self.panes.get_mut(&id) else {
             return;
         };
-        let ids: Vec<BlockId> = p
-            .term
-            .blocks()
-            .iter()
-            .filter(|b| b.folded)
-            .map(|b| b.id)
-            .collect();
+        let ids: Vec<BlockId> = p.term.blocks().iter().filter(|b| b.folded).map(|b| b.id).collect();
         for b in ids {
             p.term.set_block_folded(b, false);
         }
@@ -472,10 +400,7 @@ impl App {
         let Some(p) = self.panes.get_mut(&id) else {
             return;
         };
-        if let Some((bid, _)) = super::rows::folds(&p.term)
-            .into_iter()
-            .find(|f| f.1.contains(&line))
-        {
+        if let Some((bid, _)) = super::rows::folds(&p.term).into_iter().find(|f| f.1.contains(&line)) {
             p.term.set_block_folded(bid, false);
             self.w.dirty = true;
         }
@@ -485,12 +410,8 @@ impl App {
         let Some((id, bid)) = self.target_block() else {
             return;
         };
-        let Some(cmd) = self.panes[&id]
-            .term
-            .blocks()
-            .get(bid)
-            .and_then(|b| b.command.clone())
-            .filter(|c| !c.trim().is_empty())
+        let Some(cmd) =
+            self.panes[&id].term.blocks().get(bid).and_then(|b| b.command.clone()).filter(|c| !c.trim().is_empty())
         else {
             return self.notice("no command to run again".into());
         };

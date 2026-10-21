@@ -7,8 +7,8 @@ use std::ops::Range;
 use std::time::Instant;
 
 use base64::Engine as _;
-use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig};
 use base64::engine::DecodePaddingMode;
+use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig};
 use unicode_segmentation::UnicodeSegmentation;
 use vte::{Params, Perform};
 
@@ -58,7 +58,6 @@ pub struct Cursor {
     charsets: [Charset; 4],
     gl: usize,
 }
-
 
 #[derive(Debug, Clone)]
 struct SavedCursor {
@@ -115,7 +114,6 @@ struct Dcs {
     sixel: Option<Box<SixelDecoder>>,
 }
 
-
 /// A terminal: two screens (primary with scrollback, alternate), cursor, modes,
 /// palette and shell-integration state.
 pub struct Terminal {
@@ -168,7 +166,6 @@ pub struct Terminal {
 fn default_tabs(cols: usize) -> Vec<bool> {
     (0..cols).map(|i| i % 8 == 0 && i != 0).collect()
 }
-
 
 impl Terminal {
     pub fn new(cols: usize, lines: usize, config: Config) -> Self {
@@ -228,7 +225,6 @@ impl Terminal {
         self.feed(&mut parser, bytes);
         self.parser = parser;
     }
-
 
     // --- accessors -------------------------------------------------------
 
@@ -299,7 +295,6 @@ impl Terminal {
         &self.config
     }
 
-
     // --- host interaction ------------------------------------------------
 
     /// Bytes the terminal wants to send to the application (query replies).
@@ -351,7 +346,6 @@ impl Terminal {
         let data = BASE64.encode(text.as_bytes());
         self.reply(&format!("\x1b]52;{sel};{data}{}", terminator.as_str()));
     }
-
 
     // --- viewport --------------------------------------------------------
 
@@ -425,7 +419,6 @@ impl Terminal {
         self.grid.abs_line(self.cursor.y) + 1
     }
 
-
     // --- selection -------------------------------------------------------
 
     pub fn start_selection(&mut self, kind: SelectionKind, at: Point) {
@@ -498,7 +491,6 @@ impl Terminal {
         self.blocks.iter().filter_map(|b| b.output_lines(live_end)).filter(|r| !r.is_empty()).collect()
     }
 
-
     // --- resize ----------------------------------------------------------
 
     /// Resize both screens. The primary screen reflows soft-wrapped lines.
@@ -509,7 +501,8 @@ impl Terminal {
             return;
         }
         let alt = self.is_alt_screen();
-        let (primary, alt_grid) = if alt { (&mut self.inactive, &mut self.grid) } else { (&mut self.grid, &mut self.inactive) };
+        let (primary, alt_grid) =
+            if alt { (&mut self.inactive, &mut self.grid) } else { (&mut self.grid, &mut self.inactive) };
 
         // Reflow the primary screen around its cursor (the saved one while in alt screen).
         let saved_primary = if alt { &mut self.saved_inactive } else { &mut self.saved };
@@ -523,8 +516,11 @@ impl Terminal {
         };
         let r = primary.reflow(cols, lines, px, py.min(primary.lines() - 1), pw);
         self.blocks.remap(&r.line_map);
-        let (primary_images, alt_images) =
-            if alt { (&mut self.images_inactive, &mut self.images) } else { (&mut self.images, &mut self.images_inactive) };
+        let (primary_images, alt_images) = if alt {
+            (&mut self.images_inactive, &mut self.images)
+        } else {
+            (&mut self.images, &mut self.images_inactive)
+        };
         primary_images.remap(&r.line_map, cols);
         if alt {
             if let Some(s) = saved_primary {
@@ -558,7 +554,6 @@ impl Terminal {
             self.report_size();
         }
     }
-
 
     // --- internal helpers ------------------------------------------------
 
@@ -614,7 +609,6 @@ impl Terminal {
         self.cursor.y = self.cursor.y.min(self.lines() - 1);
     }
 
-
     // --- printing --------------------------------------------------------
 
     fn print_char(&mut self, c: char) {
@@ -656,7 +650,6 @@ impl Terminal {
         s.push(c);
         s.graphemes(true).nth(1).is_none()
     }
-
 
     fn append_to_prev(&mut self, c: char) {
         let Some((x, y)) = self.prev_cell() else { return };
@@ -706,7 +699,6 @@ impl Terminal {
             }
         }
     }
-
 
     fn put_char(&mut self, c: char, width: usize) {
         let cols = self.cols();
@@ -764,7 +756,6 @@ impl Terminal {
             }
         }
     }
-
 
     // --- cursor movement & scrolling ------------------------------------
 
@@ -846,7 +837,6 @@ impl Terminal {
         self.cursor.pending_wrap = false;
     }
 
-
     fn move_right(&mut self, n: usize) {
         self.cursor.x = (self.cursor.x + n).min(self.cols() - 1);
         self.cursor.pending_wrap = false;
@@ -911,7 +901,6 @@ impl Terminal {
         self.damage_line(y);
     }
 
-
     fn erase_display(&mut self, mode: usize) {
         let (x, y) = (self.cursor.x, self.cursor.y);
         let (cols, lines) = (self.cols(), self.lines());
@@ -973,7 +962,6 @@ impl Terminal {
         self.erase_range(y, x, x.saturating_add(n));
     }
 
-
     /// ICH: shift the rest of the line right by `n` blanks.
     fn insert_blank(&mut self, n: usize) {
         let (x, y, cols) = (self.cursor.x, self.cursor.y, self.cols());
@@ -1032,7 +1020,6 @@ impl Terminal {
         self.cursor.pending_wrap = false;
         self.damage_range(y, self.bottom);
     }
-
 
     // --- cursor save/restore, screens, resets ----------------------------
 
@@ -1102,7 +1089,6 @@ impl Terminal {
         self.clamp_cursor();
     }
 
-
     /// DECSTR.
     fn soft_reset(&mut self) {
         self.mode.remove(TermMode::INSERT | TermMode::ORIGIN | TermMode::APP_CURSOR | TermMode::APP_KEYPAD);
@@ -1157,7 +1143,6 @@ impl Terminal {
         }
     }
 
-
     // --- modes -----------------------------------------------------------
 
     fn private_mode(m: u16) -> Option<TermMode> {
@@ -1191,10 +1176,34 @@ impl Terminal {
     fn set_private_modes(&mut self, args: &[u16], on: bool) {
         for &m in args {
             match m {
-                47 => if on { self.enter_alt(false, false) } else { self.leave_alt(false, false) },
-                1047 => if on { self.enter_alt(false, false) } else { self.leave_alt(false, true) },
-                1049 => if on { self.enter_alt(true, true) } else { self.leave_alt(true, false) },
-                1048 => if on { self.save_cursor() } else { self.restore_cursor() },
+                47 => {
+                    if on {
+                        self.enter_alt(false, false)
+                    } else {
+                        self.leave_alt(false, false)
+                    }
+                }
+                1047 => {
+                    if on {
+                        self.enter_alt(false, false)
+                    } else {
+                        self.leave_alt(false, true)
+                    }
+                }
+                1049 => {
+                    if on {
+                        self.enter_alt(true, true)
+                    } else {
+                        self.leave_alt(true, false)
+                    }
+                }
+                1048 => {
+                    if on {
+                        self.save_cursor()
+                    } else {
+                        self.restore_cursor()
+                    }
+                }
                 9 | 1000 | 1002 | 1003 => {
                     self.mode.remove(TermMode::MOUSE_ANY);
                     if on {
@@ -1215,7 +1224,6 @@ impl Terminal {
         }
     }
 
-
     fn set_ansi_modes(&mut self, args: &[u16], on: bool) {
         for &m in args {
             match m {
@@ -1230,13 +1238,31 @@ impl Terminal {
     fn report_mode(&mut self, m: u16, private: bool) {
         let state = if private {
             match Self::private_mode(m) {
-                Some(bit) => if self.mode.contains(bit) { 1 } else { 2 },
+                Some(bit) => {
+                    if self.mode.contains(bit) {
+                        1
+                    } else {
+                        2
+                    }
+                }
                 None => 0,
             }
         } else {
             match m {
-                4 => if self.mode.contains(TermMode::INSERT) { 1 } else { 2 },
-                20 => if self.mode.contains(TermMode::LINE_FEED_NEW_LINE) { 1 } else { 2 },
+                4 => {
+                    if self.mode.contains(TermMode::INSERT) {
+                        1
+                    } else {
+                        2
+                    }
+                }
+                20 => {
+                    if self.mode.contains(TermMode::LINE_FEED_NEW_LINE) {
+                        1
+                    } else {
+                        2
+                    }
+                }
                 _ => 0,
             }
         };
@@ -1266,9 +1292,9 @@ impl Terminal {
         self.reply(&format!("\x1b[?997;{v}n"));
     }
 
-
     fn device_status(&mut self, n: usize, private: bool) {
-        let y = if self.mode.contains(TermMode::ORIGIN) { self.cursor.y.saturating_sub(self.top) } else { self.cursor.y };
+        let y =
+            if self.mode.contains(TermMode::ORIGIN) { self.cursor.y.saturating_sub(self.top) } else { self.cursor.y };
         match (n, private) {
             (5, false) => self.reply("\x1b[0n"),
             (6, false) => self.reply(&format!("\x1b[{};{}R", y + 1, self.cursor.x + 1)),
@@ -1343,7 +1369,6 @@ impl Terminal {
         }
     }
 
-
     // --- SGR -------------------------------------------------------------
 
     fn sgr(&mut self, params: &Params) {
@@ -1397,7 +1422,6 @@ impl Terminal {
                 53 => st.attrs.insert(Attrs::OVERLINE),
                 55 => st.attrs.remove(Attrs::OVERLINE),
 
-
                 38 | 48 | 58 => {
                     let (color, used) = parse_extended_color(&ps, i);
                     i += used;
@@ -1450,7 +1474,6 @@ fn parse_extended_color(ps: &[&[u16]], i: usize) -> (Option<Color>, usize) {
         _ => (None, 0),
     }
 }
-
 
 fn lossy(b: &[u8]) -> String {
     String::from_utf8_lossy(b).into_owned()
@@ -1518,7 +1541,6 @@ impl Terminal {
         }
     }
 
-
     /// OSC 4;index;spec[;index;spec...] — set or query (`?`) palette entries.
     fn osc_palette(&mut self, params: &[&[u8]], term: Terminator) {
         for pair in params[1..].chunks(2) {
@@ -1560,14 +1582,13 @@ impl Terminal {
         self.cursor.style.hyperlink = if uri.is_empty() || uri.len() > MAX_URI {
             None
         } else {
-            let id = params.get(1).and_then(|p| {
-                lossy(p).split(':').find_map(|kv| kv.strip_prefix("id=").map(str::to_string))
-            });
+            let id = params
+                .get(1)
+                .and_then(|p| lossy(p).split(':').find_map(|kv| kv.strip_prefix("id=").map(str::to_string)));
             Some(self.links.intern(Hyperlink { id, uri }))
         };
         self.sync_style();
     }
-
 
     /// OSC 52;selection;base64|? — writes are allowed by policy, reads go through the host.
     fn osc_clipboard(&mut self, params: &[&[u8]], term: Terminator) {
@@ -1602,7 +1623,6 @@ impl Terminal {
         self.events.push(Event::Notification { title, body });
     }
 
-
     /// OSC 133 (FinalTerm) and OSC 633 (VS Code) shell-integration marks.
     fn osc_shell_mark(&mut self, params: &[&[u8]], vscode: bool) {
         // Marks on the alternate screen would point into the wrong grid.
@@ -1610,9 +1630,7 @@ impl Terminal {
             return;
         }
         let Some(kind) = params.get(1).and_then(|p| p.first()) else { return };
-        let kv = |key: &str| {
-            params[2..].iter().find_map(|p| lossy(p).strip_prefix(key).map(str::to_string))
-        };
+        let kv = |key: &str| params[2..].iter().find_map(|p| lossy(p).strip_prefix(key).map(str::to_string));
         match kind {
             b'A' => self.mark_prompt(),
             b'B' => self.mark_input(),
@@ -1637,7 +1655,6 @@ impl Terminal {
     fn cursor_point(&self) -> Point {
         Point::new(self.grid.abs_line(self.cursor.y), self.cursor.x)
     }
-
 
     fn mark_prompt(&mut self) {
         let here = self.cursor_point();
@@ -1669,7 +1686,6 @@ impl Terminal {
             b.state = BlockState::Input;
         }
     }
-
 
     fn mark_output(&mut self, cmd: Option<String>) {
         let here = self.cursor_point();
@@ -1721,7 +1737,6 @@ impl Terminal {
     }
 }
 
-
 // --- DCS handlers -----------------------------------------------------------
 
 /// Terminfo capabilities answered via XTGETTCAP. `None` = boolean capability.
@@ -1766,7 +1781,6 @@ fn color_sgr(c: Color, base: u16, bright: u16, ext: u16) -> Option<String> {
         Color::Rgb(c) => Some(format!("{ext}:2::{}:{}:{}", c.r, c.g, c.b)),
     }
 }
-
 
 fn sgr_report(s: &Style) -> String {
     let mut parts = vec!["0".to_string()];
@@ -1846,7 +1860,6 @@ impl Terminal {
     }
 }
 
-
 // --- parser callbacks -------------------------------------------------------
 
 impl Perform for Terminal {
@@ -1908,7 +1921,6 @@ impl Perform for Terminal {
         }
     }
 
-
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
         if ignore {
             return;
@@ -1961,7 +1973,6 @@ impl Perform for Terminal {
                 3 => self.tabs.iter_mut().for_each(|t| *t = false),
                 _ => {}
             },
-
 
             ([], 'h') => self.set_ansi_modes(&args, true),
             ([], 'l') => self.set_ansi_modes(&args, false),

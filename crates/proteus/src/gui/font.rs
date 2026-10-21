@@ -9,11 +9,11 @@ use std::sync::Arc;
 
 use fontconfig_sys as fc;
 use fontconfig_sys::constants::{
-    FC_CHARSET, FC_FAMILY, FC_FILE, FC_INDEX, FC_SLANT, FC_SLANT_ITALIC, FC_SLANT_ROMAN, FC_SPACING, FC_WEIGHT,
-    FC_WEIGHT_BOLD, FC_WEIGHT_REGULAR, FC_WEIGHT_SEMIBOLD, FC_MONO, FC_COLOR,
+    FC_CHARSET, FC_COLOR, FC_FAMILY, FC_FILE, FC_INDEX, FC_MONO, FC_SLANT, FC_SLANT_ITALIC, FC_SLANT_ROMAN, FC_SPACING,
+    FC_WEIGHT, FC_WEIGHT_BOLD, FC_WEIGHT_REGULAR, FC_WEIGHT_SEMIBOLD,
 };
-use swash::scale::image::Content;
 use std::rc::Rc;
+use swash::scale::image::Content;
 
 use swash::scale::{Render, ScaleContext, Source, StrikeWith};
 use swash::shape::ShapeContext;
@@ -214,12 +214,8 @@ pub fn emoji_presentation(text: &str, wide: bool) -> bool {
     }
     let mut chars = text.chars();
     let base = chars.next().unwrap_or(' ');
-    let marker = |c: char| {
-        matches!(c, '\u{fe0f}' | '\u{200d}' | '\u{20e3}' | '\u{1f3fb}'..='\u{1f3ff}' | '\u{e0020}'..='\u{e007f}')
-    };
-    matches!(base, '\u{1f1e6}'..='\u{1f1ff}')
-        || chars.any(marker)
-        || (wide && base.is_extended_pictographic())
+    let marker = |c: char| matches!(c, '\u{fe0f}' | '\u{200d}' | '\u{20e3}' | '\u{1f3fb}'..='\u{1f3ff}' | '\u{e0020}'..='\u{e007f}');
+    matches!(base, '\u{1f1e6}'..='\u{1f1ff}') || chars.any(marker) || (wide && base.is_extended_pictographic())
 }
 
 /// Script for shaping: the first one that is not Common/Inherited.
@@ -289,9 +285,9 @@ impl Fonts {
             matches.push(fc.find(&self.family, w, s, &[], false));
         }
         let regular = matches[0].take().ok_or_else(|| format!("no font found for `{}`", self.family))?;
-        self.primary[0] = self.load_face(&regular, false, false).ok_or_else(|| {
-            format!("cannot load font {}", regular.file.display())
-        })?;
+        self.primary[0] = self
+            .load_face(&regular, false, false)
+            .ok_or_else(|| format!("cannot load font {}", regular.file.display()))?;
         for (style, m) in matches.into_iter().enumerate().skip(1) {
             let want_bold = style as u8 & BOLD != 0;
             let want_italic = style as u8 & ITALIC != 0;
@@ -482,7 +478,8 @@ impl Fonts {
         if let Some(f) = self.emoji {
             return f;
         }
-        let m = self.fc.as_ref().and_then(|fc| fc.find("emoji", FC_WEIGHT_REGULAR, FC_SLANT_ROMAN, &['\u{1f600}'], true));
+        let m =
+            self.fc.as_ref().and_then(|fc| fc.find("emoji", FC_WEIGHT_REGULAR, FC_SLANT_ROMAN, &['\u{1f600}'], true));
         let f = m.and_then(|m| self.face_for(&m, false, false));
         self.emoji = Some(f);
         f
@@ -643,10 +640,10 @@ mod tests {
         };
         for seq in [
             "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}", // family (ZWJ)
-            "\u{1f1e8}\u{1f1f3}",                         // flag
-            "\u{1f44d}\u{1f3fd}",                         // skin tone
-            "1\u{fe0f}\u{20e3}",                          // keycap
-            "\u{2764}\u{fe0f}",                           // VS16
+            "\u{1f1e8}\u{1f1f3}",                          // flag
+            "\u{1f44d}\u{1f3fd}",                          // skin tone
+            "1\u{fe0f}\u{20e3}",                           // keycap
+            "\u{2764}\u{fe0f}",                            // VS16
             "\u{1f600}",
         ] {
             assert!(emoji_presentation(seq, true), "{seq}");

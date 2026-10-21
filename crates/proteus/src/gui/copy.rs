@@ -47,7 +47,6 @@ fn prev(grid: &Grid, p: Point) -> Option<Point> {
     }
 }
 
-
 fn word_next(grid: &Grid, p: Point) -> Point {
     let start = class(grid, p);
     let mut q = p;
@@ -109,7 +108,10 @@ fn word_end(grid: &Grid, p: Point) -> Point {
 /// Last non-blank column of a row.
 fn line_end(grid: &Grid, line: Line) -> usize {
     let Some(row) = grid.abs_row(line) else { return 0 };
-    row.cells.iter().rposition(|c| !matches!(c.ch, ' ' | '\0') && !c.flags.contains(CellFlags::WIDE_SPACER)).unwrap_or(0)
+    row.cells
+        .iter()
+        .rposition(|c| !matches!(c.ch, ' ' | '\0') && !c.flags.contains(CellFlags::WIDE_SPACER))
+        .unwrap_or(0)
 }
 
 /// Clamp a point to stored lines and columns.

@@ -72,10 +72,7 @@ pub fn extract(grid: &Grid, start: Point, end: Point, rect: bool) -> String {
         let (a, b) = if rect {
             (lc, rc + 1)
         } else {
-            (
-                if line == start.line { start.col } else { 0 },
-                if line == end.line { end.col + 1 } else { cols },
-            )
+            (if line == start.line { start.col } else { 0 }, if line == end.line { end.col + 1 } else { cols })
         };
         let text = row.text(a..b);
         let soft = !rect && row.wrapped && line != end.line && b >= cols;
@@ -151,7 +148,10 @@ pub(crate) fn percent_decode(s: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%'
-            && let Some(v) = bytes.get(i + 1..i + 3).and_then(|h| std::str::from_utf8(h).ok()).and_then(|h| u8::from_str_radix(h, 16).ok())
+            && let Some(v) = bytes
+                .get(i + 1..i + 3)
+                .and_then(|h| std::str::from_utf8(h).ok())
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
         {
             out.push(v);
             i += 3;

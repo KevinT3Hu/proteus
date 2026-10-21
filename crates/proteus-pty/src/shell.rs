@@ -52,7 +52,6 @@ pub fn data_dir() -> Option<PathBuf> {
     Some(base.join("proteus"))
 }
 
-
 /// Write the integration scripts under `dir` (only files whose content changed).
 pub fn install(dir: &Path) -> io::Result<()> {
     for (rel, content) in FILES {
@@ -112,7 +111,6 @@ pub fn inject(spec: &mut CommandSpec, dir: &Path) -> Option<Shell> {
     }
     Some(shell)
 }
-
 
 /// Compile the `proteus` terminfo entry into `dir` with `tic` (once). On
 /// success, returns the directory to put in `TERMINFO_DIRS`.

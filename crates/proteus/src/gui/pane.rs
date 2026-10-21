@@ -12,8 +12,8 @@ use smithay_client_toolkit::reexports::calloop::channel::Sender;
 
 use super::Msg;
 use crate::layout::PaneId;
-use crate::spec::Cmd;
 use crate::session::{self, SpawnOptions};
+use crate::spec::Cmd;
 
 /// How often the fallback title (foreground process) is re-read.
 const PROC_REFRESH: Duration = Duration::from_secs(1);

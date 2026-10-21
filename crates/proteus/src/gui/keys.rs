@@ -58,7 +58,8 @@ impl Levels {
 
     pub fn set_keymap(&mut self, text: String) {
         let ctx = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
-        self.keymap = xkb::Keymap::new_from_string(&ctx, text, xkb::KEYMAP_FORMAT_TEXT_V1, xkb::KEYMAP_COMPILE_NO_FLAGS);
+        self.keymap =
+            xkb::Keymap::new_from_string(&ctx, text, xkb::KEYMAP_FORMAT_TEXT_V1, xkb::KEYMAP_COMPILE_NO_FLAGS);
     }
 
     fn level_char(&self, raw_code: u32, level: u32) -> Option<char> {

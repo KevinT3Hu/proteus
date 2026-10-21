@@ -22,10 +22,10 @@ mod workspace;
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
-use std::path::PathBuf;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::OwnedFd;
+use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::time::{Duration, Instant};
 
@@ -45,9 +45,9 @@ use smithay_client_toolkit::data_device_manager::data_source::{CopyPasteSource, 
 use smithay_client_toolkit::data_device_manager::{DataDeviceManagerState, WritePipe};
 use smithay_client_toolkit::dispatch2::Dispatch2;
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
+use smithay_client_toolkit::primary_selection::PrimarySelectionManagerState;
 use smithay_client_toolkit::primary_selection::device::{PrimarySelectionDevice, PrimarySelectionDeviceHandler};
 use smithay_client_toolkit::primary_selection::selection::{PrimarySelectionSource, PrimarySelectionSourceHandler};
-use smithay_client_toolkit::primary_selection::PrimarySelectionManagerState;
 use smithay_client_toolkit::reexports::calloop::channel::{self, Sender};
 use smithay_client_toolkit::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay_client_toolkit::reexports::calloop::{EventLoop, LoopHandle, RegistrationToken};
@@ -87,13 +87,13 @@ use smithay_client_toolkit::{delegate_dispatch2, delegate_registry, registry_han
 use crate::config::{Blink, Config, HintBar, PaneTitles, TabBar};
 use crate::layout::{self, Axis, Dir, Layout, PaneId, Rect, Tab};
 use crate::modes::{Action, Lookup, Mode, Scroll};
-use crate::spec::{self, LayoutSpec};
-use textinput::{Input, Purpose};
-use workspace::SessionStore;
 use crate::session::SpawnOptions;
+use crate::spec::{self, LayoutSpec};
 use font::Fonts;
 use pane::Pane;
 use render::{FrameInfo, Overlay, PaneFrame, Renderer, Theme};
+use textinput::{Input, Purpose};
+use workspace::SessionStore;
 
 const APP_ID: &str = "dev.proteus.Proteus";
 const APP_NAME: &str = "Proteus";
@@ -162,19 +162,50 @@ impl HasDisplayHandle for Display {
 struct ScaleData;
 
 impl Dispatch2<WpFractionalScaleManagerV1, App> for ScaleData {
-    fn event(&self, _: &mut App, _: &WpFractionalScaleManagerV1, _: <WpFractionalScaleManagerV1 as Proxy>::Event, _: &Connection, _: &QueueHandle<App>) {}
+    fn event(
+        &self,
+        _: &mut App,
+        _: &WpFractionalScaleManagerV1,
+        _: <WpFractionalScaleManagerV1 as Proxy>::Event,
+        _: &Connection,
+        _: &QueueHandle<App>,
+    ) {
+    }
 }
 impl Dispatch2<WpViewporter, App> for ScaleData {
-    fn event(&self, _: &mut App, _: &WpViewporter, _: <WpViewporter as Proxy>::Event, _: &Connection, _: &QueueHandle<App>) {}
+    fn event(
+        &self,
+        _: &mut App,
+        _: &WpViewporter,
+        _: <WpViewporter as Proxy>::Event,
+        _: &Connection,
+        _: &QueueHandle<App>,
+    ) {
+    }
 }
 impl Dispatch2<WpViewport, App> for ScaleData {
-    fn event(&self, _: &mut App, _: &WpViewport, _: <WpViewport as Proxy>::Event, _: &Connection, _: &QueueHandle<App>) {}
+    fn event(
+        &self,
+        _: &mut App,
+        _: &WpViewport,
+        _: <WpViewport as Proxy>::Event,
+        _: &Connection,
+        _: &QueueHandle<App>,
+    ) {
+    }
 }
 /// User data of a window's fractional-scale object.
 struct WinScale(WinId);
 
 impl Dispatch2<WpFractionalScaleV1, App> for WinScale {
-    fn event(&self, app: &mut App, _: &WpFractionalScaleV1, ev: wp_fractional_scale_v1::Event, _: &Connection, _: &QueueHandle<App>) {
+    fn event(
+        &self,
+        app: &mut App,
+        _: &WpFractionalScaleV1,
+        ev: wp_fractional_scale_v1::Event,
+        _: &Connection,
+        _: &QueueHandle<App>,
+    ) {
         if let wp_fractional_scale_v1::Event::PreferredScale { scale } = ev
             && app.activate(self.0)
         {
@@ -683,10 +714,7 @@ impl App {
 
     /// Window holding a pane.
     fn win_of_pane(&self, pane: PaneId) -> Option<WinId> {
-        std::iter::once(&self.w)
-            .chain(&self.parked)
-            .find(|w| w.tabs.iter().any(|t| t.contains(pane)))
-            .map(|w| w.id)
+        std::iter::once(&self.w).chain(&self.parked).find(|w| w.tabs.iter().any(|t| t.contains(pane))).map(|w| w.id)
     }
 
     /// Make the window holding `pane` current. Returns false if no window does.
@@ -1016,7 +1044,8 @@ impl App {
                 let title = t.name.as_deref().unwrap_or_else(|| self.panes.get(&t.focus).map_or("", |p| p.title()));
                 let n = t.panes().len();
                 // A bell rang in one of its panes.
-                let bell = if t.panes().iter().any(|id| self.panes.get(id).is_some_and(|p| p.bell)) { "• " } else { "" };
+                let bell =
+                    if t.panes().iter().any(|id| self.panes.get(id).is_some_and(|p| p.bell)) { "• " } else { "" };
                 match (n, t.zoomed) {
                     (1, _) => format!("{bell}{title}"),
                     (n, true) => format!("{bell}{title} [{n}, zoom]"),
@@ -1058,11 +1087,7 @@ impl App {
         let p = self.panes.get(&id);
         let t = p.map_or("", |p| p.title());
         let t = if p.is_some_and(|p| p.bell) { format!("• {t}") } else { t.to_string() };
-        if focused && self.w.mode != Mode::Normal {
-            format!(" {t}  [{}]", self.w.mode.name())
-        } else {
-            format!(" {t}")
-        }
+        if focused && self.w.mode != Mode::Normal { format!(" {t}  [{}]", self.w.mode.name()) } else { format!(" {t}") }
     }
 
     fn frame_parts(&self) -> FrameParts {
@@ -1076,7 +1101,8 @@ impl App {
         let p = self.pad() as f32;
         let thick = (self.w.scale.round() as f32).max(1.0);
         let float_focus = self.w.tabs[self.w.active].focus_is_float();
-        let mut panes: Vec<PanePart> = view.panes.iter().map(|&(id, r)| self.pane_part(id, r, fid, false, &theme)).collect();
+        let mut panes: Vec<PanePart> =
+            view.panes.iter().map(|&(id, r)| self.pane_part(id, r, fid, false, &theme)).collect();
 
         // Tiled chrome: dividers, the focused pane's accent, title rows.
         let mut tiled_rects = Vec::new();
@@ -1180,7 +1206,8 @@ impl App {
                 use unicode_segmentation::UnicodeSegmentation;
                 use unicode_width::UnicodeWidthStr;
                 let caret_cols: usize = i.before_cursor().graphemes(true).map(|g| g.width().clamp(1, 2)).sum();
-                let (l, x) = chrome::input_bar(i.purpose.badge(), &i.text, caret_cols, &i.status, p, y, cols, cw, &theme);
+                let (l, x) =
+                    chrome::input_bar(i.purpose.badge(), &i.text, caret_cols, &i.status, p, y, cols, cw, &theme);
                 labels.extend(l);
                 rects.push(([x, y, (cw / 8.0).round().max(1.0), ch], theme.fg));
             } else if let Some(h) = &self.w.hints {
@@ -1227,7 +1254,6 @@ impl App {
     pub(crate) fn mark_dirty(&mut self) {
         self.w.dirty = true;
     }
-
 
     fn update_title(&mut self) {
         let t = self.focused_pane().title();
@@ -1677,7 +1703,8 @@ impl App {
         {
             p.bell = false;
         }
-        if self.w.copy.as_ref().is_some_and(|c| c.pane != new) || (self.w.mode == Mode::Scroll && self.w.copy.is_none()) {
+        if self.w.copy.as_ref().is_some_and(|c| c.pane != new) || (self.w.mode == Mode::Scroll && self.w.copy.is_none())
+        {
             self.set_mode(Mode::Normal);
         }
         if new != old && self.w.focused {
@@ -1827,7 +1854,8 @@ impl App {
             Action::TabToNextWindow => {
                 let from = self.w.id;
                 let ids = self.window_ids();
-                let next = ids.iter().copied().find(|&i| i > from).or_else(|| ids.first().copied().filter(|&i| i != from));
+                let next =
+                    ids.iter().copied().find(|&i| i > from).or_else(|| ids.first().copied().filter(|&i| i != from));
                 self.move_tab(from, old, next, None);
             }
             Action::Palette => self.open_palette(),
@@ -1883,7 +1911,9 @@ impl App {
                     app.run_env_steps(steps[i + 1..].to_vec(), secs.max(0.001));
                     return;
                 }
-                if let Some(c) = name.strip_prefix("key:").filter(|_| app.w.hints.is_some()).and_then(|k| k.chars().next()) {
+                if let Some(c) =
+                    name.strip_prefix("key:").filter(|_| app.w.hints.is_some()).and_then(|k| k.chars().next())
+                {
                     app.hint_key(input::Key::Char(c), input::Mods::empty());
                     continue;
                 }
@@ -1945,11 +1975,14 @@ impl App {
                 Event::Bell => self.bell(id),
                 Event::Notification { title, body } => {
                     if self.cfg.notify_osc {
-                        let summary = title.unwrap_or_else(|| self.panes.get(&id).map_or(APP_NAME, |p| p.title()).to_string());
+                        let summary =
+                            title.unwrap_or_else(|| self.panes.get(&id).map_or(APP_NAME, |p| p.title()).to_string());
                         self.notifier.send(id, summary, body);
                     }
                 }
-                Event::CommandFinished { block, exit_code, duration } => self.command_finished(id, block, exit_code, duration),
+                Event::CommandFinished { block, exit_code, duration } => {
+                    self.command_finished(id, block, exit_code, duration)
+                }
                 _ => {}
             }
         }
@@ -2194,14 +2227,18 @@ impl App {
         }
         let pick = |mimes: &[String]| MIMES.iter().find(|m| mimes.iter().any(|x| x == *m)).map(|m| m.to_string());
         let pipe = match kind {
-            ClipboardKind::Clipboard => self.data_device.as_ref().and_then(|d| d.data().selection_offer()).and_then(|o| {
-                let mime = o.with_mime_types(pick)?;
-                o.receive(mime).ok().map(OwnedFd::from)
-            }),
-            ClipboardKind::Primary => self.primary_device.as_ref().and_then(|d| d.data().selection_offer()).and_then(|o| {
-                let mime = o.with_mime_types(pick)?;
-                o.receive(mime).ok().map(OwnedFd::from)
-            }),
+            ClipboardKind::Clipboard => {
+                self.data_device.as_ref().and_then(|d| d.data().selection_offer()).and_then(|o| {
+                    let mime = o.with_mime_types(pick)?;
+                    o.receive(mime).ok().map(OwnedFd::from)
+                })
+            }
+            ClipboardKind::Primary => {
+                self.primary_device.as_ref().and_then(|d| d.data().selection_offer()).and_then(|o| {
+                    let mime = o.with_mime_types(pick)?;
+                    o.receive(mime).ok().map(OwnedFd::from)
+                })
+            }
         };
         let Some(fd) = pipe else {
             // Nothing to read: an OSC 52 query still gets an (empty) answer.
@@ -2543,7 +2580,9 @@ impl App {
                     && let Some(id) = self.w.mouse.selecting.take()
                 {
                     self.w.mouse.pending = None;
-                    if let Some(text) = self.panes.get(&id).and_then(|p| p.term.selection_text()).filter(|t| !t.is_empty()) {
+                    if let Some(text) =
+                        self.panes.get(&id).and_then(|p| p.term.selection_text()).filter(|t| !t.is_empty())
+                    {
                         self.set_selection(ClipboardKind::Primary, text);
                     }
                 }
@@ -2818,7 +2857,13 @@ impl SeatHandler for App {
         }
         if cap == Capability::Pointer && self.pointer.is_none() {
             let surface = self.compositor.create_surface(qh);
-            match self.seat_state.get_pointer_with_theme::<App, ()>(qh, &seat, self.shm.wl_shm(), surface, ThemeSpec::default()) {
+            match self.seat_state.get_pointer_with_theme::<App, ()>(
+                qh,
+                &seat,
+                self.shm.wl_shm(),
+                surface,
+                ThemeSpec::default(),
+            ) {
                 Ok(p) => self.pointer = Some(p),
                 Err(e) => eprintln!("proteus: pointer: {e}"),
             }
@@ -2844,7 +2889,16 @@ impl SeatHandler for App {
 }
 
 impl KeyboardHandler for App {
-    fn enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlKeyboard, s: &WlSurface, serial: u32, _: &[u32], _: &[Keysym]) {
+    fn enter(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &WlKeyboard,
+        s: &WlSurface,
+        serial: u32,
+        _: &[u32],
+        _: &[Keysym],
+    ) {
         if self.activate_surface(s) {
             self.kbd_win = Some(self.w.id);
             self.serial = serial;
@@ -2878,7 +2932,16 @@ impl KeyboardHandler for App {
     fn release_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlKeyboard, _: u32, ev: KeyEvent) {
         self.key(ev, KeyAction::Release);
     }
-    fn update_modifiers(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlKeyboard, _: u32, m: Modifiers, _: RawModifiers, layout: u32) {
+    fn update_modifiers(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &WlKeyboard,
+        _: u32,
+        m: Modifiers,
+        _: RawModifiers,
+        layout: u32,
+    ) {
         self.mods = m;
         self.levels.layout = layout;
     }
@@ -2904,7 +2967,8 @@ impl DataDeviceHandler for App {
         let Some(dnd) = self.tab_dnd.as_mut() else { return };
         dnd.at = Some((win, (x, y)));
         // Only our own tab drags are accepted.
-        let Some(offer) = self.data_device.as_ref().filter(|d| d.inner() == dev).and_then(|d| d.data().drag_offer()) else {
+        let Some(offer) = self.data_device.as_ref().filter(|d| d.inner() == dev).and_then(|d| d.data().drag_offer())
+        else {
             return;
         };
         if offer.with_mime_types(|m| m.iter().any(|m| m == TAB_MIME)) {
@@ -2985,7 +3049,14 @@ impl PrimarySelectionDeviceHandler for App {
 }
 
 impl PrimarySelectionSourceHandler for App {
-    fn send_request(&mut self, _: &Connection, _: &QueueHandle<Self>, src: &ZwpPrimarySelectionSourceV1, mime: String, fd: WritePipe) {
+    fn send_request(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        src: &ZwpPrimarySelectionSourceV1,
+        mime: String,
+        fd: WritePipe,
+    ) {
         if let Some((_, text)) = self.primary.as_ref().filter(|(s, _)| s.inner() == src)
             && MIMES.contains(&mime.as_str())
         {
@@ -3053,7 +3124,8 @@ impl Prompt {
                     (n, true) => format!("Paste {n} lines containing control characters?"),
                 };
                 let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
-                let preview: String = first.chars().map(|c| if c.is_control() { '\u{fffd}' } else { c }).take(200).collect();
+                let preview: String =
+                    first.chars().map(|c| if c.is_control() { '\u{fffd}' } else { c }).take(200).collect();
                 Overlay { title, detail: Some(preview), keys: "[Enter] paste   [Esc] cancel".into() }
             }
             Prompt::Restore(spec) => Overlay {
@@ -3069,7 +3141,9 @@ impl Prompt {
             Prompt::Close(_, msg) | Prompt::Quit(msg) => {
                 Overlay { title: msg.clone(), detail: None, keys: "[y] close   [n] cancel".into() }
             }
-            Prompt::Notice(msg) => Overlay { title: msg.clone(), detail: None, keys: "press any key to dismiss".into() },
+            Prompt::Notice(msg) => {
+                Overlay { title: msg.clone(), detail: None, keys: "press any key to dismiss".into() }
+            }
         }
     }
 }

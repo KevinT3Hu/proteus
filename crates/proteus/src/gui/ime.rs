@@ -112,7 +112,14 @@ impl Dispatch2<ZwpTextInputManagerV3, App> for ImeData {
 }
 
 impl Dispatch2<ZwpTextInputV3, App> for ImeData {
-    fn event(&self, app: &mut App, _: &ZwpTextInputV3, ev: zwp_text_input_v3::Event, _: &Connection, _: &QueueHandle<App>) {
+    fn event(
+        &self,
+        app: &mut App,
+        _: &ZwpTextInputV3,
+        ev: zwp_text_input_v3::Event,
+        _: &Connection,
+        _: &QueueHandle<App>,
+    ) {
         use zwp_text_input_v3::Event;
         // Enter/leave name a window; everything else goes to the keyboard's.
         let ours = match &ev {

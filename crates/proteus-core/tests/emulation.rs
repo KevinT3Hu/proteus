@@ -47,7 +47,6 @@ fn wide_char_wraps_with_spacer() {
     assert_eq!(t.cursor().x, 2);
 }
 
-
 #[test]
 fn overwrite_half_of_wide_char() {
     let mut t = term(6, 2);
@@ -101,7 +100,6 @@ fn insert_delete_chars_and_ech() {
     feed(&mut t, "\x1b[4h12\x1b[4l");
     assert_eq!(t.row_text(0), "a12   cd");
 }
-
 
 #[test]
 fn scroll_region_and_scrollback() {
@@ -169,7 +167,6 @@ fn background_color_erase() {
     assert_eq!(s.bg, Color::Indexed(4));
 }
 
-
 #[test]
 fn query_replies() {
     let mut t = term(10, 5);
@@ -229,7 +226,6 @@ fn title_and_stack() {
     let ev = t.take_events();
     assert!(ev.contains(&Event::TitleChanged("two".into())));
 }
-
 
 #[test]
 fn osc7_osc52_osc8() {
@@ -293,7 +289,6 @@ fn explicit_cmdline_wins() {
     assert_eq!(t.blocks().last().unwrap().command.as_deref(), Some("ls -la"));
     assert_eq!(t.blocks().last().unwrap().state, BlockState::Running);
 }
-
 
 #[test]
 fn resize_reflows_and_remaps_blocks() {

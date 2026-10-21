@@ -50,13 +50,31 @@ pub enum Event {
     TitleChanged(String),
     CwdChanged(Cwd),
     /// OSC 52 write (allowed by policy).
-    ClipboardStore { kind: ClipboardKind, text: String },
+    ClipboardStore {
+        kind: ClipboardKind,
+        text: String,
+    },
     /// OSC 52 read request: the host must ask the user, then call
     /// [`crate::Terminal::respond_clipboard`] (or ignore it).
-    ClipboardLoad { kind: ClipboardKind, terminator: Terminator },
+    ClipboardLoad {
+        kind: ClipboardKind,
+        terminator: Terminator,
+    },
     /// OSC 9 / OSC 777 desktop notification (already rate-limited).
-    Notification { title: Option<String>, body: String },
-    PromptStarted { block: BlockId },
-    CommandStarted { block: BlockId, command: Option<String> },
-    CommandFinished { block: BlockId, exit_code: Option<i32>, duration: Option<Duration> },
+    Notification {
+        title: Option<String>,
+        body: String,
+    },
+    PromptStarted {
+        block: BlockId,
+    },
+    CommandStarted {
+        block: BlockId,
+        command: Option<String>,
+    },
+    CommandFinished {
+        block: BlockId,
+        exit_code: Option<i32>,
+        duration: Option<Duration>,
+    },
 }

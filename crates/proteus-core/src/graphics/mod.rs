@@ -497,7 +497,13 @@ impl ImageStore {
     /// other screen. Unplaced images go first, then the least recently
     /// displayed images lose their pixels (placements stay, shown as evicted).
     /// On success the bytes are accounted.
-    pub(crate) fn reserve(&mut self, need: usize, other: usize, cfg: &GraphicsConfig, protect: Option<u64>) -> Result<(), kitty::Error> {
+    pub(crate) fn reserve(
+        &mut self,
+        need: usize,
+        other: usize,
+        cfg: &GraphicsConfig,
+        protect: Option<u64>,
+    ) -> Result<(), kitty::Error> {
         if need > cfg.max_image_bytes {
             return Err(kitty::err("EFBIG", "Image too large"));
         }
@@ -594,9 +600,7 @@ impl ImageStore {
         loop {
             let alive = |k: u64, id: u32, ps: &[Placement]| ps.iter().any(|q| q.image == k && q.id == id);
             let orphans: Vec<usize> = (0..self.placements.len())
-                .filter(|&i| {
-                    self.placements[i].parent.is_some_and(|(k, id)| !alive(k, id, &self.placements))
-                })
+                .filter(|&i| self.placements[i].parent.is_some_and(|(k, id)| !alive(k, id, &self.placements)))
                 .collect();
             if orphans.is_empty() {
                 break;
@@ -640,7 +644,12 @@ impl ImageStore {
 
     /// Absolute (line, col) of a placement, following relative chains through
     /// non-virtual parents. `virt` resolves virtual parents.
-    fn resolve(&self, p: &Placement, depth: usize, virt: &dyn Fn(u64, u32) -> Option<(i64, i64)>) -> Option<(i64, i64)> {
+    fn resolve(
+        &self,
+        p: &Placement,
+        depth: usize,
+        virt: &dyn Fn(u64, u32) -> Option<(i64, i64)>,
+    ) -> Option<(i64, i64)> {
         let Some((pk, pid)) = p.parent else { return Some((p.line, p.col as i64)) };
         if depth >= MAX_RELATIVE_DEPTH {
             return None;
@@ -808,7 +817,8 @@ impl ImageStore {
                     .entry((key, vp.id))
                     .and_modify(|o| *o = (o.0.min(origin.0), o.1.min(origin.1)))
                     .or_insert(origin);
-                let (ix, iy, iw, ih) = contain(vp.src.w as i64, vp.src.h as i64, vp.cols as i64 * cw, vp.rows as i64 * ch);
+                let (ix, iy, iw, ih) =
+                    contain(vp.src.w as i64, vp.src.h as i64, vp.cols as i64 * cw, vp.rows as i64 * ch);
                 let (rx0, ry0) = (run.col as i64 * cw, run.row as i64 * ch);
                 let (rx1, ry1) = (rx0 + run.len as i64 * cw, ry0 + ch);
                 let (ax0, ay0, ax1, ay1) = (rx0.max(ix), ry0.max(iy), rx1.min(ix + iw), ry1.min(iy + ih));

@@ -43,11 +43,7 @@ pub struct Notifier {
 
 impl Notifier {
     pub fn new(events: Sender<Msg>) -> Self {
-        Self {
-            tx: None,
-            events,
-            failed: false,
-        }
+        Self { tx: None, events, failed: false }
     }
 
     /// Show a notification; clicking it focuses `pane`. Errors (no bus, no
@@ -59,24 +55,14 @@ impl Notifier {
         if self.tx.is_none() {
             let (tx, rx) = mpsc::channel();
             let events = self.events.clone();
-            if std::thread::Builder::new()
-                .name("notify".into())
-                .spawn(move || worker(rx, events))
-                .is_err()
-            {
+            if std::thread::Builder::new().name("notify".into()).spawn(move || worker(rx, events)).is_err() {
                 self.failed = true;
                 return;
             }
             self.tx = Some(tx);
         }
         if let Some(tx) = &self.tx
-            && tx
-                .send(Req {
-                    pane,
-                    summary,
-                    body,
-                })
-                .is_err()
+            && tx.send(Req { pane, summary, body }).is_err()
         {
             self.failed = true;
         }
@@ -93,9 +79,8 @@ fn worker(rx: mpsc::Receiver<Req>, events: Sender<Msg>) {
     let shared = Arc::new(Mutex::new(Shared::default()));
     {
         let (conn, shared) = (conn.clone(), shared.clone());
-        let _ = std::thread::Builder::new()
-            .name("notify-signals".into())
-            .spawn(move || listen(&conn, &shared, &events));
+        let _ =
+            std::thread::Builder::new().name("notify-signals".into()).spawn(move || listen(&conn, &shared, &events));
     }
     let mut warned = false;
     for req in rx {
@@ -132,11 +117,7 @@ fn worker(rx: mpsc::Receiver<Req>, events: Sender<Msg>) {
 }
 
 fn listen(conn: &Connection, shared: &Mutex<Shared>, events: &Sender<Msg>) {
-    let rule = match MatchRule::builder()
-        .msg_type(Type::Signal)
-        .interface(DEST)
-        .and_then(|b| b.path(PATH))
-    {
+    let rule = match MatchRule::builder().msg_type(Type::Signal).interface(DEST).and_then(|b| b.path(PATH)) {
         Ok(b) => b.build(),
         Err(_) => return,
     };
