@@ -1,0 +1,41 @@
+[workspace]
+resolver = "3"
+members = ["crates/proteus-core", "crates/proteus-pty", "crates/proteus"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.88"
+
+[workspace.dependencies]
+proteus-core = { path = "crates/proteus-core" }
+proteus-pty = { path = "crates/proteus-pty" }
+vte = "=0.15.0"
+bitflags = "=2.13.2"
+unicode-width = "=0.2.2"
+unicode-segmentation = "=1.13.3"
+regex = "=1.13.1"
+base64 = "=0.22.1"
+rustix = { version = "=1.1.5", features = ["pty", "termios", "process", "fs", "stdio", "system"] }
+clap = { version = "=4.6.7", features = ["derive"] }
+mlua = { version = "=0.12.2", features = ["lua54", "vendored"] }
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+miniz_oxide = { version = "=0.9.1", features = ["with-alloc"] }
+wgpu = "=30.0.1"
+smithay-client-toolkit = { version = "=0.21.1", default-features = false, features = ["calloop", "xkbcommon"] }
+wayland-client = "=0.31.15"
+wayland-backend = { version = "=0.3.17", features = ["client_system"] }
+raw-window-handle = "=0.6.2"
+wayland-protocols = { version = "=0.32.13", features = ["client", "staging", "unstable"] }
+xkbcommon = { version = "=0.8.0", default-features = false, features = ["wayland"] }
+pollster = "=1.0.1"
+bytemuck = { version = "=1.25.2", features = ["derive"] }
+swash = "=0.2.10"
+yeslogic-fontconfig-sys = "=6.0.1"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

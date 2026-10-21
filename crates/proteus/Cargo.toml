@@ -1,0 +1,39 @@
+[package]
+name = "proteus"
+description = "Proteus terminal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "proteus"
+path = "src/main.rs"
+
+[dependencies]
+proteus-core.workspace = true
+proteus-pty.workspace = true
+rustix.workspace = true
+clap.workspace = true
+mlua.workspace = true
+wgpu.workspace = true
+smithay-client-toolkit.workspace = true
+wayland-client.workspace = true
+wayland-backend.workspace = true
+raw-window-handle.workspace = true
+wayland-protocols.workspace = true
+unicode-width.workspace = true
+unicode-segmentation.workspace = true
+xkbcommon.workspace = true
+image.workspace = true
+pollster.workspace = true
+bytemuck.workspace = true
+swash.workspace = true
+yeslogic-fontconfig-sys.workspace = true
+
+[dev-dependencies]
+naga = { version = "=30.0.1", features = ["wgsl-in"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "proteus-pty"
+description = "PTY spawning, resizing, foreground-process queries and shell-integration injection for Proteus."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rustix.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+proteus-core.workspace = true

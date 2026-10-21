@@ -1,0 +1,17 @@
+# Proteus terminal. Builds on xterm-256color and adds the extensions Proteus
+# implements (true color, styled/colored underlines, synchronized output,
+# bracketed paste, cursor shapes).
+proteus|Proteus terminal emulator,
+	Tc,
+	Su,
+	RGB,
+	Smulx=\E[4:%p1%dm,
+	Setulc=\E[58:2::%p1%{65536}%/%d:%p1%{256}%/%{255}%&%d:%p1%{255}%&%dm,
+	Ss=\E[%p1%d q,
+	Se=\E[2 q,
+	Sync=\E[?2026%?%p1%{1}%-%tl%eh%;,
+	BE=\E[?2004h,
+	BD=\E[?2004l,
+	PS=\E[200~,
+	PE=\E[201~,
+	use=xterm-256color,

@@ -1,0 +1,20 @@
+[package]
+name = "proteus-core"
+description = "Terminal emulation core for Proteus: parser glue, grid, scrollback, modes, shell-integration blocks. No GUI dependencies."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+vte.workspace = true
+bitflags.workspace = true
+unicode-width.workspace = true
+unicode-segmentation.workspace = true
+regex.workspace = true
+base64.workspace = true
+image.workspace = true
+miniz_oxide.workspace = true
+
+[lints]
+workspace = true
