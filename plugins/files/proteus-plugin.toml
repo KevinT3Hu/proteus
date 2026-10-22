@@ -12,4 +12,4 @@ read-panes = true
 write-pty = true
 clipboard-write = true
 fs = ["~:rw", "/:r"]
-run-command = ["git", "zoxide"]
+run-command = ["git", "zoxide", "file", "bsdtar", "unzip", "ffmpegthumbnailer", "pdftoppm"]

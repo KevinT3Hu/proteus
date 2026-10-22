@@ -367,6 +367,7 @@ impl App {
             storage: store.storage_path(&entry.id),
             memory: proteus_wasm::runtime::MEMORY,
             stderr: std::env::var_os("PROTEUS_DEBUG").is_some(),
+            compiled: Some(store.compiled_dir()),
         };
         let Some(rt) = &self.pl.runtime else { return };
         match rt.start(spec, sink) {

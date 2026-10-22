@@ -45,8 +45,8 @@ Shown in the last column (pane) or a floating preview (sidebar, toggle `p`).
 | Directories | Child listing |
 | Binary | Size, mime type, `file` output |
 
-- Previews are async and cancellable; moving the cursor cancels the previous preview.
-- Thumbnail results cached in the freedesktop thumbnail cache (`~/.cache/thumbnails`).
+- Previews are async and cancellable: a preview starts 60 ms after the cursor stops; moving on kills its helper program (`spawn-process`) and drops its image. Text is the first 64 KB (highlighted up to 400 lines); SVG is drawn with `resvg` (no `<text>` support) and handed to `load-image` as PNG; archives use `bsdtar -tf`, else `unzip -Z1` for zip files.
+- Video and PDF thumbnails are written by the helper straight into `~/.cache/thumbnails/large/<md5(uri)>.png` and reused while newer than the file (the helpers do not add the spec's `Thumb::URI`/`Thumb::MTime` tags).
 
 ## Terminal integration
 

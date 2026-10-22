@@ -91,6 +91,11 @@ impl Store {
         self.root.join("plugin-data").join(format!("{id}.storage.toml"))
     }
 
+    /// Compiled components (native code), named by the wasm's hash.
+    pub fn compiled_dir(&self) -> PathBuf {
+        self.root.join("compiled")
+    }
+
     pub fn component_path(&self, id: &str) -> PathBuf {
         self.plugin_dir(id).join("plugin.wasm")
     }

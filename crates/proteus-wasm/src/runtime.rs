@@ -237,6 +237,8 @@ pub struct Spec {
     pub memory: usize,
     /// Pass the plugin's stderr through (debugging).
     pub stderr: bool,
+    /// Keep compiled code here so later starts skip compiling.
+    pub compiled: Option<PathBuf>,
 }
 
 /// Compiles and starts plugins. One per terminal process.
@@ -849,6 +851,53 @@ fn trap_message(e: &wasmtime::Error, state: &State) -> String {
     format!("crashed: {}", s.lines().next().unwrap_or(""))
 }
 
+/// The compiled-code file of a plugin: its wasm hash and the engine's
+/// (wasmtime version and settings), so a stale file is never used.
+fn compiled_path(engine: &Engine, spec: &Spec) -> Option<PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    engine.precompile_compatibility_hash().hash(&mut h);
+    let hex = spec.hash.rsplit(':').next().unwrap_or_default();
+    let ok = hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit());
+    ok.then(|| spec.compiled.as_ref().map(|d| d.join(format!("{hex}-{:016x}.cwasm", h.finish()))))?
+}
+
+fn load_compiled(engine: &Engine, spec: &Spec) -> Option<Component> {
+    let path = compiled_path(engine, spec)?;
+    use std::os::unix::fs::MetadataExt;
+    // Only our own file, not writable by others: it is native code.
+    let m = std::fs::metadata(&path).ok()?;
+    if m.uid() != rustix::process::getuid().as_raw() || m.mode() & 0o022 != 0 {
+        return None;
+    }
+    // SAFETY: the file was written by `save_compiled` with this engine's
+    // settings (checked by wasmtime) and only this user can change it.
+    unsafe { Component::deserialize_file(engine, &path) }.ok()
+}
+
+fn save_compiled(engine: &Engine, spec: &Spec, c: &Component) {
+    let (Some(path), Some(dir)) = (compiled_path(engine, spec), spec.compiled.as_ref()) else { return };
+    let bytes = match c.serialize() {
+        Ok(b) => b,
+        Err(e) => return eprintln!("proteus: cannot keep compiled plugin: {e}"),
+    };
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let _ = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir);
+    let tmp = path.with_extension("tmp");
+    let ok = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, &bytes));
+    if ok.is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
 fn run(
     engine: &Engine,
     cache: &Mutex<HashMap<String, Component>>,
@@ -861,7 +910,14 @@ fn run(
     let component = match cached {
         Some(c) => c,
         None => {
-            let c = Component::new(engine, &spec.wasm).map_err(|e| format!("not a valid plugin: {e}"))?;
+            let c = match load_compiled(engine, &spec) {
+                Some(c) => c,
+                None => {
+                    let c = Component::new(engine, &spec.wasm).map_err(|e| format!("not a valid plugin: {e}"))?;
+                    save_compiled(engine, &spec, &c);
+                    c
+                }
+            };
             cache.lock().map_err(err)?.insert(spec.hash.clone(), c.clone());
             c
         }

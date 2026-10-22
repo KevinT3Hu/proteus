@@ -69,6 +69,7 @@ fn start(name: &str, granted: Permissions) -> Option<Host> {
         storage: data.with_extension("storage.toml"),
         memory: 64 << 20,
         stderr: false,
+        compiled: Some(data.with_extension("compiled")),
     };
     let handle = runtime().start(spec, sink).unwrap();
     Some(Host { rx, handle, data })

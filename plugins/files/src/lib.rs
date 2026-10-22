@@ -7,17 +7,19 @@
 
 mod fsys;
 mod git;
+mod preview;
 mod view;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use proteus_plugin::types::ProcessId;
 use proteus_plugin::types::{
-    Attrs, BlockState, Color, Command, Event, Frame, Line, MouseAction, MouseButton, PaneId, RequestId, Span, Style,
-    SurfaceId, SurfaceKind, SurfaceOptions, Theme, TimerId, UiEvent, WatchId,
+    Attrs, BlockState, Color, Command, Event, Frame, ImageId, ImagePlace, Line, MouseAction, MouseButton, PaneId,
+    RequestId, Span, Style, SurfaceId, SurfaceKind, SurfaceOptions, Theme, TimerId, UiEvent, WatchId,
 };
-use proteus_plugin::{Edit, Guest, TextInput, fit, host, pad, width};
+use proteus_plugin::{Edit, Guest, TextInput, fit, host, pad, widgets::clip, width};
 
 use fsys::{Sort, SortKey};
 use view::{Kind, Layout, View};
@@ -71,6 +73,48 @@ struct State {
     reload_timer: Option<TimerId>,
     /// `z` prompts: request → surface.
     asks: HashMap<RequestId, SurfaceId>,
+    /// The surface the user works in (its cursor is previewed).
+    active: Option<SurfaceId>,
+    /// The sidebar's floating preview (`p`).
+    float: Option<SurfaceId>,
+    float_size: (u32, u32),
+    preview: Option<Shown>,
+    /// Waiting to preview this file (cursor moves are debounced).
+    pending: Option<(PathBuf, i64)>,
+    preview_timer: Option<TimerId>,
+    job: Option<Job>,
+}
+
+/// A preview of one file.
+struct Shown {
+    path: PathBuf,
+    mtime: i64,
+    /// Name, size, date, mime type.
+    info: Vec<Line>,
+    body: Body,
+}
+
+enum Body {
+    Loading,
+    Lines(Vec<Line>),
+    /// Pixel size.
+    Image(ImageId, (u32, u32)),
+}
+
+/// A helper program making a preview.
+struct Job {
+    pid: ProcessId,
+    path: PathBuf,
+    kind: JobKind,
+    out: Vec<u8>,
+    err: Vec<u8>,
+}
+
+enum JobKind {
+    Archive,
+    File,
+    /// Writes the thumbnail at this path.
+    Thumb(PathBuf),
 }
 
 /// Git status, cached per repository.
@@ -275,6 +319,7 @@ impl State {
         let home = fsys::home();
         let mut lines: Vec<Line> = Vec::new();
         let mut cursor = None;
+        let mut images = Vec::new();
 
         // Header: the directory and the sidebar's follow state.
         let flag = match (ui.view.kind, ui.follow) {
@@ -336,7 +381,12 @@ impl State {
             }
             if miller {
                 let parent = if pw > 0 { column_parent(&mut ui.view, pw, body, &mark, &c) } else { Vec::new() };
-                let preview = column_preview(&mut ui.view, vw, body, &mark, &c);
+                let (preview, img) = column_preview(&mut ui.view, self.preview.as_ref(), vw, body, &mark, &c);
+                if let Some(mut i) = img {
+                    i.col += (pw + if pw > 0 { 1 } else { 0 } + cw + 1) as u32;
+                    i.row += 1;
+                    images.push(i);
+                }
                 let sep = span("│", style(Some(c.dim), None, Attrs::empty()));
                 for i in 0..body {
                     let mut l = Vec::new();
@@ -398,7 +448,10 @@ impl State {
             vec![span(fit(&s, cols), dim)]
         };
         lines.push(footer);
-        let _ = host::draw(id, &Frame { lines, cursor, background: None, images: vec![] });
+        let _ = host::draw(id, &Frame { lines, cursor, background: None, images });
+        if self.sidebar == Some(id) {
+            self.draw_float();
+        }
     }
 
     fn draw_all(&mut self) {
@@ -437,12 +490,18 @@ fn column_parent(v: &mut View, cols: usize, rows: usize, mark: &MarkOf, c: &Colo
 }
 
 /// Miller: the directory under the cursor, or facts about the file.
-fn column_preview(v: &mut View, cols: usize, rows: usize, mark: &MarkOf, c: &Colors) -> Vec<Line> {
-    let Some(r) = v.current().cloned() else { return Vec::new() };
-    let dim = style(Some(c.dim), None, Attrs::empty());
+fn column_preview(
+    v: &mut View,
+    shown: Option<&Shown>,
+    cols: usize,
+    rows: usize,
+    mark: &MarkOf,
+    c: &Colors,
+) -> (Vec<Line>, Option<ImagePlace>) {
+    let Some(r) = v.current().cloned() else { return (Vec::new(), None) };
     if r.entry.dir {
         let hidden = v.hidden;
-        return match v.listing(&r.path) {
+        let lines = match v.listing(&r.path) {
             Ok(e) if e.is_empty() => vec![vec![span("empty", style(Some(c.dim), None, Attrs::ITALIC))]],
             Ok(e) => e
                 .iter()
@@ -460,18 +519,48 @@ fn column_preview(v: &mut View, cols: usize, rows: usize, mark: &MarkOf, c: &Col
                     };
                     row_line(&row, look, cols, c)
                 })
-                .collect(),
+                .collect::<Vec<_>>(),
             Err(e) => vec![vec![span(fit(e, cols), style(Some(Color::Indexed(1)), None, Attrs::empty()))]],
         };
+        return (lines, None);
     }
-    let e = &r.entry;
-    let mut out = vec![vec![span(fit(&e.name, cols), style(None, None, Attrs::BOLD))]];
-    out.push(vec![span(fit(&format!("{} ({} bytes)", fsys::human(e.size), e.size), cols), dim)]);
-    out.push(vec![span(fit(&format!("modified {}", date(e.mtime)), cols), dim)]);
-    if let Ok(m) = host::mime_type(&r.path.display().to_string()) {
-        out.push(vec![span(fit(&m, cols), dim)]);
+    let shown = shown.filter(|s| s.path == r.path && s.mtime == r.entry.mtime);
+    render_preview(shown, &r.entry.name, cols, rows, c)
+}
+
+/// A file's preview in `cols`×`rows` cells; an image is at (0, 0).
+fn render_preview(
+    shown: Option<&Shown>,
+    name: &str,
+    cols: usize,
+    rows: usize,
+    c: &Colors,
+) -> (Vec<Line>, Option<ImagePlace>) {
+    let dim = style(Some(c.dim), None, Attrs::empty());
+    let Some(sh) = shown else {
+        return (vec![vec![span(fit(name, cols), style(None, None, Attrs::BOLD))], vec![span("…", dim)]], None);
+    };
+    let info = |n: usize| sh.info.iter().take(n).map(|l| clip(l, cols)).collect::<Vec<_>>();
+    match &sh.body {
+        Body::Loading => {
+            let mut l = info(rows);
+            l.push(vec![span("…", dim)]);
+            (l, None)
+        }
+        Body::Lines(lines) => {
+            if lines.is_empty() {
+                return (info(rows), None);
+            }
+            (lines.iter().take(rows).map(|l| clip(l, cols)).collect(), None)
+        }
+        Body::Image(id, px) => {
+            let room = rows.saturating_sub(sh.info.len() + 1).max(1);
+            let (w, h) = preview::fit_cells(*px, cols, room, 8);
+            let mut l = vec![Vec::new(); h as usize];
+            l.extend(info(rows.saturating_sub(h as usize)));
+            (l, Some(ImagePlace { image: *id, col: 0, row: 0, cols: w, rows: h }))
+        }
     }
-    out
 }
 
 // --- actions ------------------------------------------------------------------
@@ -530,6 +619,7 @@ impl State {
             dragging: false,
         };
         self.uis.insert(id, ui);
+        self.active = Some(id);
         self.watch(id);
         self.draw(id);
         Some(id)
@@ -544,6 +634,12 @@ impl State {
         }
         if self.sidebar == Some(id) {
             self.sidebar = None;
+            if let Some(f) = self.float.take() {
+                host::close_surface(f);
+            }
+        }
+        if self.active == Some(id) {
+            self.active = None;
         }
         if self.picker == Some(id) {
             self.picker = None;
@@ -857,6 +953,7 @@ impl State {
             (_, "c") => self.cd_pane(id),
             (_, "i") => self.insert(id),
             (_, "y") => self.copy_paths(id),
+            (_, "p") if ui.view.kind == Kind::Sidebar => self.toggle_float(),
             (_, "F") if ui.view.kind == Kind::Sidebar => {
                 ui.follow = !ui.follow;
                 let f = ui.follow;
@@ -945,6 +1042,253 @@ impl State {
     }
 }
 
+// --- previews -----------------------------------------------------------------
+
+/// Output kept from a preview helper.
+const JOB_OUTPUT: usize = 256 << 10;
+
+impl State {
+    /// The file whose preview is shown now, if any.
+    fn wanted(&self) -> Option<(PathBuf, i64)> {
+        let ui = self.uis.get(&self.active?)?;
+        let r = ui.view.current().filter(|r| !r.entry.dir)?;
+        let miller = ui.view.layout == Layout::Miller && ui.size.0 >= 30;
+        let float = ui.view.kind == Kind::Sidebar && self.float.is_some();
+        (miller || float).then(|| (r.path.clone(), r.entry.mtime))
+    }
+
+    /// Preview the cursor's file soon (moving on cancels it).
+    fn sync_preview(&mut self) {
+        let want = self.wanted();
+        let have = self.preview.as_ref().map(|p| (p.path.clone(), p.mtime));
+        if want.is_none() || want == have || want == self.pending {
+            return;
+        }
+        self.pending = want;
+        if let Some(t) = self.preview_timer.take() {
+            host::cancel_timer(t);
+        }
+        self.preview_timer = Some(host::set_timer(60, false));
+    }
+
+    fn clear_preview(&mut self) {
+        if let Some(j) = self.job.take() {
+            host::process_kill(j.pid);
+        }
+        if let Some(Shown { body: Body::Image(id, _), .. }) = self.preview.take() {
+            host::drop_image(id);
+        }
+    }
+
+    fn redraw_preview(&mut self) {
+        if let Some(a) = self.active {
+            self.draw(a);
+        }
+        if self.active != self.sidebar {
+            self.draw_float();
+        }
+    }
+
+    fn preview_now(&mut self) {
+        self.preview_timer = None;
+        let Some((path, mtime)) = self.pending.take() else { return };
+        self.clear_preview();
+        let c = colors(self.theme);
+        let dim = style(Some(c.dim), None, Attrs::empty());
+        let line = |t: String| vec![span(t, dim)];
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let ps = path.display().to_string();
+        let meta = std::fs::metadata(&path);
+        let size = meta.as_ref().map_or(0, |m| m.len());
+        let mime = host::mime_type(&ps).unwrap_or_default();
+        let mut info = vec![
+            vec![span(name.clone(), style(None, None, Attrs::BOLD))],
+            line(format!("{} ({size} bytes)", fsys::human(size))),
+            line(format!("modified {}", date(mtime))),
+        ];
+        if !mime.is_empty() {
+            info.push(line(mime.clone()));
+        }
+        let mut sh = Shown { path: path.clone(), mtime, info, body: Body::Lines(Vec::new()) };
+        let head = match preview::head(&path, preview::TEXT_BYTES) {
+            Ok(h) => h,
+            Err(e) => {
+                sh.info.push(vec![span(e.to_string(), style(Some(Color::Indexed(1)), None, Attrs::empty()))]);
+                self.preview = Some(sh);
+                return self.redraw_preview();
+            }
+        };
+        let what = preview::classify(&mime, &name, &head[..head.len().min(8192)]);
+        let fail = |sh: &mut Shown, e: String| sh.info.push(line(fit(&e, 200)));
+        match what {
+            preview::What::Text => {
+                let text = String::from_utf8_lossy(&head);
+                let dark = self.theme.is_none_or(|t| t.dark);
+                sh.body = Body::Lines(preview::highlight(&name, &text, 200, 500, dark, c.dim));
+            }
+            preview::What::Image | preview::What::Svg if size > preview::IMAGE_BYTES => {
+                fail(&mut sh, "too big to preview".into());
+            }
+            preview::What::Image => match load_image_file(&path) {
+                Ok((id, px)) => {
+                    sh.info.push(line(format!("{} × {} px", px.0, px.1)));
+                    sh.body = Body::Image(id, px);
+                }
+                Err(e) => fail(&mut sh, e),
+            },
+            preview::What::Svg => {
+                let r = std::fs::read(&path).map_err(|e| e.to_string()).and_then(|d| preview::svg_png(&d, 512));
+                match r.and_then(|(png, px)| host::load_image(&png).map(|id| (id, px))) {
+                    Ok((id, px)) => sh.body = Body::Image(id, px),
+                    Err(e) => fail(&mut sh, e),
+                }
+            }
+            preview::What::Video | preview::What::Pdf => {
+                let home = fsys::home().unwrap_or_default();
+                let thumb = preview::thumbnail_path(&path, &home);
+                let fresh = std::fs::metadata(&thumb)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .is_some_and(|t| t.as_secs() as i64 >= mtime);
+                if fresh && let Ok((id, px)) = load_image_file(&thumb) {
+                    sh.body = Body::Image(id, px);
+                } else {
+                    let ts = thumb.display().to_string();
+                    let argv: Vec<String> = if what == preview::What::Video {
+                        ["ffmpegthumbnailer", "-i", &ps, "-o", &ts, "-s", "256"].map(String::from).to_vec()
+                    } else {
+                        let prefix = ts.trim_end_matches(".png");
+                        ["pdftoppm", "-png", "-singlefile", "-f", "1", "-l", "1", "-scale-to", "256", &ps, prefix]
+                            .map(String::from)
+                            .to_vec()
+                    };
+                    if let Some(dir) = thumb.parent() {
+                        let _ = std::fs::create_dir_all(dir);
+                    }
+                    let prog = argv[0].clone();
+                    match self.spawn(argv, &path, JobKind::Thumb(thumb)) {
+                        Ok(()) => sh.body = Body::Loading,
+                        Err(e) => fail(&mut sh, format!("no preview ({prog}: {e})")),
+                    }
+                }
+            }
+            preview::What::Archive => {
+                let tar = self.spawn(vec!["bsdtar".into(), "-tf".into(), ps.clone()], &path, JobKind::Archive);
+                let r = tar.or_else(|e| {
+                    if name.to_ascii_lowercase().ends_with(".zip") {
+                        self.spawn(vec!["unzip".into(), "-Z1".into(), ps.clone()], &path, JobKind::Archive)
+                    } else {
+                        Err(e)
+                    }
+                });
+                match r {
+                    Ok(()) => sh.body = Body::Loading,
+                    Err(e) => fail(&mut sh, format!("no listing (bsdtar: {e})")),
+                }
+            }
+            preview::What::Binary => {
+                if self.spawn(vec!["file".into(), "-b".into(), "--".into(), ps.clone()], &path, JobKind::File).is_ok() {
+                    sh.body = Body::Loading;
+                }
+            }
+        }
+        self.preview = Some(sh);
+        self.redraw_preview();
+    }
+
+    fn spawn(&mut self, argv: Vec<String>, path: &Path, kind: JobKind) -> Result<(), String> {
+        let cwd = path.parent().map(|p| p.display().to_string());
+        let pid = host::spawn_process(&Command { argv, cwd, env: vec![] })?;
+        host::process_close_stdin(pid);
+        self.job = Some(Job { pid, path: path.to_path_buf(), kind, out: Vec::new(), err: Vec::new() });
+        Ok(())
+    }
+
+    fn job_output(&mut self, pid: ProcessId, stderr: bool, data: &[u8]) {
+        let Some(j) = self.job.as_mut().filter(|j| j.pid == pid) else { return };
+        let buf = if stderr { &mut j.err } else { &mut j.out };
+        buf.extend_from_slice(&data[..data.len().min(JOB_OUTPUT.saturating_sub(buf.len()))]);
+        if j.out.len() >= JOB_OUTPUT {
+            // Enough for a listing.
+            host::process_kill(pid);
+            self.job_done(pid, Some(0));
+        }
+    }
+
+    fn job_done(&mut self, pid: ProcessId, code: Option<i32>) {
+        let Some(j) = self.job.take_if(|j| j.pid == pid) else { return };
+        let Some(sh) = self.preview.as_mut().filter(|s| s.path == j.path) else { return };
+        let c = colors(self.theme);
+        let dim = style(Some(c.dim), None, Attrs::empty());
+        let first_err = || String::from_utf8_lossy(&j.err).lines().next().unwrap_or("failed").to_string();
+        sh.body = Body::Lines(Vec::new());
+        match j.kind {
+            JobKind::Archive if j.out.is_empty() => sh.info.push(vec![span(fit(&first_err(), 200), dim)]),
+            JobKind::Archive => {
+                let (names, total) = preview::archive_lines(&j.out, 300);
+                let mut l = vec![vec![span(format!("{total} entries"), dim)]];
+                l.extend(names.into_iter().map(|n| vec![span(n, Style::PLAIN)]));
+                sh.body = Body::Lines(l);
+            }
+            JobKind::File => {
+                let t = String::from_utf8_lossy(&j.out).trim().to_string();
+                if !t.is_empty() {
+                    sh.info.push(vec![span(t, dim)]);
+                }
+            }
+            JobKind::Thumb(thumb) => match code {
+                Some(0) => match load_image_file(&thumb) {
+                    Ok((id, px)) => sh.body = Body::Image(id, px),
+                    Err(e) => sh.info.push(vec![span(e, dim)]),
+                },
+                _ => sh.info.push(vec![span(fit(&format!("no preview: {}", first_err()), 200), dim)]),
+            },
+        }
+        self.redraw_preview();
+    }
+
+    /// `p` in the sidebar: a floating preview of the cursor.
+    fn toggle_float(&mut self) {
+        if let Some(f) = self.float.take() {
+            host::close_surface(f);
+            return;
+        }
+        let opts = SurfaceOptions {
+            kind: SurfaceKind::Float,
+            title: "Preview".into(),
+            cols: 84,
+            rows: 30,
+            focus: false,
+            pane: None,
+        };
+        match host::open_surface(&opts) {
+            Ok(f) => {
+                self.float = Some(f);
+                self.float_size = host::surface_size(f).unwrap_or((84, 30));
+                self.draw_float();
+            }
+            Err(e) => host::notify(&format!("files: {e}"), true),
+        }
+    }
+
+    fn draw_float(&mut self) {
+        let (Some(f), Some(sid)) = (self.float, self.sidebar) else { return };
+        let c = colors(self.theme);
+        let Some(ui) = self.uis.get_mut(&sid) else { return };
+        let (cols, rows) = (self.float_size.0 as usize, self.float_size.1 as usize);
+        let (lines, img) = column_preview(&mut ui.view, self.preview.as_ref(), cols, rows, &|_| None, &c);
+        let _ = host::draw(f, &Frame { lines, cursor: None, background: None, images: img.into_iter().collect() });
+    }
+}
+
+/// A PNG/JPEG/GIF/WebP file for frames, and its pixel size.
+fn load_image_file(path: &Path) -> Result<(ImageId, (u32, u32)), String> {
+    let data = std::fs::read(path).map_err(|e| e.to_string())?;
+    let px = preview::image_size(&data).unwrap_or((256, 256));
+    Ok((host::load_image(&data)?, px))
+}
+
 struct Files;
 
 impl Guest for Files {
@@ -957,7 +1301,24 @@ impl Guest for Files {
     }
 
     fn on_event(event: Event) {
-        STATE.with_borrow_mut(|s| match event {
+        STATE.with_borrow_mut(|s| {
+            s.event(event);
+            s.sync_preview();
+        })
+    }
+
+    fn on_ui(surface: SurfaceId, event: UiEvent) {
+        STATE.with_borrow_mut(|s| {
+            s.ui_event(surface, event);
+            s.sync_preview();
+        })
+    }
+}
+
+impl State {
+    fn event(&mut self, event: Event) {
+        let s = self;
+        match event {
             Event::Action(a) if a == SIDEBAR => s.toggle_sidebar(),
             Event::Action(a) if a == PANE => s.open_pane(),
             Event::Action(a) if a == PICKER => s.open_picker(),
@@ -1013,6 +1374,9 @@ impl Guest for Files {
             }
             Event::FsChanged(c) => s.fs_changed(c.watch),
             Event::Timer(t) if s.reload_timer == Some(t) => s.reload_stale(),
+            Event::Timer(t) if s.preview_timer == Some(t) => s.preview_now(),
+            Event::ProcessOutput(o) => s.job_output(o.id, o.stderr, &o.data),
+            Event::ProcessExited((pid, code)) => s.job_done(pid, code),
             Event::Answered((r, answer)) => {
                 if let Some(id) = s.asks.remove(&r) {
                     if let Some(q) = answer.filter(|q| !q.trim().is_empty()) {
@@ -1022,13 +1386,28 @@ impl Guest for Files {
                 }
             }
             _ => {}
-        })
+        }
     }
 
-    fn on_ui(surface: SurfaceId, event: UiEvent) {
-        STATE.with_borrow_mut(|s| {
+    fn ui_event(&mut self, surface: SurfaceId, event: UiEvent) {
+        let s = self;
+        {
+            if s.float == Some(surface) {
+                match event {
+                    UiEvent::Resize(size) => {
+                        s.float_size = size;
+                        s.draw_float();
+                    }
+                    UiEvent::Closed => s.float = None,
+                    _ => {}
+                }
+                return;
+            }
             if !s.uis.contains_key(&surface) {
                 return;
+            }
+            if matches!(event, UiEvent::Key(_) | UiEvent::Mouse(_)) {
+                s.active = Some(surface);
             }
             match event {
                 UiEvent::Key(k) => {
@@ -1052,7 +1431,7 @@ impl Guest for Files {
                 UiEvent::Preedit(_) | UiEvent::Focus(_) | UiEvent::Drop(_) => return,
             }
             s.draw(surface);
-        })
+        }
     }
 }
 
