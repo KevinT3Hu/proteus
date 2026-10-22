@@ -247,6 +247,20 @@ impl Permissions {
         }
     }
 
+    /// The on/off permissions by name.
+    pub fn flag_names(&mut self) -> Vec<(bool, &'static str)> {
+        self.flags().into_iter().map(|(on, n)| (*on, n)).collect()
+    }
+
+    /// Grant an on/off permission by name.
+    pub fn set_flag(&mut self, name: &str) {
+        for (flag, n) in self.flags() {
+            if n == name {
+                *flag = true;
+            }
+        }
+    }
+
     fn flags(&mut self) -> [(&mut bool, &'static str); 8] {
         [
             (&mut self.ui, "ui"),

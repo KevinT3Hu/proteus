@@ -2,7 +2,6 @@
 
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Entry {
@@ -28,8 +27,18 @@ impl Entry {
     }
 }
 
-/// The entries of `dir`, unsorted. Unreadable entries are skipped.
+/// The entries of `dir`, unsorted: one host call in the plugin (WASI
+/// takes ~20 µs per entry).
+#[cfg(target_arch = "wasm32")]
 pub fn list(dir: &Path) -> std::io::Result<Vec<Entry>> {
+    let v = proteus_plugin::host::list_dir(&dir.display().to_string()).map_err(std::io::Error::other)?;
+    Ok(v.into_iter().map(|e| Entry { name: e.name, dir: e.dir, link: e.link, size: e.size, mtime: e.mtime }).collect())
+}
+
+/// The entries of `dir`, unsorted. Unreadable entries are skipped.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn list(dir: &Path) -> std::io::Result<Vec<Entry>> {
+    use std::time::UNIX_EPOCH;
     let mut out = Vec::new();
     for e in std::fs::read_dir(dir)? {
         let Ok(e) = e else { continue };
@@ -99,6 +108,9 @@ impl Sort {
 /// Natural order: case-insensitive, runs of digits compared as numbers
 /// (`a2` < `a10`); ties broken by the exact text.
 pub fn natural(a: &str, b: &str) -> Ordering {
+    if a.is_ascii() && b.is_ascii() {
+        return natural_ascii(a.as_bytes(), b.as_bytes()).then_with(|| a.cmp(b));
+    }
     let (mut x, mut y) = (a.chars().peekable(), b.chars().peekable());
     loop {
         match (x.peek().copied(), y.peek().copied()) {
@@ -130,6 +142,40 @@ pub fn natural(a: &str, b: &str) -> Ordering {
             }
         }
     }
+}
+
+fn natural_ascii(a: &[u8], b: &[u8]) -> Ordering {
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        let (c, d) = (a[i], b[j]);
+        if c.is_ascii_digit() && d.is_ascii_digit() {
+            let si = i;
+            while i < a.len() && a[i].is_ascii_digit() {
+                i += 1;
+            }
+            let sj = j;
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            let trim = |s: &[u8]| {
+                let z = s.iter().take_while(|&&c| c == b'0').count();
+                s[z..].to_vec()
+            };
+            let (m, n) = (trim(&a[si..i]), trim(&b[sj..j]));
+            let o = m.len().cmp(&n.len()).then_with(|| m.cmp(&n));
+            if o != Ordering::Equal {
+                return o;
+            }
+        } else {
+            let o = c.to_ascii_lowercase().cmp(&d.to_ascii_lowercase());
+            if o != Ordering::Equal {
+                return o;
+            }
+            i += 1;
+            j += 1;
+        }
+    }
+    (a.len() - i).cmp(&(b.len() - j))
 }
 
 /// Fuzzy match: the pattern's characters appear in order. Case-insensitive

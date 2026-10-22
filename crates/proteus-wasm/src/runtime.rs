@@ -26,6 +26,7 @@ use crate::net::{self, Streams};
 use crate::process::{self, Processes};
 use crate::secrets::{self, Keyring};
 use crate::storage::Storage;
+use types::DirEntry;
 
 wasmtime::component::bindgen!({
     path: "../proteus-plugin/wit",
@@ -790,6 +791,13 @@ impl proteus::plugin::host::Host for State {
             self.access.resolve(&path_or_url, false, true)?.display().to_string()
         };
         self.rpc(Call::Open(target)).map(|_| ())
+    }
+
+    fn list_dir(&mut self, path: String) -> Result<Vec<DirEntry>, String> {
+        let host = self.access.resolve(&path, false, true)?;
+        let access = self.access.clone();
+        let guest = PathBuf::from(&path);
+        self.blocking(move || files::list_dir(&host, &guest, &access))?
     }
 
     fn mime_type(&mut self, path: String) -> Result<String, String> {

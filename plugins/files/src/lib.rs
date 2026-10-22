@@ -163,55 +163,87 @@ enum JobKind {
     Thumb(PathBuf),
 }
 
-/// Git status, cached per repository.
+/// Git status, cached per repository and refreshed in the background
+/// (`git status` can take a second in a big tree; drawing never waits).
 #[derive(Default)]
 struct Git {
     off: bool,
     roots: HashMap<PathBuf, Option<PathBuf>>,
     status: HashMap<PathBuf, git::Status>,
+    /// Repositories to ask again (shown with the old status meanwhile).
+    stale: HashSet<PathBuf>,
+    /// A running `git status`: its repository and output.
+    running: Option<(ProcessId, PathBuf, Vec<u8>)>,
 }
 
 impl Git {
-    fn run(&mut self, dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    /// The repository holding `dir`: the nearest parent with `.git`.
+    fn root(&mut self, dir: &Path) -> Option<PathBuf> {
+        if let Some(r) = self.roots.get(dir) {
+            return r.clone();
+        }
+        let r = dir.ancestors().find(|a| a.join(".git").exists()).map(Path::to_path_buf);
+        self.roots.insert(dir.to_path_buf(), r.clone());
+        r
+    }
+
+    /// The cached status (possibly old); starts a refresh if needed.
+    fn status(&mut self, dir: &Path) -> Option<&git::Status> {
         if self.off {
             return None;
         }
-        let mut argv = vec!["git".to_string()];
-        argv.extend(args.iter().map(|a| a.to_string()));
-        let cmd = Command {
-            argv,
-            cwd: Some(dir.display().to_string()),
-            env: vec![("GIT_OPTIONAL_LOCKS".into(), "0".into())],
-        };
-        match host::run(&cmd, &[], 3000) {
-            Ok(o) if o.exit_code == Some(0) => Some(o.stdout),
-            Ok(_) => None,
-            Err(e) => {
-                // Not installed or not allowed: stop asking.
-                host::log(&format!("git: {e}"));
-                self.off = true;
-                None
+        let root = self.root(dir)?;
+        let want = !self.status.contains_key(&root) || self.stale.contains(&root);
+        if want && self.running.is_none() {
+            self.stale.remove(&root);
+            let argv = ["git", "status", "--porcelain=v1", "-z", "--ignored", "--untracked-files=normal"];
+            let cmd = Command {
+                argv: argv.map(String::from).to_vec(),
+                cwd: Some(root.display().to_string()),
+                env: vec![("GIT_OPTIONAL_LOCKS".into(), "0".into())],
+            };
+            match host::spawn_process(&cmd) {
+                Ok(pid) => {
+                    host::process_close_stdin(pid);
+                    self.running = Some((pid, root.clone(), Vec::new()));
+                }
+                Err(e) => {
+                    // Not installed or not allowed: stop asking.
+                    host::log(&format!("git: {e}"));
+                    self.off = true;
+                }
             }
-        }
-    }
-
-    fn status(&mut self, dir: &Path) -> Option<&git::Status> {
-        if !self.roots.contains_key(dir) {
-            let root = self
-                .run(dir, &["rev-parse", "--show-toplevel"])
-                .map(|o| PathBuf::from(String::from_utf8_lossy(&o).trim_end_matches(['\n', '\r']).to_string()));
-            self.roots.insert(dir.to_path_buf(), root);
-        }
-        let root = self.roots.get(dir)?.clone()?;
-        if !self.status.contains_key(&root) {
-            let out = self.run(&root, &["status", "--porcelain=v1", "-z", "--ignored", "--untracked-files=normal"])?;
-            self.status.insert(root.clone(), git::Status::parse(&root, &out));
         }
         self.status.get(&root)
     }
 
+    /// Output of a process; true if it was ours.
+    fn output(&mut self, pid: ProcessId, stderr: bool, data: &[u8]) -> bool {
+        match self.running.as_mut() {
+            Some((p, _, out)) if *p == pid => {
+                if !stderr && out.len() < 64 << 20 {
+                    out.extend_from_slice(data);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// A process ended; true if it was ours (then redraw).
+    fn exited(&mut self, pid: ProcessId, code: Option<i32>) -> bool {
+        let Some((_, root, out)) = self.running.take_if(|r| r.0 == pid) else { return false };
+        if code == Some(0) {
+            self.status.insert(root.clone(), git::Status::parse(&root, &out));
+        } else {
+            // Not a repository after all.
+            self.status.insert(root.clone(), git::Status::default());
+        }
+        true
+    }
+
     fn forget(&mut self) {
-        self.status.clear();
+        self.stale.extend(self.status.keys().cloned());
     }
 }
 
@@ -664,6 +696,7 @@ impl State {
             .or_else(fsys::home)
             .unwrap_or_else(|| PathBuf::from("/"));
         let size = host::surface_size(id).unwrap_or((opts.cols.max(20), opts.rows.max(10)));
+        let t0 = std::time::Instant::now();
         let ui = Ui {
             view: View::new(kind, start),
             size,
@@ -676,10 +709,13 @@ impl State {
             watch: None,
             dragging: false,
         };
+        let listed = t0.elapsed();
+        let n = ui.view.rows.len();
         self.uis.insert(id, ui);
         self.active = Some(id);
         self.watch(id);
         self.draw(id);
+        host::log(&format!("opened with {n} entries: listed in {listed:?}, drawn after {:?}", t0.elapsed()));
         Some(id)
     }
 
@@ -1859,8 +1895,18 @@ impl State {
             Event::FsChanged(c) => s.fs_changed(c.watch),
             Event::Timer(t) if s.reload_timer == Some(t) => s.reload_stale(),
             Event::Timer(t) if s.preview_timer == Some(t) => s.preview_now(),
-            Event::ProcessOutput(o) => s.job_output(o.id, o.stderr, &o.data),
-            Event::ProcessExited((pid, code)) => s.job_done(pid, code),
+            Event::ProcessOutput(o) => {
+                if !s.git.output(o.id, o.stderr, &o.data) {
+                    s.job_output(o.id, o.stderr, &o.data);
+                }
+            }
+            Event::ProcessExited((pid, code)) => {
+                if s.git.exited(pid, code) {
+                    s.draw_all();
+                } else {
+                    s.job_done(pid, code);
+                }
+            }
             Event::Answered((r, answer)) => {
                 if let Some((id, ask)) = s.asks.remove(&r) {
                     s.answered(id, ask, answer);

@@ -71,6 +71,32 @@ impl Access {
     }
 }
 
+// --- listing -------------------------------------------------------------------
+
+const MAX_LIST: usize = 200_000;
+
+/// `list-dir`: `host` is the resolved directory, `guest` the path the
+/// plugin asked for (links are followed only into its directories).
+pub fn list_dir(host: &Path, guest: &Path, access: &Access) -> Result<Vec<crate::runtime::types::DirEntry>, String> {
+    let io = |e: std::io::Error| format!("{}: {e}", guest.display());
+    let secs = |m: &std::fs::Metadata| m.mtime();
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(host).map_err(io)?.flatten().take(MAX_LIST) {
+        let Ok(meta) = e.metadata() else { continue };
+        let link = meta.file_type().is_symlink();
+        let name = e.file_name().to_string_lossy().into_owned();
+        let target = if link {
+            let child = guest.join(&name).display().to_string();
+            access.resolve(&child, false, true).ok().and_then(|p| std::fs::metadata(p).ok())
+        } else {
+            None
+        };
+        let m = target.as_ref().unwrap_or(&meta);
+        out.push(crate::runtime::types::DirEntry { name, dir: m.is_dir(), link, size: m.len(), mtime: secs(m) });
+    }
+    Ok(out)
+}
+
 // --- watching ------------------------------------------------------------------
 
 pub enum Change {

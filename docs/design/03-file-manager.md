@@ -10,6 +10,7 @@
 - Written in Rust, compiled to `wasm32-wasip2`, embedded in the `proteus` binary and installed as a bundled plugin.
 - Bundled plugins have their permissions pre-granted but visible and revocable in the plugin manager like any other plugin.
 - Can be disabled or replaced by a third-party file manager.
+- Build: `crates/proteus/build.rs` builds `plugins/files` for `wasm32-wasip2` (or takes `PROTEUS_FILES_WASM=path`; `PROTEUS_NO_BUNDLE=1` or a missing target builds the terminal without it). Every start installs it if missing and updates it when the embedded build changed (`source = "bundled"` in `plugins.lock`): revoked permissions and the enabled state are kept, permissions a new version adds are granted. `+plugin remove proteus.files` is remembered (it is not installed again; `+plugin install proteus.files` brings it back); a plugin installed from elsewhere with the same id is left alone.
 
 ## Surfaces
 
@@ -91,6 +92,7 @@ Shown in the last column (pane) or a floating preview (sidebar, toggle `p`).
 ## Performance targets
 
 - Directory of 10,000 entries lists in < 100 ms and scrolls at frame rate.
+  Measured (release build, Intel RPL-S): 34–84 ms to list and sort, 7 ms to draw, through `list-dir` (one host call; WASI took 220 ms for the same directory). Git markers come from a background `git status` and are drawn when it ends.
 - Sidebar open/close < 1 frame after first load.
 
 ## Open questions

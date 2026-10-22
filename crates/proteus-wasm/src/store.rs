@@ -30,7 +30,13 @@ pub struct Entry {
 pub struct Lock {
     #[serde(default, rename = "plugin")]
     pub plugins: Vec<Entry>,
+    /// Bundled plugins the user removed: not installed again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed: Vec<String>,
 }
+
+/// `Entry::source` of a plugin shipped inside the terminal.
+pub const BUNDLED: &str = "bundled";
 
 impl Lock {
     pub fn get(&self, id: &str) -> Option<&Entry> {
@@ -189,9 +195,88 @@ impl Store {
         Ok(entry)
     }
 
+    /// Install or update a plugin shipped inside the terminal. Its
+    /// permissions are granted without asking (they are shown by `+plugin
+    /// info` and can be revoked); revoked ones stay revoked, and only those
+    /// a new version adds are granted. Nothing happens if the user removed
+    /// it (unless `force`) or installed another plugin with its id.
+    /// Returns the entry if it was (re)installed.
+    pub fn install_bundled(&self, manifest: &str, wasm: &[u8], force: bool) -> Result<Option<Entry>, String> {
+        let m = Manifest::parse(manifest)?;
+        let mut lock = self.read()?;
+        let old = lock.get(&m.id).cloned();
+        if old.as_ref().is_some_and(|e| e.source != BUNDLED) || (!force && lock.removed.contains(&m.id)) {
+            return Ok(None);
+        }
+        let hash = sha256(wasm);
+        let installed = Manifest::load(&self.plugin_dir(&m.id)).ok();
+        if !force
+            && let Some(e) = &old
+            && e.hash == hash
+            && installed.as_ref().is_some_and(|i| i.permissions == m.permissions)
+            && self.load_component(e).is_ok()
+        {
+            return Ok(None);
+        }
+        let granted = match (&old, &installed) {
+            (Some(e), Some(i)) => {
+                // Kept as the user left them, plus what is new.
+                let mut g = e.granted.clone();
+                let new = m.permissions.beyond(&i.permissions);
+                for (on, n) in new.clone().flag_names() {
+                    if on {
+                        g.set_flag(n);
+                    }
+                }
+                g.fs.extend(new.fs);
+                g.run_command.extend(new.run_command);
+                g.network.extend(new.network);
+                // Nothing the manifest no longer asks for.
+                g.fs.retain(|f| m.permissions.fs.contains(f));
+                g.run_command.retain(|c| m.permissions.run_command.contains(c));
+                g.network.retain(|h| m.permissions.network.contains(h));
+                let asked = m.permissions.clone().flag_names();
+                for (on, n) in g.clone().flag_names() {
+                    if on && !asked.contains(&(true, n)) {
+                        g.revoke(n);
+                    }
+                }
+                g
+            }
+            _ => m.permissions.clone(),
+        };
+        let target = self.plugin_dir(&m.id);
+        let stage = self.root.join("plugins").join(format!(".{}.new", m.id));
+        let io = |e: std::io::Error| format!("{}: {e}", stage.display());
+        let _ = std::fs::remove_dir_all(&stage);
+        std::fs::create_dir_all(&stage).map_err(io)?;
+        std::fs::write(stage.join("proteus-plugin.toml"), manifest).map_err(io)?;
+        std::fs::write(stage.join("plugin.wasm"), wasm).map_err(io)?;
+        let _ = std::fs::remove_dir_all(&target);
+        std::fs::rename(&stage, &target).map_err(io)?;
+        std::fs::create_dir_all(self.data_dir(&m.id)).map_err(io)?;
+        let entry = Entry {
+            id: m.id.clone(),
+            name: m.name.clone(),
+            version: m.version.clone(),
+            source: BUNDLED.into(),
+            hash,
+            enabled: old.as_ref().is_none_or(|e| e.enabled),
+            granted,
+        };
+        lock.removed.retain(|r| *r != m.id);
+        lock.plugins.retain(|e| e.id != entry.id);
+        lock.plugins.push(entry.clone());
+        self.write(&lock)?;
+        Ok(Some(entry))
+    }
+
     /// Install again from where it came from.
     pub fn update(&self, id: &str, approve: Approve<'_>) -> Result<Entry, String> {
         let source = self.read()?.get(id).map(|e| e.source.clone()).ok_or_else(|| format!("no plugin `{id}`"))?;
+        if source == BUNDLED {
+            return Err(format!("`{id}` comes with the terminal and is updated with it"));
+        }
         let e = self.install(&source, approve)?;
         if e.id != id {
             return Err(format!("{source} now holds plugin `{}`, not `{id}`", e.id));
@@ -202,7 +287,9 @@ impl Store {
     /// Uninstall; `keep_data` leaves its data directory.
     pub fn remove(&self, id: &str, keep_data: bool) -> Result<(), String> {
         let mut lock = self.read()?;
-        lock.get_mut(id)?;
+        if lock.get_mut(id)?.source == BUNDLED && !lock.removed.iter().any(|r| r == id) {
+            lock.removed.push(id.to_string());
+        }
         lock.plugins.retain(|e| e.id != id);
         self.write(&lock)?;
         let _ = std::fs::remove_dir_all(self.plugin_dir(id));
@@ -382,10 +469,41 @@ mod tests {
         store.install(&tar.display().to_string(), &mut |_, _| true).unwrap();
 
         store.remove("t.demo", false).unwrap();
+        assert!(store.read().unwrap().removed.is_empty());
         assert!(!store.plugin_dir("t.demo").exists() && !store.data_dir("t.demo").exists());
         assert!(store.read().unwrap().plugins.is_empty());
         assert!(store.remove("t.demo", false).is_err());
         assert!(store.install(&base.join("nope").display().to_string(), &mut |_, _| true).is_err());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn bundled() {
+        let base = std::env::temp_dir().join(format!("proteus-bundled-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let store = Store::new(base.clone());
+        let man = |perms: &str| {
+            format!("[plugin]\nid = \"p.b\"\nname = \"B\"\nversion = \"1\"\napi = \"1\"\n[permissions]\n{perms}")
+        };
+        let m1 = man("ui = true\nread-panes = true\nrun-command = [\"git\"]");
+        let e = store.install_bundled(&m1, b"\0asm1", false).unwrap().unwrap();
+        assert!(e.granted.ui && e.granted.read_panes && e.source == BUNDLED);
+        // Same build: nothing to do.
+        assert!(store.install_bundled(&m1, b"\0asm1", false).unwrap().is_none());
+        // Revoked and disabled stay so; new permissions are granted.
+        store.revoke("p.b", "read-panes").unwrap();
+        store.set_enabled("p.b", false).unwrap();
+        let m2 = man("ui = true\nread-panes = true\nwrite-pty = true\nrun-command = [\"git\", \"ln\"]");
+        let e = store.install_bundled(&m2, b"\0asm2", false).unwrap().unwrap();
+        assert!(!e.granted.read_panes && e.granted.write_pty && !e.enabled);
+        assert_eq!(e.granted.run_command, ["git", "ln"]);
+        assert_eq!(store.load_component(&e).unwrap(), b"\0asm2");
+        assert!(store.update("p.b", &mut |_, _| true).is_err());
+        // Removed: not back unless asked.
+        store.remove("p.b", true).unwrap();
+        assert!(store.install_bundled(&m2, b"\0asm2", false).unwrap().is_none());
+        assert!(store.install_bundled(&m2, b"\0asm2", true).unwrap().is_some());
+        assert!(store.read().unwrap().removed.is_empty());
         let _ = std::fs::remove_dir_all(&base);
     }
 }

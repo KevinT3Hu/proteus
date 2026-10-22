@@ -90,8 +90,18 @@ fn ask(m: &Manifest, asks: &Permissions, yes: bool) -> bool {
 
 fn run_cmd(cmd: Cmd) -> Result<(), String> {
     let store = store()?;
+    for e in crate::bundled::install(&store) {
+        eprintln!("proteus: bundled plugin: {e}");
+    }
     match cmd {
         Cmd::Install { source, yes } => {
+            if !std::path::Path::new(&source).exists()
+                && let Some(r) = crate::bundled::reinstall(&store, &source)
+            {
+                r?;
+                println!("installed the bundled {source}");
+                return Ok(());
+            }
             let e = store.install(&source, &mut |m, p| ask(m, p, yes))?;
             println!("installed {} {} ({})", e.name, e.version, if e.enabled { "enabled" } else { "disabled" });
         }

@@ -3,6 +3,7 @@
 //! Settings come from `$XDG_CONFIG_HOME/proteus/init.lua` (see [`config`]);
 //! command-line options override them.
 
+mod bundled;
 mod config;
 mod gui;
 mod icat;

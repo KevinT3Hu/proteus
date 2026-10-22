@@ -161,6 +161,19 @@ interface types {
 
     enum fs-change-kind { created, removed, modified, moved }
 
+    /// An entry of `list-dir`.
+    record dir-entry {
+        name: string,
+        /// A directory, or a symlink to one.
+        dir: bool,
+        link: bool,
+        /// Of what a link points at (when it is inside the plugin's
+        /// directories; else of the link).
+        size: u64,
+        /// Seconds since the epoch.
+        mtime: s64,
+    }
+
     record fs-change {
         watch: watch-id,
         /// Absolute path of what changed.
@@ -306,7 +319,7 @@ interface types {
 
 interface host {
     use types.{pane-id, pane-info, block-info, surface-id, surface-options, frame, status-side, timer-id, spawn, placement,
-        process-id, request-id, watch-id, task-id, image-id, command, output, http-request, http-response};
+        process-id, request-id, watch-id, task-id, image-id, command, output, http-request, http-response, dir-entry};
 
     /// A line in the plugin log (stderr of the terminal, with `PROTEUS_DEBUG`).
     log: func(message: string);
@@ -415,6 +428,9 @@ interface host {
     /// `inode/directory`, `text/x-rust`, `image/png`, ... from the name
     /// and the first bytes.
     mime-type: func(path: string) -> result<string, string>;
+    /// The entries of a directory with their metadata, in one call (much
+    /// faster than WASI for big directories). At most 200,000 entries.
+    list-dir: func(path: string) -> result<list<dir-entry>, string>;
 
     // --- time -----------------------------------------------------------------
     /// `event::timer(id)` after `ms` milliseconds (every `ms` with `repeat`).

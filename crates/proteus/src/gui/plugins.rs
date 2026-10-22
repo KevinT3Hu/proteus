@@ -303,7 +303,11 @@ impl App {
             return;
         };
         let _ = std::fs::create_dir_all(&root);
-        self.pl.store = Some(Store::new(root.clone()));
+        let store = Store::new(root.clone());
+        for e in crate::bundled::install(&store) {
+            eprintln!("proteus: bundled plugin: {e}");
+        }
+        self.pl.store = Some(store);
         self.sync_plugins();
         self.watch_dir(&root, |name| name == "plugins.lock", |app| app.sync_plugins());
     }
