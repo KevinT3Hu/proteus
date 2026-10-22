@@ -68,6 +68,7 @@ Shown in the last column (pane) or a floating preview (sidebar, toggle `p`).
 - Selection: `Space` toggle, `v` visual range, `*` invert.
 - All operations run as background tasks with progress in the status bar; conflicts prompt (overwrite / skip / rename / apply to all).
 - Undo: last operation (rename, move, trash) can be undone with `u`.
+- Keys of this build: `C` yank to copy, `x` cut, `P` paste into the current directory, `r` rename, `n` new file (`name/`: directory), `L` link the yanked files here, `M` chmod, `d` trash, `D` delete (type `yes`), `b` bulk rename, `v` visual range. Copies run in 40 ms steps on a timer (one plugin call stays short) as a cancellable task; a conflict waits in the surface's footer (`o`/`s`/`r`, capitals for all). Moves across file systems copy, then remove. Symlinks inside copied directories are skipped with an error (WASI has no `symlink`); `L` and `M` use `ln` and `chmod`. Undo of a trash restores from the home trash only. Enter opens text files in `$EDITOR` in a split.
 
 ## Remote panes
 

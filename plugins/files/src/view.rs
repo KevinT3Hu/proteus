@@ -66,6 +66,8 @@ pub struct View {
     pub hidden: bool,
     pub sort: Sort,
     pub selected: BTreeSet<PathBuf>,
+    /// `v`: the anchor row and the marks from before.
+    pub visual: Option<(usize, BTreeSet<PathBuf>)>,
 }
 
 impl View {
@@ -87,6 +89,7 @@ impl View {
             hidden: false,
             sort: Sort::default(),
             selected: BTreeSet::new(),
+            visual: None,
         };
         v.rebuild();
         v
@@ -247,6 +250,23 @@ impl View {
         self.list.selected = (self.list.selected + 1).min(self.list.len.saturating_sub(1));
     }
 
+    /// `v`: start or end marking the rows between an anchor and the cursor.
+    pub fn toggle_visual(&mut self) {
+        if self.visual.take().is_none() {
+            self.visual = Some((self.list.selected, self.selected.clone()));
+            self.update_visual();
+        }
+    }
+
+    /// The cursor moved: mark the range.
+    pub fn update_visual(&mut self) {
+        let Some((anchor, base)) = &self.visual else { return };
+        let (a, b) = (*anchor.min(&self.list.selected), *anchor.max(&self.list.selected));
+        let mut sel = base.clone();
+        sel.extend(self.rows.iter().skip(a).take(b + 1 - a).map(|r| r.path.clone()));
+        self.selected = sel;
+    }
+
     /// `*`: invert the marks of the shown rows.
     pub fn invert_selected(&mut self) {
         for r in &self.rows {
@@ -324,6 +344,14 @@ mod tests {
         assert!(!names(&v).contains(&"-lib.rs".to_string()));
         v.toggle_selected();
         assert_eq!(v.targets(), [d.join("src")]);
+        v.selected.clear();
+        v.list.selected = 0;
+        v.toggle_visual();
+        v.list.selected = 2;
+        v.update_visual();
+        assert_eq!(v.targets(), [d.join("docs"), d.join("file2"), d.join("src")]);
+        v.toggle_visual();
+        assert!(v.visual.is_none() && v.selected.len() == 3);
         let _ = std::fs::remove_dir_all(&d);
     }
 }

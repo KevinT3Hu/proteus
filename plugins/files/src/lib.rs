@@ -7,6 +7,7 @@
 
 mod fsys;
 mod git;
+mod ops;
 mod preview;
 mod view;
 
@@ -22,6 +23,8 @@ use proteus_plugin::types::{
 use proteus_plugin::{Edit, Guest, TextInput, fit, host, pad, widgets::clip, width};
 
 use fsys::{Sort, SortKey};
+use ops::{Choice, OpKind, Step, Transfer};
+use proteus_plugin::types::{Placement, Spawn, TaskId};
 use view::{Kind, Layout, View};
 
 const SIDEBAR: &str = "Files: sidebar";
@@ -72,7 +75,13 @@ struct State {
     stale: HashSet<SurfaceId>,
     reload_timer: Option<TimerId>,
     /// `z` prompts: request → surface.
-    asks: HashMap<RequestId, SurfaceId>,
+    asks: HashMap<RequestId, (SurfaceId, Ask)>,
+    /// Files yanked (`C`) or cut (`x`) for `P`.
+    clip: Option<(OpKind, Vec<PathBuf>)>,
+    op: Option<Running>,
+    undo: Option<Undo>,
+    /// A bulk rename being edited in a pane.
+    bulk: Option<Bulk>,
     /// The surface the user works in (its cursor is previewed).
     active: Option<SurfaceId>,
     /// The sidebar's floating preview (`p`).
@@ -83,6 +92,43 @@ struct State {
     pending: Option<(PathBuf, i64)>,
     preview_timer: Option<TimerId>,
     job: Option<Job>,
+}
+
+/// What a `prompt` or `confirm` was for.
+enum Ask {
+    Zoxide,
+    Rename(PathBuf),
+    /// Create in this directory.
+    New(PathBuf),
+    Chmod(Vec<PathBuf>),
+    Delete(Vec<PathBuf>),
+    Bulk(Vec<(PathBuf, PathBuf)>),
+}
+
+/// A copy or move in the background.
+struct Running {
+    t: Transfer,
+    task: Option<TaskId>,
+    timer: Option<TimerId>,
+    surface: SurfaceId,
+    /// Waiting for the user: this destination exists.
+    conflict: Option<PathBuf>,
+    /// Undoing a move (it is not undone again).
+    undoing: bool,
+}
+
+enum Undo {
+    Renamed(Vec<(PathBuf, PathBuf)>),
+    Moved(Vec<(PathBuf, PathBuf)>),
+    Trashed(Vec<PathBuf>),
+}
+
+struct Bulk {
+    pane: PaneId,
+    surface: SurfaceId,
+    file: PathBuf,
+    dir: PathBuf,
+    names: Vec<String>,
 }
 
 /// A preview of one file.
@@ -407,7 +453,12 @@ impl State {
 
         // Footer: the filter being typed, a message, or the state.
         let dim = style(Some(c.dim), None, Attrs::empty());
-        let footer = if let Some(input) = &ui.input {
+        let conflict = self.op.as_ref().filter(|o| o.surface == id).and_then(|o| o.conflict.clone());
+        let footer = if let Some(p) = conflict {
+            let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let q = format!("{name} exists: o(verwrite) s(kip) r(ename), O/S/R for all, Esc stops");
+            vec![span(fit(&q, cols), style(Some(Color::Indexed(3)), None, Attrs::BOLD))]
+        } else if let Some(input) = &ui.input {
             let (field, col) = input.render(cols.saturating_sub(1), Style::PLAIN);
             cursor = Some((col + 1, rows as u32 - 1));
             let mut l = vec![span("/", style(Some(c.accent), None, Attrs::BOLD))];
@@ -433,6 +484,13 @@ impl State {
             }
             if !v.selected.is_empty() {
                 s.push_str(&format!("  {} marked", v.selected.len()));
+            }
+            if ui.view.visual.is_some() {
+                s.push_str("  VISUAL");
+            }
+            if let Some((k, c)) = &self.clip {
+                let what = if *k == OpKind::Copy { "to copy" } else { "to move" };
+                s.push_str(&format!("  {} {what} (P)", c.len()));
             }
             if let Some(p) = ui.prefix {
                 s.push_str(match p {
@@ -726,6 +784,10 @@ impl State {
         if ui.view.kind == Kind::Picker {
             return self.insert(id);
         }
+        let text = preview::head(&r.path, 4096).is_ok_and(|h| preview::is_text(&h));
+        if text {
+            return self.edit_in(id, Placement::SplitRight);
+        }
         if let Err(e) = host::open(&r.path.display().to_string()) {
             self.say(id, e, true);
         }
@@ -823,7 +885,7 @@ impl State {
     fn zoxide(&mut self, id: SurfaceId) {
         match host::prompt("zoxide:", "") {
             Ok(r) => {
-                self.asks.insert(r, id);
+                self.asks.insert(r, (id, Ask::Zoxide));
             }
             Err(e) => self.say(id, e, true),
         }
@@ -871,6 +933,25 @@ impl State {
 
     fn key(&mut self, id: SurfaceId, key: &str, text: &str, ctrl: bool) {
         let rows = self.uis.get(&id).map_or(1, |u| u.size.1.saturating_sub(2) as usize);
+        if self.op.as_ref().is_some_and(|o| o.surface == id && o.conflict.is_some()) {
+            let choice = match text {
+                "o" | "O" => Some(Choice::Overwrite),
+                "s" | "S" => Some(Choice::Skip),
+                "r" | "R" => Some(Choice::Rename),
+                _ => None,
+            };
+            if let Some(c) = choice {
+                let all = text.chars().all(char::is_uppercase);
+                if let Some(o) = self.op.as_mut() {
+                    o.t.resolve(c, all);
+                    o.conflict = None;
+                }
+                self.op_tick();
+            } else if key == "escape" {
+                self.op_cancel();
+            }
+            return;
+        }
         let Some(ui) = self.ui(id) else { return };
         ui.message = None;
 
@@ -894,7 +975,10 @@ impl State {
         if let Some(p) = ui.prefix.take() {
             match (p, text) {
                 (_, "") if key != "escape" => ui.prefix = Some(p), // a modifier
-                (Prefix::G, "g") => ui.view.list.selected = 0,
+                (Prefix::G, "g") => {
+                    ui.view.list.selected = 0;
+                    ui.view.update_visual();
+                }
                 (Prefix::Mark, t) if t.chars().count() == 1 && key != "escape" => self.bookmark(id, t),
                 (Prefix::Jump, t) if t.chars().count() == 1 && key != "escape" => self.jump(id, t),
                 (Prefix::Sort, t) => {
@@ -949,6 +1033,21 @@ impl State {
                 self.say(id, format!("view: {label}"), false);
             }
             (_, " ") => ui.view.toggle_selected(),
+            (_, "v") => ui.view.toggle_visual(),
+            (_, "C") => self.yank(id, OpKind::Copy),
+            (_, "x") => self.yank(id, OpKind::Move),
+            (_, "P") => self.paste(id),
+            (_, "r") => self.ask_rename(id),
+            (_, "n") => self.ask_new(id),
+            (_, "L") => self.link(id),
+            (_, "M") => self.ask_chmod(id),
+            (_, "d") => self.trash(id),
+            (_, "D") => self.ask_delete(id),
+            (_, "u") => self.undo(id),
+            (_, "b") => self.bulk_rename(id),
+            (_, "s") => self.edit_in(id, Placement::SplitRight),
+            (_, "t") => self.edit_in(id, Placement::NewTab),
+            (_, "f") => self.edit_in(id, Placement::Float),
             (_, "*") => ui.view.invert_selected(),
             (_, "c") => self.cd_pane(id),
             (_, "i") => self.insert(id),
@@ -971,7 +1070,9 @@ impl State {
                 self.close_ui(id);
             }
             ("escape", _) => {
-                if !ui.view.filter.is_empty() {
+                if ui.view.visual.is_some() {
+                    ui.view.visual = None;
+                } else if !ui.view.filter.is_empty() {
                     ui.view.set_filter("");
                 } else if !ui.view.selected.is_empty() {
                     ui.view.selected.clear();
@@ -983,7 +1084,9 @@ impl State {
                 }
             }
             (k, t) => {
-                ui.view.list.key(k, t, rows);
+                if ui.view.list.key(k, t, rows) {
+                    ui.view.update_visual();
+                }
             }
         }
     }
@@ -1289,6 +1392,384 @@ fn load_image_file(path: &Path) -> Result<(ImageId, (u32, u32)), String> {
     Ok((host::load_image(&data)?, px))
 }
 
+// --- operations ---------------------------------------------------------------
+
+fn plural(n: usize, what: &str) -> String {
+    format!("{n} {what}{}", if n == 1 { "" } else { "s" })
+}
+
+fn name_of(p: &Path) -> String {
+    p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.display().to_string())
+}
+
+/// `$EDITOR` (else `vi`) on `file`, through the user's shell.
+fn editor_argv(file: &Path) -> Vec<String> {
+    let script = "exec ${VISUAL:-${EDITOR:-vi}} \"$1\"";
+    vec!["sh".into(), "-c".into(), script.into(), "sh".into(), file.display().to_string()]
+}
+
+impl State {
+    fn targets(&mut self, id: SurfaceId) -> Vec<PathBuf> {
+        let Some(ui) = self.ui(id) else { return Vec::new() };
+        ui.view.visual = None;
+        ui.view.targets()
+    }
+
+    /// After a change: read every view again.
+    fn changed(&mut self) {
+        self.git.forget();
+        for ui in self.uis.values_mut() {
+            ui.view.reload();
+        }
+        self.draw_all();
+    }
+
+    fn yank(&mut self, id: SurfaceId, kind: OpKind) {
+        let t = self.targets(id);
+        if t.is_empty() {
+            return;
+        }
+        let verb = if kind == OpKind::Copy { "copy" } else { "move" };
+        self.say(id, format!("{} to {verb}: P pastes", plural(t.len(), "file")), false);
+        self.clip = Some((kind, t));
+        if let Some(ui) = self.ui(id) {
+            ui.view.selected.clear();
+        }
+    }
+
+    /// The directory new things go into: the open tree node under the
+    /// cursor, else the view's directory.
+    fn here(&self, id: SurfaceId) -> Option<PathBuf> {
+        let ui = self.uis.get(&id)?;
+        Some(match ui.view.current() {
+            Some(r) if r.entry.dir && r.open => r.path.clone(),
+            Some(r) if ui.view.layout == Layout::Tree && r.depth > 0 => r.path.parent()?.to_path_buf(),
+            _ => ui.view.dir.clone(),
+        })
+    }
+
+    fn paste(&mut self, id: SurfaceId) {
+        let Some(dir) = self.here(id) else { return };
+        let Some((kind, paths)) = self.clip.clone() else {
+            return self.say(id, "nothing to paste (C or x first)", true);
+        };
+        let pairs = paths.iter().map(|p| (p.clone(), dir.join(name_of(p)))).collect();
+        if kind == OpKind::Move {
+            self.clip = None;
+        }
+        self.start_op(id, Transfer::new(kind, pairs), false);
+    }
+
+    fn start_op(&mut self, id: SurfaceId, t: Transfer, undoing: bool) {
+        if self.op.is_some() {
+            return self.say(id, "another copy or move is running", true);
+        }
+        let title = match (t.kind, undoing) {
+            (_, true) => "Undoing a move".to_string(),
+            (OpKind::Copy, _) => "Copying".into(),
+            (OpKind::Move, _) => "Moving".into(),
+        };
+        let task = host::task_start(&format!("files: {title}")).ok();
+        self.op = Some(Running { t, task, timer: None, surface: id, conflict: None, undoing });
+        self.op_tick();
+    }
+
+    fn op_tick(&mut self) {
+        let Some(op) = self.op.as_mut() else { return };
+        op.timer = None;
+        match op.t.step(std::time::Duration::from_millis(40)) {
+            Step::Working => {
+                if let Some(task) = op.task {
+                    let msg = format!("{} of {}", fsys::human(op.t.done), fsys::human(op.t.total));
+                    host::task_update(task, op.t.progress(), &msg);
+                }
+                op.timer = Some(host::set_timer(1, false));
+            }
+            Step::Conflict(p) => {
+                op.conflict = Some(p);
+                let s = op.surface;
+                let _ = host::focus_surface(s);
+                self.draw(s);
+            }
+            Step::Done => self.op_done(),
+        }
+    }
+
+    fn op_cancel(&mut self) {
+        if let Some(op) = self.op.as_mut() {
+            op.t.cancel();
+            if let Some(t) = op.timer.take() {
+                host::cancel_timer(t);
+            }
+        }
+        self.op_done();
+    }
+
+    fn op_done(&mut self) {
+        let Some(op) = self.op.take() else { return };
+        if let Some(t) = op.task {
+            host::task_end(t);
+        }
+        let n = op.t.finished.len();
+        let verb = if op.t.kind == OpKind::Copy { "copied" } else { "moved" };
+        if op.t.kind == OpKind::Move && !op.undoing && n > 0 {
+            self.undo = Some(Undo::Moved(op.t.finished.clone()));
+        }
+        match op.t.errors.first() {
+            Some(e) => self.say(op.surface, format!("{} {verb}; {} failed: {e}", n, op.t.errors.len()), true),
+            None => self.say(op.surface, format!("{} {verb}", plural(n, "file")), false),
+        }
+        self.changed();
+    }
+
+    fn ask(&mut self, id: SurfaceId, q: &str, initial: &str, ask: Ask) {
+        match host::prompt(q, initial) {
+            Ok(r) => {
+                self.asks.insert(r, (id, ask));
+            }
+            Err(e) => self.say(id, e, true),
+        }
+    }
+
+    fn ask_rename(&mut self, id: SurfaceId) {
+        let Some(p) = self.uis.get(&id).and_then(|u| u.view.current()).map(|r| r.path.clone()) else { return };
+        self.ask(id, "Rename to:", &name_of(&p), Ask::Rename(p));
+    }
+
+    fn ask_new(&mut self, id: SurfaceId) {
+        let Some(dir) = self.here(id) else { return };
+        self.ask(id, "New file (end with / for a directory):", "", Ask::New(dir));
+    }
+
+    fn ask_chmod(&mut self, id: SurfaceId) {
+        let t = self.targets(id);
+        if !t.is_empty() {
+            let q = format!("chmod {} (e.g. 644, u+x):", plural(t.len(), "file"));
+            self.ask(id, &q, "", Ask::Chmod(t));
+        }
+    }
+
+    fn ask_delete(&mut self, id: SurfaceId) {
+        let t = self.targets(id);
+        if !t.is_empty() {
+            let q = format!("Delete {} for good? Type yes:", plural(t.len(), "file"));
+            self.ask(id, &q, "", Ask::Delete(t));
+        }
+    }
+
+    fn answered(&mut self, id: SurfaceId, ask: Ask, answer: Option<String>) {
+        let Some(a) = answer else { return };
+        let a = a.trim().to_string();
+        match ask {
+            Ask::Zoxide if !a.is_empty() => self.zoxide_answer(id, &a),
+            Ask::Rename(from) if !a.is_empty() && a != name_of(&from) => {
+                if a.contains('/') {
+                    return self.say(id, "a name cannot hold /", true);
+                }
+                let to = from.with_file_name(&a);
+                if std::fs::symlink_metadata(&to).is_ok() {
+                    return self.say(id, format!("{a} exists"), true);
+                }
+                match std::fs::rename(&from, &to) {
+                    Ok(()) => {
+                        self.undo = Some(Undo::Renamed(vec![(from, to.clone())]));
+                        self.changed();
+                        if let Some(ui) = self.ui(id) {
+                            ui.view.focus(&to);
+                        }
+                    }
+                    Err(e) => self.say(id, e.to_string(), true),
+                }
+            }
+            Ask::New(dir) if !a.is_empty() => {
+                let dirwise = a.ends_with('/');
+                let path = dir.join(a.trim_end_matches('/'));
+                if !path.starts_with(&dir) || a.split('/').any(|c| c == "..") {
+                    return self.say(id, "stay inside this directory", true);
+                }
+                let r = if dirwise {
+                    std::fs::create_dir_all(&path)
+                } else {
+                    let parent = path.parent().map(std::fs::create_dir_all).unwrap_or(Ok(()));
+                    parent.and_then(|_| std::fs::File::create_new(&path).map(|_| ()))
+                };
+                match r {
+                    Ok(()) => {
+                        self.changed();
+                        if let Some(ui) = self.ui(id) {
+                            ui.view.focus(&path);
+                        }
+                    }
+                    Err(e) => self.say(id, format!("{}: {e}", path.display()), true),
+                }
+            }
+            Ask::Chmod(paths) if !a.is_empty() => {
+                if !a.chars().all(|c| c.is_ascii_alphanumeric() || "+-=,".contains(c)) {
+                    return self.say(id, format!("bad mode `{a}`"), true);
+                }
+                let mut argv = vec!["chmod".to_string(), a, "--".into()];
+                argv.extend(paths.iter().map(|p| p.display().to_string()));
+                self.run_tool(id, argv);
+            }
+            Ask::Delete(paths) if a == "yes" => {
+                let mut failed = Vec::new();
+                for p in &paths {
+                    let r = match std::fs::symlink_metadata(p) {
+                        Ok(m) if m.is_dir() => std::fs::remove_dir_all(p),
+                        Ok(_) => std::fs::remove_file(p),
+                        Err(e) => Err(e),
+                    };
+                    if let Err(e) = r {
+                        failed.push(format!("{}: {e}", name_of(p)));
+                    }
+                }
+                self.changed();
+                match failed.first() {
+                    Some(e) => self.say(id, format!("{} not deleted: {e}", failed.len()), true),
+                    None => self.say(id, format!("deleted {}", plural(paths.len(), "file")), false),
+                }
+            }
+            Ask::Delete(_) => self.say(id, "not deleted", false),
+            Ask::Bulk(pairs) => match ops::rename_all(&pairs) {
+                Ok(done) => {
+                    self.say(id, format!("renamed {}", plural(done.len(), "file")), false);
+                    self.undo = Some(Undo::Renamed(done));
+                    self.changed();
+                }
+                Err(e) => self.say(id, e, true),
+            },
+            _ => {}
+        }
+    }
+
+    /// Run `chmod`/`ln` and report.
+    fn run_tool(&mut self, id: SurfaceId, argv: Vec<String>) {
+        let prog = argv[0].clone();
+        match host::run(&Command { argv, cwd: None, env: vec![] }, &[], 10_000) {
+            Ok(o) if o.exit_code == Some(0) => self.changed(),
+            Ok(o) => {
+                let e = String::from_utf8_lossy(&o.stderr).lines().next().unwrap_or("failed").to_string();
+                self.say(id, format!("{prog}: {e}"), true);
+                self.changed();
+            }
+            Err(e) => self.say(id, format!("{prog}: {e}"), true),
+        }
+    }
+
+    /// `L`: links here to the yanked files.
+    fn link(&mut self, id: SurfaceId) {
+        let Some(dir) = self.here(id) else { return };
+        let Some((_, paths)) = self.clip.take() else { return self.say(id, "nothing to link (C first)", true) };
+        let mut argv = vec!["ln".to_string(), "-s".into(), "--".into()];
+        argv.extend(paths.iter().map(|p| p.display().to_string()));
+        argv.push(format!("{}/", dir.display()));
+        self.run_tool(id, argv);
+    }
+
+    fn trash(&mut self, id: SurfaceId) {
+        let t = self.targets(id);
+        let mut done = Vec::new();
+        let mut err = None;
+        for p in t {
+            match host::trash(&p.display().to_string()) {
+                Ok(()) => done.push(p),
+                Err(e) => {
+                    err.get_or_insert(e);
+                }
+            }
+        }
+        if !done.is_empty() {
+            self.undo = Some(Undo::Trashed(done.clone()));
+        }
+        self.changed();
+        match err {
+            Some(e) => self.say(id, e, true),
+            None => self.say(id, format!("trashed {} (u: undo)", plural(done.len(), "file")), false),
+        }
+    }
+
+    fn undo(&mut self, id: SurfaceId) {
+        let Some(u) = self.undo.take() else { return self.say(id, "nothing to undo", true) };
+        match u {
+            Undo::Renamed(pairs) => {
+                let back: Vec<_> = pairs.into_iter().map(|(a, b)| (b, a)).collect();
+                match ops::rename_all(&back) {
+                    Ok(d) => self.say(id, format!("undid {}", plural(d.len(), "rename")), false),
+                    Err(e) => self.say(id, e, true),
+                }
+                self.changed();
+            }
+            Undo::Moved(pairs) => {
+                let back = pairs.into_iter().map(|(a, b)| (b, a)).collect();
+                self.start_op(id, Transfer::new(OpKind::Move, back), true);
+            }
+            Undo::Trashed(paths) => {
+                let trash = fsys::home().unwrap_or_default().join(".local/share/Trash");
+                let errs: Vec<String> = paths.iter().filter_map(|p| ops::restore(&trash, p).err()).collect();
+                self.changed();
+                match errs.first() {
+                    Some(e) => self.say(id, e.clone(), true),
+                    None => self.say(id, format!("restored {}", plural(paths.len(), "file")), false),
+                }
+            }
+        }
+    }
+
+    /// `s`/`t`/`f`: `$EDITOR` on the file (a shell for a directory).
+    fn edit_in(&mut self, id: SurfaceId, at: Placement) {
+        let Some(r) = self.uis.get(&id).and_then(|u| u.view.current()).cloned() else { return };
+        let (argv, cwd) = if r.entry.dir {
+            (Vec::new(), r.path.clone())
+        } else {
+            (editor_argv(&r.path), r.path.parent().map(Path::to_path_buf).unwrap_or_default())
+        };
+        if let Err(e) = host::open_pane(at, &Spawn { argv, cwd: Some(cwd.display().to_string()) }) {
+            self.say(id, e, true);
+        }
+    }
+
+    /// `b`: the names in `$EDITOR`; renamed when it exits.
+    fn bulk_rename(&mut self, id: SurfaceId) {
+        let t = self.targets(id);
+        let Some(dir) = t.first().and_then(|p| p.parent()).map(Path::to_path_buf) else { return };
+        if t.iter().any(|p| p.parent() != Some(&dir)) {
+            return self.say(id, "bulk rename: files of one directory", true);
+        }
+        let names: Vec<String> = t.iter().map(|p| name_of(p)).collect();
+        if names.iter().any(|n| n.contains('\n')) {
+            return self.say(id, "bulk rename: a name holds a newline", true);
+        }
+        let cache = fsys::home().unwrap_or_default().join(".cache/proteus-files");
+        let file = cache.join(format!("rename-{}.txt", std::process::id()));
+        let w = std::fs::create_dir_all(&cache).and_then(|_| std::fs::write(&file, names.join("\n") + "\n"));
+        if let Err(e) = w {
+            return self.say(id, format!("{}: {e}", file.display()), true);
+        }
+        let spawn = Spawn { argv: editor_argv(&file), cwd: Some(dir.display().to_string()) };
+        match host::open_pane(Placement::Float, &spawn) {
+            Ok(pane) => self.bulk = Some(Bulk { pane, surface: id, file, dir, names }),
+            Err(e) => self.say(id, e, true),
+        }
+    }
+
+    fn bulk_edited(&mut self) {
+        let Some(b) = self.bulk.take() else { return };
+        let text = std::fs::read_to_string(&b.file).unwrap_or_default();
+        let _ = std::fs::remove_file(&b.file);
+        match ops::rename_plan(&b.dir, &b.names, &text) {
+            Ok(p) if p.is_empty() => self.say(b.surface, "no names changed", false),
+            Ok(p) => match host::confirm(&format!("Rename {}?", plural(p.len(), "file"))) {
+                Ok(r) => {
+                    self.asks.insert(r, (b.surface, Ask::Bulk(p)));
+                }
+                Err(e) => self.say(b.surface, e, true),
+            },
+            Err(e) => self.say(b.surface, e, true),
+        }
+        self.draw(b.surface);
+    }
+}
+
 struct Files;
 
 impl Guest for Files {
@@ -1356,6 +1837,9 @@ impl State {
             }
             Event::CwdChanged(_) => s.follow(),
             Event::PaneClosed(p) => {
+                if s.bulk.as_ref().is_some_and(|b| b.pane == p) {
+                    s.bulk_edited();
+                }
                 s.blocks.remove(&p);
                 if s.last_pane == Some(p) {
                     s.last_pane = None;
@@ -1378,13 +1862,13 @@ impl State {
             Event::ProcessOutput(o) => s.job_output(o.id, o.stderr, &o.data),
             Event::ProcessExited((pid, code)) => s.job_done(pid, code),
             Event::Answered((r, answer)) => {
-                if let Some(id) = s.asks.remove(&r) {
-                    if let Some(q) = answer.filter(|q| !q.trim().is_empty()) {
-                        s.zoxide_answer(id, q.trim());
-                    }
+                if let Some((id, ask)) = s.asks.remove(&r) {
+                    s.answered(id, ask, answer);
                     s.draw(id);
                 }
             }
+            Event::Timer(t) if s.op.as_ref().is_some_and(|o| o.timer == Some(t)) => s.op_tick(),
+            Event::TaskCancelled(t) if s.op.as_ref().is_some_and(|o| o.task == Some(t)) => s.op_cancel(),
             _ => {}
         }
     }
