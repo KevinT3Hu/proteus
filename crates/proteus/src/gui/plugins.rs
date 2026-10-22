@@ -121,7 +121,7 @@ pub(super) struct Plugins {
     /// Tasks: (plugin id, task id).
     pub tasks: BTreeMap<(String, u32), Task>,
     /// Keys suggested by plugins for their actions (chord, action).
-    pub keys: Vec<(modes::Chord, modes::Action)>,
+    pub keys: Vec<(modes::Mode, modes::Chord, modes::Action)>,
 }
 
 /// 0xRRGGBB.
@@ -411,7 +411,7 @@ impl App {
             }
         }
         let prefix = format!("plugin:{id}:");
-        self.pl.keys.retain(|(_, a)| !a.name().starts_with(&prefix));
+        self.pl.keys.retain(|(_, _, a)| !a.name().starts_with(&prefix));
         self.status_changed();
         self.mark_all_dirty();
     }
@@ -623,10 +623,10 @@ impl App {
 
     /// Bind the keys plugins suggested that the user's keymap leaves free.
     pub(super) fn apply_plugin_keys(&mut self) {
-        for (chord, action) in self.pl.keys.clone() {
-            let taken = self.keymap.bindings(modes::Mode::Normal).iter().any(|(c, a)| *c == chord && *a != action);
+        for (mode, chord, action) in self.pl.keys.clone() {
+            let taken = self.keymap.bindings(mode).iter().any(|(c, a)| *c == chord && *a != action);
             if !taken {
-                self.keymap.set(modes::Mode::Normal, chord, Some(action));
+                self.keymap.set(mode, chord, Some(action));
             }
         }
     }
@@ -723,6 +723,10 @@ impl App {
                 Ok(Reply::Panes(self.pane_ids().into_iter().filter_map(|id| pane_info(self, id)).collect()))
             }
             Call::GetPane(id) => Ok(Reply::Pane(pane_info(self, id))),
+            Call::PaneRemote(id) => {
+                exists(self, id)?;
+                Ok(Reply::Remote(self.pane_info(id).and_then(|i| i.remote)))
+            }
             Call::FocusedPane => Ok(Reply::Id(self.focused())),
             Call::FocusPane(id) => {
                 exists(self, id)?;
@@ -760,6 +764,14 @@ impl App {
                 r.map(|id| Reply::Id(Some(id)))
             }
             Call::OpenSurface(o) => self.open_surface(key, o).map(Reply::Surface),
+            Call::StartDrag(id, paths) => {
+                // Only while the user drags on that surface of this plugin.
+                let ours = self.pl.surfaces.get(&id).is_some_and(|s| s.owner == *key);
+                if ours && self.w.surface_drag.is_some_and(|d| d.0 == id) {
+                    self.w.drag_paths = Some(paths);
+                }
+                Ok(Reply::Unit)
+            }
             Call::Draw(id, frame) => {
                 if !self.pl.surfaces.get(&id).is_some_and(|s| s.owner == *key) {
                     return Err(format!("no surface {id}"));
@@ -796,11 +808,11 @@ impl App {
             }
             Call::RegisterAction(name, chord) => {
                 let name: String = clean(&name).take(100).collect();
-                if let Some(chord) = chord.as_deref().and_then(|c| modes::Chord::parse(c).ok())
+                if let Some((mode, chord)) = chord.as_deref().and_then(suggested_key)
                     && let Some(action) = modes::plugin_action(&key.id, &name)
-                    && !self.pl.keys.iter().any(|(c, _)| *c == chord)
+                    && !self.pl.keys.iter().any(|(m, c, _)| (*m, *c) == (mode, chord))
                 {
-                    self.pl.keys.push((chord, action));
+                    self.pl.keys.push((mode, chord, action));
                     self.apply_plugin_keys();
                 }
                 if let Some(r) = self.pl.running.get_mut(&key.id)
@@ -1392,6 +1404,16 @@ impl App {
     /// A button released after a press on a surface.
     pub(super) fn surface_release(&mut self, pos: (f64, f64)) -> bool {
         let Some((id, button, last)) = self.w.surface_drag.take() else { return false };
+        let paths = self.w.drag_paths.take();
+        if let Some(paths) = paths.filter(|p| !p.is_empty())
+            && self.surface_at(pos).is_none()
+            && let Some(p) = self.pane_at(pos).filter(|p| self.panes.get(p).is_some_and(|p| p.surface.is_none()))
+        {
+            use crate::script::Host as _;
+            let text: Vec<String> =
+                paths.iter().map(|p| super::hint::shell_quote(&clean(p).collect::<String>())).collect();
+            self.send_text(p, &format!("{} ", text.join(" ")), true);
+        }
         let cell = self.surface_cell(id, pos).unwrap_or(last);
         self.surface_mouse(id, button, types::MouseAction::Release, cell);
         true
@@ -1551,6 +1573,15 @@ fn surface_mods(m: &smithay_client_toolkit::seat::keyboard::Modifiers) -> types:
     out
 }
 
+/// A key suggested by a plugin: `KEY` (Normal mode) or `MODE:KEY`.
+fn suggested_key(s: &str) -> Option<(modes::Mode, modes::Chord)> {
+    let (mode, key) = match s.split_once(':') {
+        Some((m, k)) if !k.is_empty() => (modes::Mode::from_key(m)?, k),
+        _ => (modes::Mode::Normal, s),
+    };
+    Some((mode, modes::Chord::parse(key).ok()?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1558,6 +1589,16 @@ mod tests {
 
     fn span(t: &str, style: Style) -> Span {
         Span { text: t.into(), style, link: None }
+    }
+
+    #[test]
+    fn suggested_keys() {
+        use modes::Mode;
+        let c = |s| modes::Chord::parse(s).unwrap();
+        assert_eq!(suggested_key("alt+e"), Some((Mode::Normal, c("alt+e"))));
+        assert_eq!(suggested_key("pane:e"), Some((Mode::Pane, c("e"))));
+        assert_eq!(suggested_key("ctrl+:"), Some((Mode::Normal, c("ctrl+:"))));
+        assert_eq!(suggested_key("nope:e"), None);
     }
 
     #[test]

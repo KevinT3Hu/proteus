@@ -396,6 +396,8 @@ struct Win {
     surface_focus: Option<u32>,
     /// A button pressed on a surface: drags and the release go to it.
     surface_drag: Option<(u32, proteus_wasm::types::MouseButton, (u32, u32))>,
+    /// Paths a plugin carries in that drag (`start-drag`).
+    drag_paths: Option<Vec<String>>,
 }
 
 /// A tab being dragged to another window (Wayland drag and drop).
@@ -570,6 +572,7 @@ fn make_win(
         status: Default::default(),
         surface_focus: None,
         surface_drag: None,
+        drag_paths: None,
     })
 }
 

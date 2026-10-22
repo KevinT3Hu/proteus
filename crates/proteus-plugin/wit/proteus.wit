@@ -316,6 +316,9 @@ interface host {
     // --- panes ---------------------------------------------------------------
     list-panes: func() -> result<list<pane-info>, string>;
     get-pane: func(id: pane-id) -> result<option<pane-info>, string>;
+    /// The host of the pane's cwd (OSC 7) when it is not this machine,
+    /// e.g. over ssh (its `cwd` is then none); none: local.
+    pane-remote: func(id: pane-id) -> result<option<string>, string>;
     focused-pane: func() -> result<option<pane-id>, string>;
     /// Show a pane: its window, tab, and focus (`read-panes`).
     focus-pane: func(id: pane-id) -> result<_, string>;
@@ -336,11 +339,16 @@ interface host {
     /// Give a surface the keyboard.
     focus-surface: func(surface: surface-id) -> result<_, string>;
     /// Size of a surface in cells (columns, rows).
+    /// During a mouse drag that started on `surface`: carry `paths`. If the
+    /// button is released over a terminal pane, the host pastes them there,
+    /// shell-quoted and separated by spaces.
+    start-drag: func(surface: surface-id, paths: list<string>) -> result<_, string>;
     surface-size: func(surface: surface-id) -> result<tuple<u32, u32>, string>;
     /// A tab-bar segment; empty text removes it.
     set-status: func(side: status-side, text: string) -> result<_, string>;
     /// A command palette entry; choosing it sends `event::action(name)`.
-    /// `key` suggests a key for it in Normal mode (`alt+g`); it is bound
+    /// `key` suggests a key for it in Normal mode (`alt+g`), or in another
+    /// mode as `MODE:KEY` (`pane:e`); it is bound
     /// only if the user has not bound that key. The user can bind the
     /// action to any key as `plugin:ID:NAME`.
     register-action: func(name: string, key: option<string>) -> result<_, string>;

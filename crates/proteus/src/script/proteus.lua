@@ -8,6 +8,7 @@
 ---@field title string What the tab bar shows.
 ---@field name string? Set by the user.
 ---@field cwd string? Working directory.
+---@field remote string? Host of the cwd (OSC 7) when it is not this machine.
 ---@field process string? Foreground program (the shell when idle).
 ---@field command string? Command line of the running command (shell integration).
 ---@field window integer

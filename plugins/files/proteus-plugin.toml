@@ -1,0 +1,15 @@
+[plugin]
+id = "proteus.files"
+name = "Files"
+version = "0.1.0"
+api = "1"
+description = "File manager: a sidebar that follows the focused pane, a pane with Miller columns, and a path picker."
+wasm = "target/wasm32-wasip2/release/proteus_files.wasm"
+
+[permissions]
+ui = true
+read-panes = true
+write-pty = true
+clipboard-write = true
+fs = ["~:rw", "/:r"]
+run-command = ["git", "zoxide"]

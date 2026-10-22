@@ -17,13 +17,14 @@ One plugin, three surfaces (all from the plugin UI API):
 
 | Surface | Open with | Behaviour |
 |---|---|---|
-| Sidebar | `Ctrl+g e` / palette | Docked left or right, toggles, follows focused pane's cwd |
-| Pane | `Ctrl+g p e` / layout | Full pane, like running yazi |
-| Picker | `Ctrl+g f` / palette | Floating popup; Enter inserts the selected path(s) into the focused pane's prompt and closes |
+| Sidebar | `Alt+e` / palette | Docked left or right, toggles, follows focused pane's cwd |
+| Pane | `E` in Pane mode / layout | Full pane, like running yazi |
+| Picker | `Alt+p` / palette | Floating popup; Enter inserts the selected path(s) into the focused pane's prompt and closes |
 
 ## Navigation & view
 
 - Views: Miller columns (default in pane), tree (default in sidebar), list. Configurable per surface.
+- Keys of this build: `w` cycles the view; `,` then `n`/`m`/`s`/`e` sorts by name/mtime/size/extension, `,d` toggles dirs first, `,r` reverses; `F` toggles follow (sidebar); `R` reloads; `q` closes; Esc clears the filter, then the marks, then returns to the pane.
 - Vim keys: `hjkl`, `gg`/`G`, `/` fuzzy filter, `z` jump (zoxide integration if installed), `~` home, `-` parent, `.` toggle hidden.
 - Bookmarks: `m<key>` set, `'<key>` jump; stored in plugin data dir.
 - Sorting: name (natural), mtime, size, extension; dirs first toggle.
@@ -37,7 +38,7 @@ Shown in the last column (pane) or a floating preview (sidebar, toggle `p`).
 | Type | Method |
 |---|---|
 | Text / code | Syntax highlighting in-plugin (`syntect` compiled to WASM), first N KB |
-| Images (png, jpeg, gif, webp, svg) | Host `image.decode` + `ui.image` placement (doc 04 layer) |
+| Images (png, jpeg, gif, webp, svg) | Decoded in-plugin (`image`, `resvg`), `load-image` + frame placement (doc 04 layer) |
 | Video | First frame via `ffmpegthumbnailer` (if installed, `run-command` permission) or freedesktop thumbnail cache |
 | PDF | `pdftoppm` first page, if installed |
 | Archives | Listing via `bsdtar -tf` / `unzip -l`, if installed |
@@ -75,12 +76,12 @@ Shown in the last column (pane) or a floating preview (sidebar, toggle `p`).
 
 ## Required plugin APIs (must be in doc 05 v1)
 
-- UI: sidebar, pane, floating surfaces; styled cell rendering; image placement; key/mouse input; drag-and-drop source.
+- UI: sidebar, pane, floating surfaces; styled cell rendering; image placement; key/mouse input; drag-and-drop source (`start-drag`, onto panes).
 - Events: `cwd_changed`, `focus_changed`, `block_state_changed`, `config_changed`.
-- Panes: query focused pane (cwd, host, at-prompt), `send_text`, `insert_text`, open command in split/tab/float.
+- Panes: query focused pane (cwd, host via `pane-remote`, at-prompt via `read-blocks`), `send_text`, `insert_text`, open command in split/tab/float.
 - Filesystem: read/write within granted paths, `fs.watch` (host-side inotify), `fs.trash`, metadata, xattr not required.
 - Processes: `run-command` with allowlisted binaries (`git`, `ffmpegthumbnailer`, `pdftoppm`, `bsdtar`, `file`, `zoxide`).
-- Host services: `image.decode`, `xdg.open`, `clipboard.write`, `notify`, background tasks with progress reporting.
+- Host services: `load-image` (pixels decoded by the plugin), `open`, `clipboard.write`, `notify`, background tasks with progress reporting.
 
 ## Permissions requested
 

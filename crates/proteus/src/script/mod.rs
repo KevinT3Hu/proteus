@@ -121,6 +121,8 @@ pub struct PaneInfo {
     /// Set by the user (`pane.rename`, `pane:set_name`).
     pub name: Option<String>,
     pub cwd: Option<String>,
+    /// The cwd's host (OSC 7) when it is not this machine.
+    pub remote: Option<String>,
     /// Foreground program name (the shell when idle).
     pub process: Option<String>,
     /// Command line of the running command block (shell integration).
@@ -655,6 +657,7 @@ fn host_op(host: &mut dyn Host, lua: &Lua, op: &str, args: MultiValue) -> mlua::
             t.set("title", info.title)?;
             t.set("name", info.name)?;
             t.set("cwd", info.cwd)?;
+            t.set("remote", info.remote)?;
             t.set("process", info.process)?;
             t.set("command", info.command)?;
             t.set("window", info.window)?;

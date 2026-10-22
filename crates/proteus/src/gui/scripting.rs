@@ -635,6 +635,7 @@ impl Host for App {
             title: p.title().to_string(),
             name: p.name.clone(),
             cwd: p.cwd(&self.hostname).map(|c| c.display().to_string()),
+            remote: t.cwd().filter(|c| !c.is_local(&self.hostname)).and_then(|c| c.host.clone()),
             process: p.process(),
             command: running.and_then(|b| b.command.clone()),
             window: w.id,

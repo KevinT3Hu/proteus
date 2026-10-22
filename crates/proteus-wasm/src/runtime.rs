@@ -77,6 +77,8 @@ pub enum Call {
     },
     ListPanes,
     GetPane(PaneId),
+    /// Answered with `Reply::Remote`.
+    PaneRemote(PaneId),
     FocusedPane,
     FocusPane(PaneId),
     SendText {
@@ -95,6 +97,7 @@ pub enum Call {
     CloseSurface(SurfaceId),
     FocusSurface(SurfaceId),
     SurfaceSize(SurfaceId),
+    StartDrag(SurfaceId, Vec<String>),
     SetStatus(StatusSide, String),
     /// A palette entry, with a suggested key.
     RegisterAction(String, Option<String>),
@@ -137,6 +140,7 @@ impl Call {
                 | Call::Notify { .. }
                 | Call::Draw(..)
                 | Call::CloseSurface(_)
+                | Call::StartDrag(..)
                 | Call::SetStatus(..)
                 | Call::RegisterAction(..)
                 | Call::LoadImage(..)
@@ -159,6 +163,7 @@ pub enum Reply {
     Pane(Option<PaneInfo>),
     Id(Option<PaneId>),
     Text(String),
+    Remote(Option<String>),
     Blocks(Vec<BlockInfo>),
     Surface(SurfaceId),
     Size(u32, u32),
@@ -483,6 +488,14 @@ impl proteus::plugin::host::Host for State {
         }
     }
 
+    fn pane_remote(&mut self, id: PaneId) -> Result<Option<String>, String> {
+        self.need(self.granted.read_panes, "read-panes")?;
+        match self.rpc(Call::PaneRemote(id))? {
+            Reply::Remote(r) => Ok(r),
+            _ => bad_reply(),
+        }
+    }
+
     fn focused_pane(&mut self) -> Result<Option<PaneId>, String> {
         self.need(self.granted.read_panes, "read-panes")?;
         match self.rpc(Call::FocusedPane)? {
@@ -523,6 +536,14 @@ impl proteus::plugin::host::Host for State {
             Reply::Id(Some(p)) => Ok(p),
             _ => bad_reply(),
         }
+    }
+
+    fn start_drag(&mut self, surface: SurfaceId, paths: Vec<String>) -> Result<(), String> {
+        self.need(self.granted.ui, "ui")?;
+        if paths.len() > 10_000 || paths.iter().map(String::len).sum::<usize>() > 1 << 20 {
+            return Err("start-drag: too many paths".into());
+        }
+        self.rpc(Call::StartDrag(surface, paths)).map(|_| ())
     }
 
     fn open_surface(&mut self, options: SurfaceOptions) -> Result<SurfaceId, String> {
