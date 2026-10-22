@@ -20,6 +20,8 @@ use crate::layout::{Axis, PaneId};
 use crate::modes::Action;
 use crate::spec::Cmd;
 
+mod ui;
+
 /// Index of a registered Lua function (see [`Action::Lua`]).
 pub type FnId = u16;
 
@@ -34,6 +36,7 @@ pub const EVENTS: &[&str] = &[
     "command_finished",
     "bell",
     "config_changed",
+    "block_state_changed",
 ];
 
 /// A callback slower than this is reported (once per function).
@@ -86,6 +89,8 @@ struct Registry {
     next_timer: u32,
     /// Functions already reported as slow.
     slow: HashSet<FnId>,
+    /// `on_event` of `p.ui` surfaces.
+    surfaces: HashMap<u32, FnId>,
 }
 
 impl Registry {
@@ -172,6 +177,21 @@ pub trait Host {
     /// Run an action on the focused pane of the keyboard window.
     fn run_action(&mut self, action: Action);
     fn notify(&mut self, text: String, error: bool, timeout: Option<Duration>);
+    /// `p.ui.open`: a surface like a plugin's; its events come back
+    /// through [`Script::surface_event`].
+    fn ui_open(&mut self, _: proteus_wasm::types::SurfaceOptions) -> Result<u32, String> {
+        Err("surfaces are not available here".into())
+    }
+    fn ui_draw(&mut self, _: u32, _: proteus_wasm::types::Frame) -> Result<(), String> {
+        Err("no such surface".into())
+    }
+    fn ui_close(&mut self, _: u32) {}
+    fn ui_focus(&mut self, _: u32) -> Result<(), String> {
+        Err("no such surface".into())
+    }
+    fn ui_size(&self, _: u32) -> Option<(u32, u32)> {
+        None
+    }
 }
 
 /// A field value of an event.
@@ -315,7 +335,21 @@ impl Script {
                 r.borrow_mut().timers.remove(&id);
                 Ok(())
             })?;
-            let ctor: Function = lua.load(PRELUDE).set_name("=proteus").call((p.clone(), call, start, stop))?;
+            let r = reg.clone();
+            let on_ui = lua.create_function(move |_, (id, f): (u32, Option<Function>)| {
+                let mut r = r.borrow_mut();
+                match f {
+                    Some(f) => {
+                        let fid = r.add(f)?;
+                        r.surfaces.insert(id, fid);
+                    }
+                    None => {
+                        r.surfaces.remove(&id);
+                    }
+                }
+                Ok(())
+            })?;
+            let ctor: Function = lua.load(PRELUDE).set_name("=proteus").call((p.clone(), call, start, stop, on_ui))?;
             let package: Table = lua.globals().get("package")?;
             let loaded: Table = package.get("loaded")?;
             loaded.set("proteus", p)?;
@@ -410,6 +444,24 @@ impl Script {
         }
         self.invoke(host, f, Value::Nil);
         repeat && self.reg.borrow().timers.contains_key(&id)
+    }
+
+    /// An event of a `p.ui` surface. Returns false if the script has no
+    /// such surface.
+    pub fn surface_event(&self, host: &mut dyn Host, id: u32, e: &proteus_wasm::types::UiEvent) -> bool {
+        let closed = matches!(e, proteus_wasm::types::UiEvent::Closed);
+        let f = {
+            let mut r = self.reg.borrow_mut();
+            if closed { r.surfaces.remove(&id) } else { r.surfaces.get(&id).copied() }
+        };
+        let Some(f) = f else { return false };
+        match ui::event(&self.lua, e) {
+            Ok(t) => {
+                self.invoke(host, f, Value::Table(t));
+            }
+            Err(err) => self.message(format!("Lua: {}", clean(&err)), true),
+        }
+        true
     }
 
     /// Text of the left and right status segments for a window whose
@@ -713,6 +765,28 @@ fn host_op(host: &mut dyn Host, lua: &Lua, op: &str, args: MultiValue) -> mlua::
             host.notify(text, error, timeout);
             none()
         }
+        "ui_open" => {
+            let t: Option<Table> = lua.unpack_multi(args)?;
+            let o = ui::options(t)?;
+            host.ui_open(o).map(|id| MultiValue::from_iter([Value::Integer(id as i64)])).map_err(runtime)
+        }
+        "ui_draw" => {
+            let (id, lines, opts): (u32, Table, Option<Table>) = lua.unpack_multi(args)?;
+            host.ui_draw(id, ui::frame(lines, opts)?).map_err(runtime)?;
+            none()
+        }
+        "ui_close" => {
+            host.ui_close(lua.unpack_multi(args)?);
+            none()
+        }
+        "ui_focus" => {
+            host.ui_focus(lua.unpack_multi(args)?).map_err(runtime)?;
+            none()
+        }
+        "ui_size" => match host.ui_size(lua.unpack_multi(args)?) {
+            Some((c, r)) => Ok(MultiValue::from_iter([Value::Integer(c as i64), Value::Integer(r as i64)])),
+            None => none(),
+        },
         _ => Err(runtime(format!("unknown host call `{op}`"))),
     }
 }

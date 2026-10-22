@@ -167,6 +167,7 @@ impl Dispatch2<ZwpTextInputV3, App> for ImeData {
                     app.commit_text(&text);
                 }
                 if changed {
+                    app.surface_preedit();
                     app.mark_dirty();
                     app.scroll_focused_to_bottom();
                 }

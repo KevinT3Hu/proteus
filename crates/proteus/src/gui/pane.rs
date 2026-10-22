@@ -1,5 +1,6 @@
 //! A pane: one terminal emulator attached to one PTY, with a reader thread
-//! that forwards output to the event loop.
+//! that forwards output to the event loop; or a plugin's pane surface,
+//! whose terminal the plugin's frames are painted into.
 
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -26,8 +27,9 @@ pub struct Pane {
     pub cmd: Option<Cmd>,
     /// A layout's `run` command, typed once the shell waits for input.
     pending_run: Option<(String, Instant)>,
-    pub pty: Pty,
-    writer: File,
+    /// None for a plugin's pane.
+    pub pty: Option<Pty>,
+    writer: Option<File>,
     /// Size last sent to the PTY.
     size: WindowSize,
     /// Foreground process name and cwd, used when the app sets no title.
@@ -37,6 +39,12 @@ pub struct Pane {
     pub bell: bool,
     /// Visual bell: tinted until then.
     pub flash_until: Option<Instant>,
+    /// Hidden from plugins that read screens.
+    pub private: bool,
+    /// A plugin's pane: its surface.
+    pub surface: Option<u32>,
+    /// A plugin's pane from a layout (or to save in one): plugin id, args.
+    pub plugin: Option<(String, String)>,
 }
 
 impl Pane {
@@ -74,16 +82,39 @@ impl Pane {
             name: None,
             cmd: None,
             pending_run: None,
-            pty,
-            writer,
+            pty: Some(pty),
+            writer: Some(writer),
             size,
             proc_title: String::new(),
             proc_checked: None,
             bell: false,
             flash_until: None,
+            private: false,
+            surface: None,
+            plugin: None,
         };
         pane.refresh_proc_title();
         Ok(pane)
+    }
+
+    /// A pane showing plugin surface `surface` in `term`.
+    pub fn plugin(term: Terminal, surface: u32, title: String) -> Pane {
+        Pane {
+            term,
+            name: Some(title),
+            cmd: None,
+            pending_run: None,
+            pty: None,
+            writer: None,
+            size: WindowSize::default(),
+            proc_title: String::new(),
+            proc_checked: None,
+            bell: false,
+            flash_until: None,
+            private: false,
+            surface: Some(surface),
+            plugin: None,
+        }
     }
 
     /// Type `line` into the shell as soon as its line editor reads input
@@ -97,7 +128,7 @@ impl Pane {
     /// never leave canonical mode. Returns true while one is still queued.
     pub fn deliver_run(&mut self, timeout: Duration) -> bool {
         let Some((_, since)) = &self.pending_run else { return false };
-        if !self.pty.raw_input() && since.elapsed() < timeout {
+        if self.pty.as_ref().is_some_and(|p| !p.raw_input()) && since.elapsed() < timeout {
             return true;
         }
         if let Some((line, _)) = self.pending_run.take() {
@@ -107,7 +138,9 @@ impl Pane {
     }
 
     pub fn write(&mut self, bytes: &[u8]) {
-        if let Err(e) = self.writer.write_all(bytes) {
+        if let Some(w) = &mut self.writer
+            && let Err(e) = w.write_all(bytes)
+        {
             eprintln!("proteus: write to pty: {e}");
         }
     }
@@ -120,17 +153,21 @@ impl Pane {
             self.term.resize(cols as usize, rows as usize);
         }
         let ws = session::window_size(cols, rows, Some((cell.0 as u16, cell.1 as u16)));
-        if notify && ws != self.size {
+        if notify
+            && ws != self.size
+            && let Some(pty) = &self.pty
+        {
             self.size = ws;
-            let _ = self.pty.resize(ws);
+            let _ = pty.resize(ws);
         }
     }
 
     /// Hang up and collect the exit status, waiting briefly.
     pub fn finish(&mut self) -> i32 {
-        self.pty.hangup();
+        let Some(pty) = &mut self.pty else { return 0 };
+        pty.hangup();
         for _ in 0..50 {
-            if let Ok(Some(st)) = self.pty.try_wait() {
+            if let Ok(Some(st)) = pty.try_wait() {
                 return st.code().unwrap_or(0);
             }
             std::thread::sleep(Duration::from_millis(5));
@@ -149,10 +186,11 @@ impl Pane {
 
     /// Foreground job (not the shell): program name and argv.
     pub fn foreground_command(&self) -> Option<(String, Vec<String>)> {
-        if !self.pty.has_foreground_job() {
+        let pty = self.pty.as_ref()?;
+        if !pty.has_foreground_job() {
             return None;
         }
-        let pid = self.pty.foreground_pgrp()?;
+        let pid = pty.foreground_pgrp()?;
         let proc = std::path::Path::new("/proc").join(pid.to_string());
         let name = std::fs::read_to_string(proc.join("comm")).ok()?.trim_end().to_string();
         let raw = std::fs::read(proc.join("cmdline")).ok()?;
@@ -173,7 +211,7 @@ impl Pane {
             return false;
         }
         self.proc_checked = Some(Instant::now());
-        let Some(fg) = self.pty.foreground_process() else { return false };
+        let Some(fg) = self.pty.as_ref().and_then(|p| p.foreground_process()) else { return false };
         let dir = fg.cwd.as_deref().map(home_relative).unwrap_or_default();
         let title = if dir.is_empty() { fg.name } else { format!("{} {dir}", fg.name) };
         if title != self.proc_title {
@@ -186,10 +224,11 @@ impl Pane {
     /// Name of the foreground program if it is not the shell and not in
     /// `ignore` (closing would kill it).
     pub fn busy(&self, ignore: &[String]) -> Option<String> {
-        if !self.pty.has_foreground_job() {
+        let pty = self.pty.as_ref()?;
+        if !pty.has_foreground_job() {
             return None;
         }
-        let name = self.pty.foreground_process().map(|p| p.name).unwrap_or_else(|| "a program".into());
+        let name = pty.foreground_process().map(|p| p.name).unwrap_or_else(|| "a program".into());
         (!ignore.contains(&name)).then_some(name)
     }
 
@@ -202,7 +241,12 @@ impl Pane {
                 return Some(p);
             }
         }
-        self.pty.foreground_process().and_then(|f| f.cwd)
+        self.pty.as_ref()?.foreground_process().and_then(|f| f.cwd)
+    }
+
+    /// The foreground program's name.
+    pub fn process(&self) -> Option<String> {
+        self.pty.as_ref()?.foreground_process().map(|f| f.name)
     }
 }
 

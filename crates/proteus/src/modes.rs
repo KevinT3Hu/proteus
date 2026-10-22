@@ -371,6 +371,39 @@ pub enum Action {
     ViewImage,
     /// Run a Lua function registered by the config (`p.keymap`).
     Lua(crate::script::FnId),
+    /// Give the keyboard to the next plugin surface (sidebar), then back.
+    FocusSurface,
+    /// Close the plugin surface that has the keyboard.
+    CloseSurface,
+    /// Hide the pane from plugins that read screens, or show it again.
+    TogglePrivate,
+    /// A plugin's palette action, `plugin:ID:NAME` (see [`plugin_action`]).
+    Plugin(u16),
+}
+
+/// Names of plugin actions (`ID:NAME`) seen so far; [`Action::Plugin`]
+/// indexes this. Entries are never removed, so indices stay valid.
+static PLUGIN_ACTIONS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// The action for plugin `id`'s palette entry `name`.
+pub fn plugin_action(id: &str, name: &str) -> Option<Action> {
+    let full = format!("{id}:{name}");
+    let mut v = PLUGIN_ACTIONS.lock().ok()?;
+    let i = match v.iter().position(|a| *a == full) {
+        Some(i) => i,
+        None => {
+            v.push(full);
+            v.len() - 1
+        }
+    };
+    u16::try_from(i).ok().map(Action::Plugin)
+}
+
+/// (plugin id, action name) of a plugin action.
+pub fn plugin_action_name(i: u16) -> Option<(String, String)> {
+    let v = PLUGIN_ACTIONS.lock().ok()?;
+    let (id, name) = v.get(i as usize)?.split_once(':')?;
+    Some((id.to_string(), name.to_string()))
 }
 
 /// Cells per resize step.
@@ -464,6 +497,13 @@ impl Action {
             Action::Hints(h) => format!("hints.{}", h.key()),
             Action::ViewImage => "image.view".into(),
             Action::Lua(n) => format!("lua.{n}"),
+            Action::FocusSurface => "sidebar.focus".into(),
+            Action::CloseSurface => "sidebar.close".into(),
+            Action::TogglePrivate => "pane.toggle_private".into(),
+            Action::Plugin(i) => match plugin_action_name(i) {
+                Some((id, name)) => format!("plugin:{id}:{name}"),
+                None => "plugin:?".into(),
+            },
         }
     }
 
@@ -521,11 +561,14 @@ impl Action {
         v.extend(PARTS.map(Action::BlockSelect));
         v.extend([Action::BlockFold, Action::BlockUnfoldAll, Action::BlockRerun, Action::BlockInfo]);
         v.extend([HintAction::Open, HintAction::Copy, HintAction::Insert].map(Action::Hints));
-        v.push(Action::ViewImage);
+        v.extend([Action::ViewImage, Action::FocusSurface, Action::CloseSurface, Action::TogglePrivate]);
         v
     }
 
     pub fn from_name(s: &str) -> Option<Action> {
+        if let Some((id, name)) = s.strip_prefix("plugin:").and_then(|r| r.split_once(':')) {
+            return (!id.is_empty() && !name.is_empty()).then(|| plugin_action(id, name)).flatten();
+        }
         if let Some(n) = s.strip_prefix("tab.goto_") {
             return n.parse::<u8>().ok().filter(|n| (1..=99).contains(n)).map(|n| Action::GotoTab(n - 1));
         }
@@ -601,7 +644,10 @@ impl Action {
             Action::BlockInfo => "info",
             Action::Hints(_) if mode.passes_keys() => return None,
             Action::Hints(_) => "hints",
-            Action::ViewImage | Action::Lua(_) => return None,
+            Action::ViewImage | Action::Lua(_) | Action::FocusSurface | Action::CloseSurface | Action::Plugin(_) => {
+                return None;
+            }
+            Action::TogglePrivate => "private",
         })
     }
 }
@@ -722,6 +768,8 @@ fn window_keys(t: &mut Table) {
     bind(t, &["ctrl+shift+p"], Action::Palette);
     bind(t, &["ctrl+shift+n"], Action::NewWindow);
     bind(t, &["ctrl+shift+e"], Action::Hints(HintAction::Open));
+    // Plugin sidebars and floats: the keyboard to the next one, then back.
+    bind(t, &["ctrl+shift+b"], Action::FocusSurface);
 }
 
 /// tmux's prefix table (in the Menu mode; one key, then back to Normal).
@@ -1080,6 +1128,15 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_focus_in_every_preset() {
+        for preset in [Preset::Zellij, Preset::Leader, Preset::Tmux] {
+            let k = km(preset);
+            let l = k.lookup(Mode::Normal, Key::Char('b'), Mods::CTRL | Mods::SHIFT);
+            assert_eq!(l, Lookup::Do(Action::FocusSurface), "{preset:?}");
+        }
+    }
+
+    #[test]
     fn zellij_preset() {
         let k = km(Preset::Zellij);
         let ch = |c| Key::Char(c);
@@ -1220,5 +1277,9 @@ mod tests {
         assert_eq!(km(Preset::Tmux).key_path(Action::Split(Axis::X)), Some("ctrl+b %".into()));
         assert_eq!(km(Preset::Tmux).key_path(Action::NewWindow), Some("ctrl+shift+n".into()));
         assert_eq!(Action::from_name("nope"), None);
+        let a = Action::from_name("plugin:example.git:Git: status").unwrap();
+        assert_eq!(a.name(), "plugin:example.git:Git: status");
+        assert_eq!(plugin_action("example.git", "Git: status"), Some(a));
+        assert_eq!(Action::from_name("plugin:x"), None);
     }
 }

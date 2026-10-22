@@ -1,0 +1,17 @@
+[package]
+name = "proteus-plugin"
+description = "SDK for Proteus terminal plugins (wasm32-wasip2 components)"
+version = "1.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.97"
+
+[dependencies]
+wit-bindgen = { version = "=0.63.0", default-features = false, features = ["macros", "realloc", "std", "bitflags"] }
+unicode-width = "=0.2.2"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+# Not part of the terminal workspace: built for wasm32-wasip2.
+[workspace]

@@ -45,7 +45,7 @@ p.status.segment("right", function() return os.date("%H:%M") end)
 - Only while `init.lua` runs: `p.config{...}`, `p.keymap(mode, key, action)` (action name, `"none"`/`false`, or a function; `keys.MODE` tables also accept functions).
 - Any time: `p.on(event, f)`, `p.status.segment("left"|"right", f)`, `p.palette.add(name, f)`, `p.after(secs, f)` / `p.every(secs, f)` (return a timer with `:stop()`), `p.version`.
 - In callbacks only (they need the terminal): `p.panes.list/focused/get/new_tab/float`, `p.run_action(name)`, `p.notify(text, { level, timeout })`, and pane objects: fields `id title name cwd process command window tab focused floating cols rows` (read live), methods `split{dir, cmd, cwd}`, `send_text`, `insert_text` (as a paste), `close` (asks if something runs), `focus`, `set_name`, `read_screen{scrollback}`, `read_blocks`, `block_text(id, part)`, `info`, `exists`.
-- Events: `pane_opened`, `pane_closed`, `focus_changed` (`previous`), `cwd_changed`, `title_changed`, `command_started`, `command_finished` (`command`, `exit_code`, `duration`), `bell`, `config_changed`. `theme_changed` comes with themes; `key` and `block_state_changed` with plugin surfaces.
+- Events: `pane_opened`, `pane_closed`, `focus_changed` (`previous`), `cwd_changed`, `title_changed`, `command_started`, `command_finished` (`command`, `exit_code`, `duration`), `bell`, `config_changed`. `block_state_changed` (`block`, `state`). `theme_changed` comes with themes. Surfaces: `p.ui.open` (see Status of v1).
 - Callbacks never run inside an event handler: events are queued and run before the next frame, so a hook can cause more events (at most 1000 calls per pass). Status segments run after events and once a second.
 - Budget: time in the callback itself (not in host calls such as starting a shell) over 5 ms warns once per function; over 2 s the callback is stopped. `init.lua` itself may run 5 s.
 - Errors in callbacks and messages show as toasts in the top right corner (the same error at most once per 30 s) and on stderr.
@@ -83,7 +83,7 @@ network = []
 
 ### Lifecycle
 
-- Install: `proteus plugin install <git-url|path|archive>`, or from the plugin manager UI. Recorded in `$XDG_DATA_HOME/proteus/plugins.lock` with source and hash.
+- Install: `proteus +plugin install <path|archive|git-url>` (also `update`, `list`, `info`, `enable`, `disable`, `revoke`, `remove`; tools take a `+` like `+icat`). Recorded in `$XDG_DATA_HOME/proteus/plugins.lock` with source, sha256 of `plugin.wasm` (checked before every load), enabled flag and granted permissions. Running terminals watch the lock file and start/stop plugins at once. In the terminal, the palette has `plugins: enable/disable/restart NAME`.
 - Enable/disable/update/remove at runtime; state survives reload via plugin data dir.
 - Crash or trap in a plugin: instance stopped, error shown, terminal unaffected; auto-restart up to 3 times.
 - Resource limits per instance: memory (default 256 MiB), fuel/epoch-based CPU interruption for runaway loops.
@@ -107,6 +107,19 @@ network = []
 - Per-plugin revocation in the plugin manager (palette: "Plugins").
 - Panes marked "private" (doc 06) are invisible to `read-screen` for every plugin.
 
+### Status of v1 (M5)
+
+Implemented: `wit/proteus.wit` in `crates/proteus-plugin` (the SDK), host in `crates/proteus-wasm` (wasmtime 50, WASI p2), GUI in `gui/plugins.rs`, example `examples/plugins/pane-list`.
+
+- Each instance runs in its own thread; a call into it may run 5 s (epoch interruption, also used to stop it at once), memory 256 MiB. Traps and timeouts stop the instance and are shown; it is restarted after 1 s, at most 3 times a session. `init` failures are not retried.
+- Permissions: all of the table above. `run-command` lists program names (looked up in `PATH`, run without a shell in their own process group; `run` with a timeout, `spawn-process` streaming stdout/stderr); `network` lists hosts (`*.example.com`, `host:port`; ureq with rustls and the system's certificates, no redirects followed); `secrets` uses the Secret Service (entries tagged with the plugin id). Every plugin has its own `/data` directory (`$XDG_DATA_HOME/proteus/plugin-data/ID`) and a key-value store next to it (`ID.storage.toml`, 1 MiB); `fs` grants are visible at their real paths, with `watch` (inotify), `trash` (freedesktop), `open` and `mime-type`. Time spent in host calls does not count against the 5 s limit.
+- Revoking: `proteus +plugin revoke ID PERMISSION` or the palette (`plugins: revoke PERMISSION from NAME`); `run-command:git` / `network:HOST` take back one entry.
+- Surfaces: `sidebar-left`, `sidebar-right` (take columns from the panes), `float` (centered), `overlay` (below the focused pane's cursor), and `pane-right`, `pane-down`, `tab` (a pane in the layout with no PTY). Layouts may hold plugin panes (`{ plugin = "ID", args = "..." }`); the plugin hears `surface-opened(id, args)` once it runs, and again after a restart (its panes stay while it is stopped). Frames are styled spans plus image placements (`load-image` RGBA, sent to the surface terminal with the kitty protocol); the host writes them into a terminal with control characters of the plugin's text removed, drawn by the pane renderer. Keys reach a focused surface (or a focused plugin pane) unless the mode binds them; `sidebar.focus` (Ctrl+Shift+B in every preset) cycles the keyboard through the window's sidebars and floats, then back to the panes; mouse events have press, release and drag; files dropped from other programs arrive as `drop(paths)`. Input-method text arrives as `text`; while composing, the host draws the preedit at the frame's cursor and sends `preedit(text, cursor)` (none when it ends), so a plugin need only place its cursor.
+- `register-action(name, key)`: the key is bound in normal mode unless the user's keymap uses it. `prompt` and `confirm` use the input line and the bottom prompt (`answered`); tasks show in the status bar and can be cancelled from the palette (`task-cancelled`). `block-state-changed` and `config-changed` events; `clipboard-read/write`.
+- `pane.toggle_private` hides a pane from `read-screen` and block events.
+- SDK helpers: styled text, `fit`/`pad`/`clip`, `List`, `TextInput`, `Tree`, `Table`, `Spinner`, `ScrollView`.
+- Lua: `p.ui.open{ kind, title, cols, rows, focus, pane, on_event }` gives scripts the same surfaces (`s:draw(lines, { cursor, background })`, `s:close()`, `s:focus()`, `s:size()`; lines are strings or lists of span tables; rows and columns 1-based). They close when the config reloads.
+
 ## Host API (WIT, v1)
 
 Grouped interfaces; Lua module `proteus` mirrors the same names.
@@ -114,10 +127,10 @@ Grouped interfaces; Lua module `proteus` mirrors the same names.
 - `events`: subscribe to `pane_opened`, `pane_closed`, `focus_changed`, `cwd_changed`, `command_started`, `command_finished`, `block_state_changed`, `key` (only for the plugin's own surfaces), `theme_changed`, `config_changed`, `timer`.
 - `panes`: list, focused, metadata, `split`, `new_tab`, `float`, `close`, `send_text`, `insert_text`, `read_screen`, `read_blocks`.
 - `ui`: surfaces (see below), `palette.register_action`, `status.register_segment`, `notify`, `prompt` (input dialog), `confirm`.
-- `fs` (beyond WASI): `watch`, `trash`, `xdg_open`, `mime_type`.
-- `image`: `decode`, `place` on a surface.
-- `process`: `run` with allowlist, streaming output.
-- `http`: request/stream (for AI providers; SSE support).
+- `fs` (beyond WASI): `watch`, `trash`, `open`, `mime-type`.
+- `image`: `load-image` (RGBA pixels the plugin decoded, e.g. with the `image` crate), `drop-image`; placed with `frame.images` on a surface.
+- `process`: `run` (with a timeout) and `spawn-process` (streaming output, `process-write`, `process-kill`), allowlisted.
+- `http`: `http` (whole response) and `http-stream` (`http-response`, `http-body`, `http-done` events, for SSE), `http-cancel`.
 - `secrets`: get/set/delete own keys.
 - `tasks`: background task handle with progress, cancel.
 - `storage`: plugin data dir + small key-value store.
@@ -137,5 +150,5 @@ Grouped interfaces; Lua module `proteus` mirrors the same names.
 
 ## Open questions
 
-1. Rendering model: retained cell frames (proposed) vs immediate-mode callback per frame? Retained is simpler for async WASM workers.
+1. ~~Rendering model~~: retained cell frames (decided in M5).
 2. Should Lua be allowed to create UI surfaces too, or only WASM? (Proposed: yes, same `ui` API — useful for small personal widgets.)

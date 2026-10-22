@@ -230,7 +230,7 @@ impl App {
     }
 
     /// Hand `target` to the desktop's default application.
-    fn xdg_open(&mut self, target: &str, dir: Option<&Path>) {
+    pub(super) fn xdg_open(&mut self, target: &str, dir: Option<&Path>) {
         let mut cmd = Command::new("xdg-open");
         cmd.arg(target).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
         if let Some(d) = dir.filter(|d| d.is_dir()) {

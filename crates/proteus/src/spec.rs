@@ -65,6 +65,8 @@ pub struct PaneSpec {
     pub cwd: Option<PathBuf>,
     pub name: Option<String>,
     pub focus: bool,
+    /// A plugin's pane instead of a terminal: plugin id and `args` for it.
+    pub plugin: Option<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -152,7 +154,7 @@ fn boolean(v: &Value, at: &str) -> Result<bool, String> {
     }
 }
 
-const PANE_KEYS: [&str; 5] = ["cmd", "run", "cwd", "name", "focus"];
+const PANE_KEYS: [&str; 7] = ["cmd", "run", "cwd", "name", "focus", "plugin", "args"];
 
 /// Which extra keys a node table may have.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -181,6 +183,7 @@ fn node(t: &Table, at: &str, base: Option<&Path>, kind: Kind) -> Result<NodeSpec
     let mut ratio = None;
     let mut pane = PaneSpec::default();
     let mut pane_keys = false;
+    let mut args = None;
     for pair in t.pairs::<Value, Value>() {
         let (k, v) = pair.map_err(|e| format!("{at}: {e}"))?;
         match k {
@@ -225,7 +228,14 @@ fn node(t: &Table, at: &str, base: Option<&Path>, kind: Kind) -> Result<NodeSpec
                         pane_keys = true;
                         pane.run = Some(string(&v, &key_at)?);
                     }
-                    "plugin" => return Err(format!("{key_at}: plugin panes are not supported yet")),
+                    "plugin" => {
+                        pane_keys = true;
+                        pane.plugin = Some((string(&v, &key_at)?, String::new()));
+                    }
+                    "args" => {
+                        pane_keys = true;
+                        args = Some(string(&v, &key_at)?);
+                    }
                     // Tab keys are read by `tab()`.
                     "name" | "cwd" | "focus" | "zoom" | "floating" | "show_floating" if tab => {}
                     "x" | "y" | "width" | "height" if kind == Kind::Float => {}
@@ -252,6 +262,14 @@ fn node(t: &Table, at: &str, base: Option<&Path>, kind: Kind) -> Result<NodeSpec
         let child_at = format!("{at}[{}]", i + 1);
         let Value::Table(c) = v else { return Err(format!("{child_at}: expected a table")) };
         children.push(node(&c, &child_at, base, Kind::Child)?);
+    }
+    match (&mut pane.plugin, args) {
+        (Some(p), Some(a)) => p.1 = a,
+        (None, Some(_)) => return Err(format!("{at}: `args` belongs to a `plugin` pane")),
+        _ => {}
+    }
+    if pane.plugin.is_some() && (pane.cmd.is_some() || pane.run.is_some()) {
+        return Err(format!("{at}: a `plugin` pane has no `cmd` or `run`"));
     }
     if kind == Kind::Float && !children.is_empty() {
         return Err(format!("{at}: a floating pane cannot be split"));
@@ -469,6 +487,12 @@ fn write_pane_keys(p: &PaneSpec, out: &mut Vec<String>, tab_cwd: Option<&Path>) 
     }
     if let Some(r) = &p.run {
         out.push(format!("run = {}", quote(r)));
+    }
+    if let Some((id, args)) = &p.plugin {
+        out.push(format!("plugin = {}", quote(id)));
+        if !args.is_empty() {
+            out.push(format!("args = {}", quote(args)));
+        }
     }
     if let Some(c) = p.cwd.as_deref().filter(|c| Some(*c) != tab_cwd) {
         out.push(format!("cwd = {}", quote(&path_str(c))));
@@ -735,7 +759,8 @@ mod tests {
             ("return { tabs = { { split = 'diagonal', {}, {} } } }", "tabs[1].split"),
             ("return { tabs = { { split = 'vertical', ratio = 2, {}, {} } } }", "between 0 and 1"),
             ("return { tabs = { { split = 'vertical', {}, { comand = 'x' } } } }", "tabs[1][2]: unknown key `comand`"),
-            ("return { tabs = { { plugin = 'files' } } }", "plugin"),
+            ("return { tabs = { { plugin = 'files', cmd = 'x' } } }", "no `cmd`"),
+            ("return { tabs = { { args = 'x' } } }", "belongs to a `plugin`"),
             ("return { tabz = {} }", "unknown key `tabz`"),
             (
                 "return { tabs = { { split = 'vertical', stacked = true, {}, { split = 'vertical', {}, {} } } } }",

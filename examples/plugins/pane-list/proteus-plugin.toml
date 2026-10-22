@@ -1,0 +1,12 @@
+[plugin]
+id = "example.pane-list"
+name = "Pane list"
+version = "0.1.0"
+api = "1"
+description = "A sidebar listing every pane; a status segment with the pane count."
+# Relative to this file; `proteus +plugin install` copies it.
+wasm = "target/wasm32-wasip2/release/pane_list.wasm"
+
+[permissions]
+ui = true
+read-panes = true

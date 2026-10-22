@@ -95,6 +95,8 @@ enum Item {
     Layout(String),
     /// `p.palette.add` entry.
     Lua(crate::script::FnId),
+    /// A plugin's action (`Some`) or managing a plugin: plugin id.
+    Plugin(String, super::plugins::Pick),
 }
 
 fn recent_path() -> Option<PathBuf> {
@@ -491,6 +493,7 @@ impl App {
         let mut v: Vec<(String, Item)> = Action::all().into_iter().map(|a| (a.name(), Item::Action(a))).collect();
         v.sort_by(|a, b| a.0.cmp(&b.0));
         v.extend(self.sc.palette.iter().map(|(name, f)| (name.clone(), Item::Lua(*f))));
+        v.extend(self.plugin_palette().into_iter().map(|(label, id, a)| (label, Item::Plugin(id, a))));
         for (i, t) in self.w.tabs.iter().enumerate() {
             let title =
                 t.name.clone().unwrap_or_else(|| self.panes.get(&t.focus).map_or("", |p| p.title()).to_string());
@@ -587,6 +590,10 @@ impl App {
                 self.remember(label);
                 self.queue_lua(f);
             }
+            Item::Plugin(id, a) => {
+                self.remember(label.clone());
+                self.plugin_palette_run(&label, &id, a);
+            }
         }
     }
 
@@ -617,6 +624,9 @@ impl App {
             Edit::Changed | Edit::Moved | Edit::Prev | Edit::Next => {}
             Edit::Cancel => {
                 self.w.input = None;
+                if let Purpose::PluginPrompt(n) = purpose {
+                    self.plugin_answer(n, None);
+                }
                 if purpose == Purpose::Search {
                     self.w.search = None;
                 }
@@ -667,6 +677,7 @@ impl App {
             }
             Purpose::SaveLayout if !text.is_empty() => self.save_layout(&text),
             Purpose::LoadLayout if !text.is_empty() => self.load_layout(&text),
+            Purpose::PluginPrompt(n) => self.plugin_answer(n, Some(text)),
             Purpose::SaveLayout | Purpose::LoadLayout | Purpose::Palette => {}
         }
     }

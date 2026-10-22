@@ -8,6 +8,7 @@ mod gui;
 mod icat;
 mod layout;
 mod modes;
+mod plugin_cli;
 mod script;
 mod session;
 mod spec;
@@ -62,6 +63,9 @@ enum Tool {
     /// Show images in the terminal (kitty graphics protocol).
     #[command(name = "+icat")]
     Icat(icat::Icat),
+    /// Install and manage WASM plugins.
+    #[command(name = "+plugin")]
+    Plugin(plugin_cli::Plugin),
 }
 
 /// The config, the file it came from (watched for changes) and its error.
@@ -82,8 +86,10 @@ fn load_config(cli: &Cli) -> (config::Loaded, Option<PathBuf>, Option<String>) {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    if let Some(Tool::Icat(args)) = cli.tool {
-        return ExitCode::from(icat::run(args));
+    match cli.tool {
+        Some(Tool::Icat(args)) => return ExitCode::from(icat::run(args)),
+        Some(Tool::Plugin(args)) => return ExitCode::from(plugin_cli::run(args)),
+        None => {}
     }
     if cli.list_actions {
         for a in modes::Action::all() {
@@ -162,5 +168,11 @@ mod tests {
         // Window options do not mix with tools.
         assert!(Cli::try_parse_from(["proteus", "--no-config", "+icat", "a.png"]).is_err());
         assert!(Cli::try_parse_from(["proteus", "--", "htop"]).unwrap().tool.is_none());
+        let c = Cli::try_parse_from(["proteus", "+plugin", "install", "--yes", "./x"]).unwrap();
+        assert!(matches!(
+            c.tool,
+            Some(Tool::Plugin(plugin_cli::Plugin { cmd: plugin_cli::Cmd::Install { yes: true, .. } }))
+        ));
+        assert!(Cli::try_parse_from(["proteus", "+plugin", "revoke", "a.b"]).is_err());
     }
 }

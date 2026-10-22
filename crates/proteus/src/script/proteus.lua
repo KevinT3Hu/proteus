@@ -56,6 +56,8 @@ function Pane:read_screen(opts) end
 ---@field cwd string?
 ---@field exit_code integer?
 ---@field duration number? Seconds.
+---@field block integer? Block id (for `pane:block_text`).
+---@field state ("prompt"|"input"|"running"|"finished")?
 ---@field state "prompt"|"input"|"running"|"finished"
 
 ---Command blocks (shell integration), oldest first.
@@ -79,6 +81,7 @@ function Pane:block_text(block, part) end
 ---| "command_finished" # { pane, command, exit_code, duration }
 ---| "bell"             # { pane }
 ---| "config_changed"   # {} after a reload
+---| "block_state_changed" # { pane, block, state } a prompt, command or result began
 
 ---@class proteus.EventData
 ---@field name proteus.Event
@@ -109,6 +112,61 @@ function Timer:stop() end
 ---@field graphics { enabled: boolean?, max_image: number?, pane_memory: number?, total_memory: number?, gpu_memory: number?, local_files: boolean? }?
 ---@field hints { alphabet: string?, patterns: { name: string?, regex: string, url: string? }[]? }?
 ---@field keys table? preset, leader, sticky, and per-mode tables of key = action name.
+
+---@alias proteus.Color integer|string A palette index 0-255 or "#rrggbb".
+
+---@class proteus.Span
+---@field [1] string? the text (or `text`)
+---@field text string?
+---@field fg proteus.Color?
+---@field bg proteus.Color?
+---@field link string? opened with Ctrl+click
+---@field bold boolean?
+---@field dim boolean?
+---@field italic boolean?
+---@field underline boolean?
+---@field reverse boolean?
+---@field strike boolean?
+
+---@alias proteus.Line string|proteus.Span|(string|proteus.Span)[]
+
+---@class proteus.UiEvent
+---@field type "key"|"text"|"preedit"|"mouse"|"resize"|"focus"|"close"|"drop"
+---@field key string? key: `a`, `enter`, `escape`, `up`, `page-down`, `f5`, ...
+---@field text string? key, text: what was typed; preedit: the composition (nil: it ended)
+---@field cursor integer? preedit: byte offset of its cursor
+---@field mods { shift: boolean, ctrl: boolean, alt: boolean, logo: boolean }? key, mouse
+---@field repeat boolean? key
+---@field button ("left"|"middle"|"right"|"wheel_up"|"wheel_down")? mouse
+---@field action ("press"|"release"|"drag")? mouse
+---@field col integer? mouse (1-based)
+---@field row integer? mouse (1-based)
+---@field cols integer? resize
+---@field rows integer? resize
+---@field focused boolean? focus
+---@field paths string[]? drop
+
+---@class proteus.SurfaceOpts
+---@field kind ("float"|"sidebar_left"|"sidebar_right"|"overlay"|"pane_right"|"pane_down"|"tab")? default "float"
+---@field title string?
+---@field cols integer? sidebars: width; floats and overlays: width (default 40)
+---@field rows integer? floats and overlays: height (0: 10)
+---@field focus boolean? take the keyboard (default true)
+---@field pane (integer|proteus.Pane)? split or anchor at this pane instead of the focused one
+---@field on_event fun(ev: proteus.UiEvent, s: proteus.Surface)?
+
+---@class proteus.Surface
+---@field id integer
+local Surface = {}
+---Show `lines` (rows from the top).
+---@param lines proteus.Line[]
+---@param opts { cursor: integer[]?, background: proteus.Color? }? cursor = { col, row } (1-based)
+function Surface:draw(lines, opts) end
+function Surface:close() end
+function Surface:focus() end
+---@return integer? cols
+---@return integer? rows
+function Surface:size() end
 
 ---@alias proteus.Mode "normal"|"locked"|"menu"|"pane"|"tab"|"resize"|"move"|"scroll"|"session"
 
@@ -180,5 +238,12 @@ p.palette = {}
 ---@param name string
 ---@param f fun(ctx: proteus.Ctx)
 function p.palette.add(name, f) end
+
+p.ui = {}
+---A surface drawn like a plugin's (only in callbacks). Draw it on its
+---first `resize` event; it closes when the config reloads.
+---@param opts proteus.SurfaceOpts?
+---@return proteus.Surface
+function p.ui.open(opts) end
 
 return p

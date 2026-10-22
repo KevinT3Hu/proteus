@@ -17,6 +17,8 @@ pub enum Purpose {
     LoadLayout,
     /// Run an action by name.
     Palette,
+    /// A plugin's question (`Plugins::asks`).
+    PluginPrompt(u64),
 }
 
 impl Purpose {
@@ -28,6 +30,7 @@ impl Purpose {
             Purpose::SaveLayout => "SAVE LAYOUT",
             Purpose::LoadLayout => "LOAD LAYOUT",
             Purpose::Palette => "ACTION",
+            Purpose::PluginPrompt(_) => "PLUGIN",
         }
     }
 }

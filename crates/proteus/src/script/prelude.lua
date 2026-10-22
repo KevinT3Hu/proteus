@@ -1,6 +1,6 @@
 -- The Lua half of the `proteus` module (see script/mod.rs). `p` is the
 -- module table; `call(op, ...)` reaches the terminal while a callback runs.
-local p, call, start_timer, stop_timer = ...
+local p, call, start_timer, stop_timer, on_ui = ...
 
 local Pane = {}
 local methods = {}
@@ -118,5 +118,41 @@ end
 function p.every(secs, f)
   return setmetatable({ id = start_timer(secs, f, true) }, Timer)
 end
+
+local Surface = {}
+Surface.__index = Surface
+Surface.__tostring = function(self)
+  return "surface " .. tostring(self.id)
+end
+
+--- Show `lines` (strings, or lists of spans).
+function Surface:draw(lines, opts)
+  call("ui_draw", self.id, lines, opts)
+end
+function Surface:close()
+  call("ui_close", self.id)
+  on_ui(self.id, nil)
+end
+function Surface:focus()
+  call("ui_focus", self.id)
+end
+--- Columns and rows (nil once it is gone).
+function Surface:size()
+  return call("ui_size", self.id)
+end
+
+p.ui = {
+  open = function(opts)
+    opts = opts or {}
+    local s = setmetatable({ id = call("ui_open", opts) }, Surface)
+    local f = opts.on_event
+    if f ~= nil then
+      on_ui(s.id, function(ev)
+        return f(ev, s)
+      end)
+    end
+    return s
+  end,
+}
 
 return pane

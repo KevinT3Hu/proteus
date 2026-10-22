@@ -64,6 +64,8 @@ pub(super) enum ScriptCall {
     Event(ScriptEvent),
     /// Timer `id` of script generation `gen` went off.
     Timer(u32, u32),
+    /// An event of a `p.ui` surface.
+    Ui(u32, proteus_wasm::types::UiEvent),
 }
 
 /// A message in the top right corner of a window.
@@ -104,6 +106,7 @@ impl App {
     /// Queue an event for its hooks.
     pub(super) fn emit(&mut self, ev: ScriptEvent) {
         self.sc.segments_due = true;
+        self.plugins_event(&ev);
         if self.sc.hooks.contains(&ev.name) {
             self.sc.queue.push_back(ScriptCall::Event(ev));
         }
@@ -119,8 +122,10 @@ impl App {
     pub(super) fn install_script(&mut self, script: Script) {
         self.sc.generation += 1;
         self.sc.timers.clear();
-        // Calls into the old script's functions lapse with it.
+        // Calls into the old script's functions lapse with it, and so do
+        // its surfaces.
         self.sc.queue.retain(|c| matches!(c, ScriptCall::Event(_)));
+        self.drop_lua_surfaces();
         self.sc.has_segments = script.has_segments();
         self.sc.segments_due = true;
         self.sc.script = Some(script);
@@ -204,6 +209,9 @@ impl App {
                     }
                 }
                 ScriptCall::Timer(..) => {}
+                ScriptCall::Ui(id, e) => {
+                    script.surface_event(self, id, &e);
+                }
             }
             self.activate_kbd();
         }
@@ -312,8 +320,17 @@ impl App {
 
     /// Labels of the status segments in the tab bar: left ones after the
     /// tabs, right ones at the end.
+    /// Status segments of scripts and plugins: left, right.
+    pub(super) fn status_all(&self) -> (Vec<String>, Vec<String>) {
+        let (mut l, mut r) = self.w.status.clone();
+        let (pl, pr) = self.plugin_status();
+        l.extend(pl);
+        r.extend(pr);
+        (l, r)
+    }
+
     pub(super) fn status_labels(&self, tabs: &[render::Label], theme: &render::Theme) -> Vec<render::Label> {
-        let (left, right) = &self.w.status;
+        let (left, right) = &self.status_all();
         let mut out = Vec::new();
         let (pw, _) = self.physical();
         let p = self.pad() as f32;
@@ -352,7 +369,7 @@ impl App {
 
     /// Columns of the tab bar taken by the right status segments.
     pub(super) fn status_cols(&self, cols: usize) -> usize {
-        let w = super::chrome::text_width(&self.w.status.1.join("  ")).min(cols / 2);
+        let w = super::chrome::text_width(&self.status_all().1.join("  ")).min(cols / 2);
         if w > 0 { w + 2 } else { 0 }
     }
 
@@ -399,6 +416,37 @@ impl App {
         });
     }
 
+    /// Watch one directory; `then` runs (debounced) when a file whose name
+    /// passes `filter` is written, moved in or out, or deleted.
+    pub(super) fn watch_dir(&mut self, dir: &Path, filter: fn(&str) -> bool, then: fn(&mut App)) {
+        use rustix::fs::inotify;
+        let Ok(fd) = inotify::init(inotify::CreateFlags::CLOEXEC | inotify::CreateFlags::NONBLOCK) else { return };
+        let flags = inotify::WatchFlags::CLOSE_WRITE
+            | inotify::WatchFlags::MOVED_TO
+            | inotify::WatchFlags::MOVED_FROM
+            | inotify::WatchFlags::DELETE;
+        if inotify::add_watch(&fd, dir, flags).is_err() {
+            return;
+        }
+        let pending: std::rc::Rc<std::cell::Cell<Option<Instant>>> = Default::default();
+        let source = Generic::new(fd, Interest::READ, PollMode::Level);
+        let _ = self.handle.insert_source(source, move |_, fd, app: &mut App| {
+            if drain_inotify_names(fd.as_fd()).iter().any(|n| filter(n)) {
+                let at = Instant::now() + RELOAD_DELAY;
+                pending.set(Some(at));
+                let pending = pending.clone();
+                let _ = app.handle.insert_source(Timer::from_deadline(at), move |_, _, app: &mut App| {
+                    if pending.get() == Some(at) {
+                        pending.set(None);
+                        then(app);
+                    }
+                    TimeoutAction::Drop
+                });
+            }
+            Ok(PostAction::Continue)
+        });
+    }
+
     fn schedule_reload(&mut self) {
         let at = Instant::now() + RELOAD_DELAY;
         self.sc.reload_at = Some(at);
@@ -434,6 +482,8 @@ impl App {
     fn apply_config(&mut self, new: Config) {
         let old = std::mem::replace(&mut self.cfg, new);
         self.keymap = self.cfg.keymap();
+        self.apply_plugin_keys();
+        self.plugins_config_changed();
         self.hint_patterns = super::hint::patterns(&self.cfg.hint_patterns);
         let font_changed = old.font_family != self.cfg.font_family || old.font_size != self.cfg.font_size;
         for id in self.window_ids() {
@@ -467,7 +517,7 @@ impl App {
     // --- host helpers ----------------------------------------------------------------
 
     /// Make pane `id` the focused pane of its tab, and that tab active.
-    fn focus_in_place(&mut self, id: PaneId) -> bool {
+    pub(super) fn focus_in_place(&mut self, id: PaneId) -> bool {
         if !self.activate_pane(id) {
             return false;
         }
@@ -542,6 +592,18 @@ fn drain_inotify(fd: std::os::fd::BorrowedFd<'_>) -> bool {
     relevant
 }
 
+/// Names of the files in pending inotify events.
+fn drain_inotify_names(fd: std::os::fd::BorrowedFd<'_>) -> Vec<String> {
+    use rustix::fs::inotify;
+    let mut buf = [std::mem::MaybeUninit::<u8>::uninit(); 4096];
+    let mut reader = inotify::Reader::new(fd, &mut buf);
+    let mut names = Vec::new();
+    while let Ok(ev) = reader.next() {
+        names.push(ev.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+    }
+    names
+}
+
 fn block_state(s: BlockState) -> &'static str {
     match s {
         BlockState::Prompt => "prompt",
@@ -573,7 +635,7 @@ impl Host for App {
             title: p.title().to_string(),
             name: p.name.clone(),
             cwd: p.cwd(&self.hostname).map(|c| c.display().to_string()),
-            process: p.pty.foreground_process().map(|f| f.name),
+            process: p.process(),
             command: running.and_then(|b| b.command.clone()),
             window: w.id,
             tab: tab + 1,
@@ -680,6 +742,26 @@ impl Host for App {
         // Messages from scripts are shown every time.
         self.sc.shown.remove(&text);
         self.toast(text, error, timeout);
+    }
+
+    fn ui_open(&mut self, o: proteus_wasm::types::SurfaceOptions) -> Result<u32, String> {
+        self.lua_surface_open(o)
+    }
+
+    fn ui_draw(&mut self, id: u32, frame: proteus_wasm::types::Frame) -> Result<(), String> {
+        self.lua_surface_draw(id, frame)
+    }
+
+    fn ui_close(&mut self, id: u32) {
+        self.lua_surface_close(id);
+    }
+
+    fn ui_focus(&mut self, id: u32) -> Result<(), String> {
+        self.lua_surface_focus(id)
+    }
+
+    fn ui_size(&self, id: u32) -> Option<(u32, u32)> {
+        self.lua_surface_size(id)
     }
 }
 

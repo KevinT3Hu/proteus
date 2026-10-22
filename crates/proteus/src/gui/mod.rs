@@ -15,6 +15,7 @@ mod ime;
 mod keys;
 mod notify;
 mod pane;
+mod plugins;
 mod render;
 mod rows;
 mod scripting;
@@ -126,6 +127,8 @@ pub(crate) enum ClipTarget {
     Paste(PaneId),
     /// Answer an approved OSC 52 read from a pane.
     Osc52(PaneId, ClipboardKind, Terminator),
+    /// A plugin's `clipboard-read` (its waiting answer).
+    Plugin(u64),
 }
 
 /// A question (or notice) shown at the bottom of the window. While one is
@@ -141,6 +144,8 @@ enum Prompt {
     Quit(String),
     /// Restore the session saved before an unclean exit.
     Restore(LayoutSpec),
+    /// A plugin's yes/no question (`Plugins::asks`).
+    PluginConfirm(u64, String),
 }
 
 pub(crate) enum Msg {
@@ -152,6 +157,10 @@ pub(crate) enum Msg {
     NotifyActivated(PaneId, Option<String>),
     /// Images of this pane finished decoding in the background.
     ImagesDecoded(PaneId),
+    /// A plugin called the host, started, stopped or failed.
+    Plugin(proteus_wasm::Key, proteus_wasm::FromPlugin),
+    /// A `text/uri-list` dropped on a plugin surface.
+    Dropped(u32, String),
 }
 
 /// Lets wgpu's GL backend reach the Wayland display.
@@ -254,6 +263,8 @@ enum Drag {
 /// One pane of a frame, without borrows (see [`FrameParts`]).
 struct PanePart {
     id: PaneId,
+    /// A plugin surface instead of pane `id`.
+    surface: Option<u32>,
     x: f32,
     y: f32,
     focused: bool,
@@ -274,15 +285,45 @@ struct FrameParts {
     info: FrameInfo<'static>,
 }
 
+impl PanePart {
+    /// A plugin surface drawn like a pane.
+    fn surface(id: u32, r: Rect, focused: bool, term: &proteus_core::Terminal) -> PanePart {
+        PanePart {
+            id: 0,
+            surface: Some(id),
+            x: r.x as f32,
+            y: r.y as f32,
+            focused,
+            preedit: None,
+            copy_cursor: None,
+            marks: Vec::new(),
+            skip: 0,
+            floating: false,
+            backdrop: Vec::new(),
+            labels: Vec::new(),
+            rows: rows::Rows::of(term),
+            flash: false,
+        }
+    }
+}
+
 impl FrameParts {
-    fn resolve<'a>(self, panes: &'a HashMap<PaneId, Pane>) -> FrameInfo<'a> {
+    fn resolve<'a>(
+        self,
+        panes: &'a HashMap<PaneId, Pane>,
+        surfaces: &'a std::collections::BTreeMap<u32, plugins::Surface>,
+    ) -> FrameInfo<'a> {
         let mut info: FrameInfo<'a> = self.info;
         info.panes = self
             .panes
             .into_iter()
             .filter_map(|p| {
+                let term = match p.surface {
+                    Some(s) => &surfaces.get(&s)?.term,
+                    None => &panes.get(&p.id)?.term,
+                };
                 Some(PaneFrame {
-                    term: &panes.get(&p.id)?.term,
+                    term,
                     x: p.x,
                     y: p.y,
                     focused: p.focused,
@@ -351,6 +392,10 @@ struct Win {
     toasts: Vec<scripting::Toast>,
     /// Status segments from scripts: left and right of the tab bar.
     status: (Vec<String>, Vec<String>),
+    /// A plugin surface has the keyboard.
+    surface_focus: Option<u32>,
+    /// A button pressed on a surface: drags and the release go to it.
+    surface_drag: Option<(u32, proteus_wasm::types::MouseButton, (u32, u32))>,
 }
 
 /// A tab being dragged to another window (Wayland drag and drop).
@@ -411,6 +456,8 @@ struct App {
     /// The timer delivering layouts' `run` lines is active.
     run_timer: bool,
     tab_dnd: Option<TabDnd>,
+    /// Files from another program dragged over a window: where.
+    file_dnd: Option<(WinId, (f64, f64))>,
     notifier: notify::Notifier,
     activation: Option<ActivationState>,
     hint_patterns: Vec<proteus_core::hints::HintPattern>,
@@ -437,6 +484,8 @@ struct App {
     exit: bool,
     /// Lua: the config's script, its queued calls, reloading.
     sc: scripting::Scripting,
+    /// WASM plugins and their surfaces.
+    pl: plugins::Plugins,
 }
 
 /// Wayland and GPU objects of a new window.
@@ -519,6 +568,8 @@ fn make_win(
         viewer: None,
         toasts: Vec::new(),
         status: Default::default(),
+        surface_focus: None,
+        surface_drag: None,
     })
 }
 
@@ -579,6 +630,8 @@ pub fn run(
             channel::Event::Msg(Msg::Clipboard(target, text)) => app.clipboard_received(target, text),
             channel::Event::Msg(Msg::NotifyActivated(pane, token)) => app.notification_clicked(pane, token),
             channel::Event::Msg(Msg::ImagesDecoded(id)) => app.pty_output(id, &[]),
+            channel::Event::Msg(Msg::Plugin(key, m)) => app.plugin_msg(key, m),
+            channel::Event::Msg(Msg::Dropped(s, list)) => app.surface_dropped(s, &list),
             channel::Event::Closed => app.exit = true,
         })
         .map_err(|e| err(e.to_string()))?;
@@ -623,6 +676,7 @@ pub fn run(
         quit_requested: false,
         run_timer: false,
         tab_dnd: None,
+        file_dnd: None,
         notifier,
         activation,
         hint_patterns,
@@ -642,11 +696,13 @@ pub fn run(
         primary: None,
         exit: false,
         sc: scripting::Scripting::default(),
+        pl: plugins::Plugins::default(),
     };
     app.sc.config_path = config_path;
     app.sc.overrides = overrides;
     app.install_script(script);
     app.watch_config();
+    app.plugins_init();
     if let Some(e) = config_error {
         app.toast(format!("config error (using the defaults): {e}"), true, Some(Duration::from_secs(15)));
     }
@@ -716,10 +772,10 @@ pub fn run(
     app.finish_session();
     // A single remaining session reports its exit status, as before.
     if app.panes.len() == 1
-        && let Some(p) = app.panes.values_mut().next()
+        && let Some(pty) = app.panes.values_mut().next().and_then(|p| p.pty.as_mut())
     {
-        p.pty.hangup();
-        app.exit_code = p.pty.wait()?.code().unwrap_or(0);
+        pty.hangup();
+        app.exit_code = pty.wait()?.code().unwrap_or(0);
     }
     let code = app.exit_code;
     drop(app);
@@ -848,13 +904,15 @@ impl App {
                 None => (pre.clone(), Some((pre.len(), pre.len()))),
             };
             let fid = self.focused_id();
-            for p in parts.panes.iter_mut().filter(|p| p.id == fid) {
+            let sf = self.w.surface_focus;
+            let target = |p: &PanePart| if sf.is_some() { p.surface == sf } else { p.id == fid && p.surface.is_none() };
+            for p in parts.panes.iter_mut().filter(|p| target(p)) {
                 p.focused = true;
                 p.preedit = Some(ime::Preedit { text: text.clone(), cursor });
             }
         }
         let area = self.viewer_area();
-        let mut info = parts.resolve(&self.panes);
+        let mut info = parts.resolve(&self.panes, &self.pl.surfaces);
         info.viewer = self.w.viewer.as_ref().map(|v| v.frame(area));
         let (w, h, px) = self.w.renderer.snapshot(&mut self.w.fonts, &info);
         drop(info);
@@ -903,7 +961,10 @@ impl App {
         match self.cfg.tab_bar {
             TabBar::Always => true,
             TabBar::Never => false,
-            TabBar::Auto => self.w.tabs.len() > 1 || !self.w.status.0.is_empty() || !self.w.status.1.is_empty(),
+            TabBar::Auto => {
+                let (l, r) = self.status_all();
+                self.w.tabs.len() > 1 || !l.is_empty() || !r.is_empty()
+            }
         }
     }
 
@@ -931,9 +992,11 @@ impl App {
         if self.cfg.hint_bar == HintBar::Always {
             bottom -= ch + p;
         }
-        // The block gutter of the leftmost panes lives in the padding.
-        let left = p.max(self.gutter_px() + 1);
-        Rect::new(left, top, (pw as i32 - left - p).max(1), (bottom - top).max(1))
+        // The block gutter of the leftmost panes lives in the padding (or
+        // the gap after a sidebar).
+        let (sl, sr) = self.sidebar_widths();
+        let left = if sl > 0 { p + sl } else { p.max(self.gutter_px() + 1) };
+        Rect::new(left, top, (pw as i32 - left - p - sr).max(1), (bottom - top).max(1))
     }
 
     /// Visible panes of the active tab.
@@ -978,6 +1041,7 @@ impl App {
                 }
             }
         }
+        self.relayout_surfaces();
         self.w.dirty = true;
     }
 
@@ -1110,8 +1174,10 @@ impl App {
         let skip = self.row_skip(id);
         let mut marks = self.search_marks(id);
         marks.extend(self.hint_marks(id));
+        let focused = focused && self.w.surface_focus.is_none();
         PanePart {
             id,
+            surface: None,
             x: r.x as f32,
             y: r.y as f32,
             focused: focused && self.w.focused,
@@ -1132,6 +1198,7 @@ impl App {
         let p = self.panes.get(&id);
         let t = p.map_or("", |p| p.title());
         let t = if p.is_some_and(|p| p.bell) { format!("• {t}") } else { t.to_string() };
+        let t = if p.is_some_and(|p| p.private) { format!("[private] {t}") } else { t };
         if focused && self.w.mode != Mode::Normal { format!(" {t}  [{}]", self.w.mode.name()) } else { format!(" {t}") }
     }
 
@@ -1207,6 +1274,12 @@ impl App {
             });
         }
 
+        // Plugin sidebars (with the tiled panes) and floats (over everything).
+        let (surface_tiled, surface_floats, surface_rects, surface_labels) = self.surface_parts(&theme);
+        panes.extend(surface_tiled);
+        tiled_rects.extend(surface_rects);
+        tiled_labels.extend(surface_labels);
+
         // Floating panes, each with its frame.
         for f in &view.floats {
             let on = f.id == fid;
@@ -1237,6 +1310,7 @@ impl App {
             panes.push(part);
         }
 
+        panes.extend(surface_floats);
         let mut rects = Vec::new();
         let mut labels = Vec::new();
         if self.tab_bar_visible() {
@@ -1341,6 +1415,9 @@ impl App {
         if self.w.input.is_some() {
             return self.input_text(text);
         }
+        if let Some(s) = self.key_surface() {
+            return self.surface_ui(s, proteus_wasm::types::UiEvent::Text(text.to_string()));
+        }
         let p = self.focused_pane_mut();
         p.term.scroll_to_bottom();
         p.write(text.as_bytes());
@@ -1353,11 +1430,19 @@ impl App {
     /// Tell the input method where the cursor (or the preedit cursor) is.
     pub(crate) fn update_ime_rect(&mut self) {
         let (cw, ch) = self.cell();
-        let Some(r) = self.view().rect(self.focused_id()) else { return };
-        let t = &self.focused_pane().term;
-        let (cols, x) = (t.cols(), t.cursor().x);
-        let skip = self.row_skip(self.focused_id());
-        let y = rows::Rows::of(t).row_of(t.grid().abs_line(t.cursor().y)).unwrap_or(t.cursor().y).saturating_sub(skip);
+        let (r, cols, x, y) = match self.surface_ime_spot() {
+            Some((r, cols, (x, y))) => (r, cols, x, y),
+            None => {
+                let Some(r) = self.view().rect(self.focused_id()) else { return };
+                let t = &self.focused_pane().term;
+                let skip = self.row_skip(self.focused_id());
+                let y = rows::Rows::of(t)
+                    .row_of(t.grid().abs_line(t.cursor().y))
+                    .unwrap_or(t.cursor().y)
+                    .saturating_sub(skip);
+                (r, t.cols(), t.cursor().x, y)
+            }
+        };
         let s = self.w.scale;
         let Some(ime) = self.ime.as_mut() else { return };
         let col = match &ime.preedit {
@@ -1438,7 +1523,7 @@ impl App {
         let surface = self.w.window.wl_surface().clone();
         surface.frame(&self.qh, FrameCallbackData(surface.clone()));
         let area = self.viewer_area();
-        let mut info = self.frame_parts().resolve(&self.panes);
+        let mut info = self.frame_parts().resolve(&self.panes, &self.pl.surfaces);
         info.viewer = self.w.viewer.as_ref().map(|v| v.frame(area));
         let ok = self.w.renderer.draw(&mut self.w.fonts, &info);
         drop(info);
@@ -1516,11 +1601,25 @@ impl App {
         cwd: Option<PathBuf>,
         command: Option<Vec<OsString>>,
     ) -> Result<PaneId, String> {
-        let (area, m) = (self.area(), self.layout_metrics());
         let tab = &self.w.tabs[self.w.active];
         if axis.is_none() && tab.focus_is_float() && command.is_none() {
             return self.new_floating_with(cwd, None);
         }
+        let cwd = cwd.or_else(|| self.focused_pane().cwd(&self.hostname));
+        self.split_new(axis, move |app, c, r| {
+            app.spawn_pane(c, r, cwd, command).map_err(|e| format!("cannot start shell: {e}"))
+        })
+    }
+
+    /// Split the last tiled pane of the tab with a pane `make` creates for
+    /// a size in cells.
+    fn split_new(
+        &mut self,
+        axis: Option<Axis>,
+        make: impl FnOnce(&mut App, u16, u16) -> Result<PaneId, String>,
+    ) -> Result<PaneId, String> {
+        let (area, m) = (self.area(), self.layout_metrics());
+        let tab = &self.w.tabs[self.w.active];
         let id = tab.last_tiled;
         let Some(r) = tab.full_layout(area, m).rect(id) else { return Err("no pane to split".into()) };
         let (cols, rows) = (r.w / m.cell_w, r.h / m.cell_h);
@@ -1533,17 +1632,12 @@ impl App {
             Axis::X => (cols / 2, rows),
             Axis::Y => (cols, rows / 2),
         };
-        let cwd = cwd.or_else(|| self.focused_pane().cwd(&self.hostname));
         let old = self.focused_id();
-        match self.spawn_pane(c as u16, rw as u16, cwd, command) {
-            Ok(new) => {
-                self.w.tabs[self.w.active].split(new, axis);
-                self.relayout();
-                self.after_focus(old);
-                Ok(new)
-            }
-            Err(e) => Err(format!("cannot start shell: {e}")),
-        }
+        let new = make(self, c as u16, rw as u16)?;
+        self.w.tabs[self.w.active].split(new, axis);
+        self.relayout();
+        self.after_focus(old);
+        Ok(new)
     }
 
     fn new_floating(&mut self) {
@@ -1577,21 +1671,27 @@ impl App {
 
     fn new_tab_with(&mut self, cwd: Option<PathBuf>, command: Option<Vec<OsString>>) -> Result<PaneId, String> {
         let cwd = cwd.or_else(|| self.focused_pane().cwd(&self.hostname));
+        self.new_tab_new(move |app, c, r| {
+            app.spawn_pane(c, r, cwd, command).map_err(|e| format!("cannot start shell: {e}"))
+        })
+    }
+
+    /// A new tab after the current one with a pane `make` creates.
+    fn new_tab_new(
+        &mut self,
+        make: impl FnOnce(&mut App, u16, u16) -> Result<PaneId, String>,
+    ) -> Result<PaneId, String> {
         let (cols, rows) = {
             let t = &self.focused_pane().term;
             (t.cols() as u16, t.lines() as u16)
         };
         let old = self.focused_id();
-        match self.spawn_pane(cols, rows, cwd, command) {
-            Ok(id) => {
-                self.w.tabs.insert(self.w.active + 1, Tab::new(id));
-                self.w.active += 1;
-                self.relayout();
-                self.after_focus(old);
-                Ok(id)
-            }
-            Err(e) => Err(format!("cannot start shell: {e}")),
-        }
+        let id = make(self, cols, rows)?;
+        self.w.tabs.insert(self.w.active + 1, Tab::new(id));
+        self.w.active += 1;
+        self.relayout();
+        self.after_focus(old);
+        Ok(id)
     }
 
     /// Next visible pane (tiled in order, then floats), wrapping.
@@ -1769,7 +1869,8 @@ impl App {
     /// program.
     fn close_pane(&mut self, id: PaneId) {
         if !self.activate_pane(id) {
-            if self.panes.remove(&id).is_some() {
+            if let Some(p) = self.panes.remove(&id) {
+                self.surface_pane_gone(p.surface);
                 self.emit(ScriptEvent::new("pane_closed").pane(id));
             }
             return;
@@ -1791,7 +1892,9 @@ impl App {
             }
             self.w.active = self.w.active.min(self.w.tabs.len().saturating_sub(1));
         }
-        self.panes.remove(&id);
+        if let Some(p) = self.panes.remove(&id) {
+            self.surface_pane_gone(p.surface);
+        }
         self.emit(ScriptEvent::new("pane_closed").pane(id));
         self.w.prompts.retain(|p| match p {
             Prompt::ClipboardRead(p, ..) | Prompt::Paste(p, _) => *p != id,
@@ -1821,6 +1924,7 @@ impl App {
         let new = self.focused_id();
         if new != old {
             self.w.hints = None;
+            self.unfocus_surface();
         }
         if self.w.focused
             && let Some(p) = self.panes.get_mut(&new)
@@ -1992,6 +2096,18 @@ impl App {
             Action::Hints(h) => self.hints_start(h),
             Action::ViewImage => self.view_last_image(),
             Action::Lua(f) => self.queue_lua(f),
+            Action::FocusSurface => self.cycle_surface_focus(),
+            Action::Plugin(i) => self.run_plugin_action(i),
+            Action::CloseSurface => {
+                if let Some(s) = self.w.surface_focus {
+                    self.close_surface(s);
+                }
+            }
+            Action::TogglePrivate => {
+                if let Some(p) = self.panes.get_mut(&old) {
+                    p.private = !p.private;
+                }
+            }
         }
         if !self.exit {
             self.after_focus(old);
@@ -2041,6 +2157,20 @@ impl App {
                     name.strip_prefix("key:").filter(|_| app.w.hints.is_some()).and_then(|k| k.chars().next())
                 {
                     app.hint_key(input::Key::Char(c), input::Mods::empty());
+                    continue;
+                }
+                if let Some(s) = app.w.surface_focus
+                    && let Some(k) = name.strip_prefix("key:")
+                {
+                    let key = match k {
+                        "enter" => input::Key::Enter,
+                        "esc" => input::Key::Escape,
+                        "up" => input::Key::Up,
+                        "down" => input::Key::Down,
+                        _ => input::Key::Char(k.chars().next().unwrap_or(' ')),
+                    };
+                    let text = if k.chars().count() == 1 { k } else { "" };
+                    app.surface_key(s, key, text, false);
                     continue;
                 }
                 if let Some(k) = name.strip_prefix("key:").filter(|_| app.w.viewer.is_some()) {
@@ -2105,6 +2235,9 @@ impl App {
             p.expire_proc_title();
         }
         let mut title = p.refresh_proc_title();
+        let block_changed = events.iter().any(|e| {
+            matches!(e, Event::PromptStarted { .. } | Event::CommandStarted { .. } | Event::CommandFinished { .. })
+        });
         for ev in events {
             match ev {
                 Event::TitleChanged(t) => {
@@ -2144,6 +2277,9 @@ impl App {
                 }
                 _ => {}
             }
+        }
+        if block_changed {
+            self.block_state_changed(id);
         }
         if title {
             self.update_title();
@@ -2258,6 +2394,7 @@ impl App {
                 || self.w.input.is_some()
                 || self.w.hints.is_some()
                 || self.w.viewer.is_some()
+                || self.w.surface_focus.is_some()
                 || !self.w.mode.passes_keys();
             let wants =
                 self.focused_pane().term.keyboard_flags().contains(proteus_core::KeyboardFlags::REPORT_ALL_AS_ESCAPES);
@@ -2345,6 +2482,14 @@ impl App {
             }
         }
         let text = event.utf8.as_deref().unwrap_or("");
+        // Keys not bound in the mode go to a focused plugin surface.
+        if let Some(s) = self.key_surface() {
+            if action != KeyAction::Release {
+                self.consume(event.raw_code);
+                self.surface_key(s, key, text, action == KeyAction::Repeat);
+            }
+            return;
+        }
         let ev = input::KeyEvent { key: pane_key, mods, action, text, shifted };
         let p = self.focused_pane_mut();
         if let Some(bytes) = input::encode_key(&ev, p.term.mode(), p.term.keyboard_flags()) {
@@ -2445,10 +2590,14 @@ impl App {
     }
 
     fn clipboard_received(&mut self, target: ClipTarget, text: String) {
-        let (ClipTarget::Paste(id) | ClipTarget::Osc52(id, ..)) = target;
+        let id = match target {
+            ClipTarget::Paste(id) | ClipTarget::Osc52(id, ..) => id,
+            ClipTarget::Plugin(n) => return self.plugin_clipboard(n, text),
+        };
         self.activate_pane(id);
         match target {
             ClipTarget::Paste(id) => self.paste_text(id, text),
+            ClipTarget::Plugin(_) => {}
             ClipTarget::Osc52(id, kind, terminator) => {
                 let Some(p) = self.panes.get_mut(&id) else { return };
                 p.term.respond_clipboard(kind, &text, terminator);
@@ -2534,6 +2683,12 @@ impl App {
                 _ if yes => self.restore(&spec),
                 _ if no => {}
                 _ => self.w.prompts.push_front(Prompt::Restore(spec)),
+            },
+            Prompt::PluginConfirm(n, q) => match key {
+                Key::Enter => self.plugin_answer(n, Some("yes".into())),
+                _ if yes => self.plugin_answer(n, Some("yes".into())),
+                _ if no => self.plugin_answer(n, None),
+                _ => self.w.prompts.push_front(Prompt::PluginConfirm(n, q)),
             },
             Prompt::Notice(_) => {}
         }
@@ -2648,6 +2803,9 @@ impl App {
                     self.drag_to(ev.position);
                     return;
                 }
+                if self.surface_motion(ev.position) {
+                    return;
+                }
                 self.update_hover(Some(ev.position));
                 self.update_pointer_icon();
                 if let Some(id) = self.w.mouse.selecting {
@@ -2698,6 +2856,12 @@ impl App {
                     }
                     return;
                 }
+                if let Some((s, cell)) = self.surface_at(ev.position) {
+                    if let Some(pb) = surface_button(b) {
+                        self.surface_press(s, cell, pb);
+                    }
+                    return;
+                }
                 if b == MouseButton::Left
                     && let Some(d) = self.divider_at(ev.position)
                 {
@@ -2733,6 +2897,7 @@ impl App {
                     self.w.tabs[self.w.active].set_focus(id);
                     self.after_focus(old);
                 }
+                self.unfocus_surface();
                 match part {
                     layout::Part::Content => {}
                     layout::Part::Title => {
@@ -2752,6 +2917,13 @@ impl App {
                     }
                     layout::Part::FloatFrame | layout::Part::FloatCorner => return,
                 }
+                if let Some(s) = self.panes.get(&id).and_then(|p| p.surface)
+                    && let Some(pb) = surface_button(b)
+                {
+                    let cell = self.cell_in(id, ev.position).map(|(c, r, _)| (c as u32, r as u32));
+                    self.surface_press(s, cell, pb);
+                    return;
+                }
                 if self.mouse_reporting(id) && self.report_mouse(id, MouseAction::Press, Some(b)) {
                     self.w.mouse.reported = Some((id, b));
                     return;
@@ -2763,6 +2935,9 @@ impl App {
                 }
             }
             PointerEventKind::Release { button, .. } => {
+                if self.surface_release(ev.position) {
+                    return;
+                }
                 if button == BTN_LEFT
                     && let Some(d) = self.w.mouse.drag.take()
                 {
@@ -2805,6 +2980,20 @@ impl App {
                     return;
                 }
                 let n = n as i32;
+                let pane_surface = self
+                    .pane_at(ev.position)
+                    .and_then(|id| Some((self.panes.get(&id)?.surface?, self.cell_in(id, ev.position)?)))
+                    .map(|(s, (c, r, _))| (s, Some((c as u32, r as u32))));
+                if let Some((s, Some((col, row)))) = self.surface_at(ev.position).or(pane_surface) {
+                    use proteus_wasm::types::{MouseAction as A, MouseButton as P, MouseEvent, UiEvent};
+                    let button = if n < 0 { P::WheelUp } else { P::WheelDown };
+                    let mods = proteus_wasm::types::Modifiers::empty();
+                    for _ in 0..n.unsigned_abs().min(10) {
+                        let action = A::Press;
+                        self.surface_ui(s, UiEvent::Mouse(MouseEvent { button, action, col, row, mods }));
+                    }
+                    return;
+                }
                 if self.tab_at(ev.position).is_some() {
                     self.run_action(if n < 0 { Action::PrevTab } else { Action::NextTab });
                     return;
@@ -3206,6 +3395,10 @@ impl PointerHandler for App {
 impl DataDeviceHandler for App {
     fn enter(&mut self, _: &Connection, _: &QueueHandle<Self>, dev: &WlDataDevice, x: f64, y: f64, s: &WlSurface) {
         let Some(win) = self.win_of_surface(s) else { return };
+        if self.tab_dnd.is_none() {
+            self.file_dnd = Some((win, (x, y)));
+            return self.file_drag_moved();
+        }
         let Some(dnd) = self.tab_dnd.as_mut() else { return };
         dnd.at = Some((win, (x, y)));
         // Only our own tab drags are accepted.
@@ -3222,15 +3415,35 @@ impl DataDeviceHandler for App {
         if let Some(d) = self.tab_dnd.as_mut() {
             d.at = None;
         }
+        self.file_dnd = None;
     }
     fn motion(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice, x: f64, y: f64) {
         if let Some((_, pos)) = self.tab_dnd.as_mut().and_then(|d| d.at.as_mut()) {
             *pos = (x, y);
         }
+        if let Some((_, pos)) = self.file_dnd.as_mut() {
+            *pos = (x, y);
+            self.file_drag_moved();
+        }
     }
     fn selection(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
     fn drop_performed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {
         let offer = self.data_device.as_ref().and_then(|d| d.data().drag_offer());
+        if let Some((win, pos)) = self.file_dnd.take() {
+            let surface = if self.activate(win) { self.drop_surface_at(pos) } else { None };
+            self.activate_kbd();
+            let (Some(o), Some(s)) = (offer, surface) else { return };
+            let Ok(pipe) = o.receive(URI_LIST.into()) else { return };
+            let tx = self.sender.clone();
+            let _ = std::thread::Builder::new().name("drop".into()).spawn(move || {
+                let mut data = Vec::new();
+                let _ = File::from(OwnedFd::from(pipe)).take(1 << 20).read_to_end(&mut data);
+                o.finish();
+                o.destroy();
+                let _ = tx.send(Msg::Dropped(s, String::from_utf8_lossy(&data).into_owned()));
+            });
+            return;
+        }
         let Some(dnd) = self.tab_dnd.as_mut() else { return };
         let Some((win, pos)) = dnd.at else { return };
         dnd.done = true;
@@ -3245,6 +3458,29 @@ impl DataDeviceHandler for App {
         let at = if self.activate(win) { self.tab_at(pos).flatten() } else { None };
         self.move_tab(from, pane, Some(win), at);
         self.activate_kbd();
+    }
+}
+
+const URI_LIST: &str = "text/uri-list";
+
+impl App {
+    /// Files are accepted over plugin surfaces only.
+    fn file_drag_moved(&mut self) {
+        let Some((win, pos)) = self.file_dnd else { return };
+        let over = self.activate(win) && self.drop_surface_at(pos).is_some();
+        self.activate_kbd();
+        let Some(offer) = self.data_device.as_ref().and_then(|d| d.data().drag_offer()) else { return };
+        if over && offer.with_mime_types(|m| m.iter().any(|m| m == URI_LIST)) {
+            offer.accept_mime_type(offer.serial, Some(URI_LIST.into()));
+            offer.set_actions(DndAction::Copy, DndAction::Copy);
+        } else {
+            offer.accept_mime_type(offer.serial, None);
+        }
+    }
+
+    /// The plugin surface (or plugin pane) under a position.
+    fn drop_surface_at(&self, pos: (f64, f64)) -> Option<u32> {
+        self.surface_at(pos).map(|s| s.0).or_else(|| self.panes.get(&self.pane_at(pos)?)?.surface)
     }
 }
 
@@ -3396,8 +3632,20 @@ impl Prompt {
             Prompt::Notice(msg) => {
                 Overlay { title: msg.clone(), detail: None, keys: "press any key to dismiss".into() }
             }
+            Prompt::PluginConfirm(_, q) => Overlay { title: q.clone(), detail: None, keys: "[y] yes   [n] no".into() },
         }
     }
+}
+
+/// A mouse button as plugins see it.
+fn surface_button(b: MouseButton) -> Option<proteus_wasm::types::MouseButton> {
+    use proteus_wasm::types::MouseButton as P;
+    Some(match b {
+        MouseButton::Left => P::Left,
+        MouseButton::Middle => P::Middle,
+        MouseButton::Right => P::Right,
+        _ => return None,
+    })
 }
 
 #[cfg(test)]

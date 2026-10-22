@@ -90,6 +90,13 @@ impl App {
     /// Start a pane for `p`. A command that cannot start falls back to the
     /// shell, with a notice.
     fn spawn_spec(&mut self, p: &PaneSpec, cols: u16, rows: u16) -> io::Result<PaneId> {
+        if let Some((plugin, args)) = &p.plugin {
+            let id = self.plugin_pane(plugin, args, cols, rows);
+            if let Some(pane) = self.panes.get_mut(&id) {
+                pane.name = p.name.clone().or(pane.name.take());
+            }
+            return Ok(id);
+        }
         let command = p.cmd.as_ref().map(|c| c.argv().into_iter().map(OsString::from).collect());
         let id = match self.spawn_pane(cols, rows, p.cwd.clone(), command) {
             Ok(id) => id,
@@ -223,7 +230,10 @@ impl App {
             .foreground_command()
             .filter(|(name, _)| self.cfg.restore_commands.contains(name))
             .map(|(_, argv)| shell_join(&argv));
-        PaneSpec { cmd: p.cmd.clone(), run, cwd: p.cwd(&self.hostname), name: p.name.clone(), focus }
+        if p.plugin.is_some() {
+            return PaneSpec { plugin: p.plugin.clone(), name: p.name.clone(), focus, ..PaneSpec::default() };
+        }
+        PaneSpec { cmd: p.cmd.clone(), run, cwd: p.cwd(&self.hostname), name: p.name.clone(), focus, plugin: None }
     }
 
     fn tab_specs(&self, w: &Win) -> Vec<TabSpec> {
