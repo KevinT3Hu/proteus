@@ -87,6 +87,7 @@ pub struct Config {
     pub grapheme_clustering: bool,
     /// Treat East Asian ambiguous-width characters as wide.
     pub ambiguous_wide: bool,
+    pub bidi: proteus_core::bidi::Mode,
     pub osc52_write: bool,
     pub osc52_read: ClipboardRead,
     /// Confirm multi-line pastes and pastes with control characters when
@@ -226,6 +227,7 @@ impl Default for Config {
             cursor_shape: None,
             grapheme_clustering: false,
             ambiguous_wide: false,
+            bidi: Default::default(),
             osc52_write: true,
             osc52_read: ClipboardRead::Ask,
             paste_protection: true,
@@ -262,6 +264,7 @@ impl Config {
         let mut c = crate::session::local_config();
         c.scrollback = self.scrollback;
         c.ambiguous_wide = self.ambiguous_wide;
+        c.bidi = self.bidi;
         c.osc52_write = self.osc52_write;
         c.osc52_read = self.osc52_read;
         c.grapheme_clustering = self.grapheme_clustering;
@@ -496,6 +499,13 @@ fn apply(c: &mut Config, t: &Table, reg: &Registrar) -> Result<(), String> {
                 match k {
                     "family" => c.font_family = string(v, "font.family")?,
                     "size" => c.font_size = bounded(v, "font.size", 4.0, 96.0)? as f32,
+                    "fallback_families" => {
+                        let families = strings(v, "font.fallback_families")?;
+                        if families.len() > 32 || families.iter().any(|f| f.is_empty() || f.contains('\0')) {
+                            return Err("font.fallback_families: expected at most 32 nonempty font names".into());
+                        }
+                        c.font_settings.fallback_families = families;
+                    }
                     "bold_family" => c.font_settings.bold_family = optional_string(v, "font.bold_family")?,
                     "italic_family" => c.font_settings.italic_family = optional_string(v, "font.italic_family")?,
                     "bold_italic_family" => {
@@ -539,6 +549,14 @@ fn apply(c: &mut Config, t: &Table, reg: &Registrar) -> Result<(), String> {
             })?,
             "text" => section(&v, "text", |k, v| {
                 match k {
+                    "bidi" => {
+                        c.bidi = match string(v, "text.bidi")?.as_str() {
+                            "auto" => proteus_core::bidi::Mode::Auto,
+                            "on" => proteus_core::bidi::Mode::On,
+                            "off" => proteus_core::bidi::Mode::Off,
+                            _ => return Err("text.bidi: expected auto, on or off".into()),
+                        }
+                    }
                     "grapheme_clustering" => c.grapheme_clustering = boolean(v, "text.grapheme_clustering")?,
                     "ambiguous_width" => {
                         c.ambiguous_wide = match number(v, "text.ambiguous_width")? as i64 {
@@ -960,6 +978,22 @@ mod tests {
 
     fn ev(src: &str) -> Result<Config, String> {
         eval(src, Path::new("/nonexistent/init.lua")).map(|l| l.config)
+    }
+
+    #[test]
+    fn bidi_modes_are_validated_and_reach_terminal_configuration() {
+        for (value, mode) in [
+            ("auto", proteus_core::bidi::Mode::Auto),
+            ("on", proteus_core::bidi::Mode::On),
+            ("off", proteus_core::bidi::Mode::Off),
+        ] {
+            let loaded =
+                eval(&format!("require('proteus').config {{text={{bidi='{value}'}}}}"), Path::new("/tmp/init.lua"))
+                    .unwrap();
+            assert_eq!(loaded.config.bidi, mode);
+            assert_eq!(loaded.config.core().bidi, mode);
+        }
+        assert!(eval("require('proteus').config {text={bidi='invalid'}}", Path::new("/tmp/init.lua")).is_err());
     }
 
     #[test]

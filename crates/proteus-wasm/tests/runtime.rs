@@ -13,28 +13,33 @@ use proteus_wasm::{Call, FromPlugin, Key, Permissions, Reply, Runtime, Spec};
 fn fixture() -> Option<&'static [u8]> {
     static WASM: OnceLock<Option<Vec<u8>>> = OnceLock::new();
     WASM.get_or_init(|| {
+        if let Some(path) = std::env::var_os("PROTEUS_WASM_FIXTURE") {
+            let bytes = std::fs::read(path).expect("read explicit fixture component");
+            assert!(bytes.starts_with(b"\0asm"), "fixture must be WebAssembly");
+            return Some(bytes);
+        }
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture");
         let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/plugin-fixture");
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-        let sysroot = Command::new("rustc").args(["--print", "sysroot"]).output().ok()?;
+        let sysroot = Command::new("rustc").args(["--print", "sysroot"]).output().expect("locate Rust sysroot");
         let sysroot = PathBuf::from(String::from_utf8_lossy(&sysroot.stdout).trim());
-        if !sysroot.join("lib/rustlib/wasm32-wasip2").is_dir() {
+        if !sysroot.join("lib/rustlib/wasm32-wasip2/lib").is_dir() {
             assert!(
-                std::env::var_os("PROTEUS_REQUIRE_WASM_TESTS").is_none(),
+                std::env::var_os("PROTEUS_REQUIRE_WASM_TESTS").is_none() && std::env::var_os("CI").is_none(),
                 "wasm32-wasip2 is required for this test job"
             );
             eprintln!("skipping: no wasm32-wasip2 target (set PROTEUS_REQUIRE_WASM_TESTS=1 in WASI CI)");
             return None;
         }
         let ok = Command::new(cargo)
-            .args(["build", "--quiet", "--target", "wasm32-wasip2", "--manifest-path"])
+            .args(["build", "--quiet", "--locked", "--target", "wasm32-wasip2", "--manifest-path"])
             .arg(dir.join("Cargo.toml"))
             .arg("--target-dir")
             .arg(&target)
             .status()
             .is_ok_and(|s| s.success());
         assert!(ok, "building tests/fixture failed");
-        std::fs::read(target.join("wasm32-wasip2/debug/fixture.wasm")).ok()
+        Some(std::fs::read(target.join("wasm32-wasip2/debug/fixture.wasm")).expect("read built fixture component"))
     })
     .as_deref()
 }
@@ -49,12 +54,16 @@ struct Host {
     rx: mpsc::Receiver<(Key, FromPlugin)>,
     handle: proteus_wasm::Handle,
     data: PathBuf,
+    storage: PathBuf,
+    root: PathBuf,
 }
 
 fn start(name: &str, granted: Permissions) -> Option<Host> {
     let wasm = fixture()?.to_vec();
-    let data = std::env::temp_dir().join(format!("proteus-fixture-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&data);
+    let root = std::env::temp_dir().join(format!("proteus-fixture-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let data = root.join("data");
+    let storage = root.join("state.storage.toml");
     std::fs::create_dir_all(&data).unwrap();
     if name == "fail" {
         std::fs::write(data.join("fail-init"), "").unwrap();
@@ -71,13 +80,13 @@ fn start(name: &str, granted: Permissions) -> Option<Host> {
         wasm,
         granted,
         data_dir: data.clone(),
-        storage: data.with_extension("storage.toml"),
+        storage: storage.clone(),
         memory: 64 << 20,
         stderr: false,
         compiled: Some(data.with_extension("compiled")),
     };
     let handle = runtime().start(spec, sink).unwrap();
-    Some(Host { rx, handle, data })
+    Some(Host { rx, handle, data, storage, root })
 }
 
 impl Host {
@@ -143,7 +152,7 @@ impl Host {
 
 impl Drop for Host {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.data);
+        let _ = std::fs::remove_dir_all(&self.root);
     }
 }
 
@@ -264,4 +273,46 @@ fn plugin_reads_its_own_config() {
     let Some(h) = start("config", Permissions { ui: true, ..Permissions::default() }) else { return };
     h.wait(|m| matches!(m, FromPlugin::Started));
     assert_eq!(h.act("config"), ["config: \"right\" 40"]);
+}
+
+#[test]
+fn host_flood_has_one_in_flight_call_and_stop_interrupts_backpressure() {
+    let Some(h) = start("host-flood", Permissions { ui: true, ..Default::default() }) else { return };
+    h.wait(|m| matches!(m, FromPlugin::Started));
+    h.handle.event(Event::Action("host-flood".into()));
+    let (_, message) = h.rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let FromPlugin::Call(Call::Log(_), Some(reply)) = message else { panic!("expected acknowledged log") };
+    // The GUI has not consumed/acknowledged this call: no more calls may queue.
+    assert!(matches!(h.rx.recv_timeout(Duration::from_millis(100)), Err(mpsc::RecvTimeoutError::Timeout)));
+    h.handle.stop();
+    let (_, message) = h.rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(matches!(message, FromPlugin::Failed(_) | FromPlugin::Exited));
+    drop(reply);
+}
+
+#[test]
+fn storage_corruption_is_preserved_and_legacy_api_errors_reach_the_host() {
+    let Some(h) = start("storage", Permissions { ui: true, ..Default::default() }) else { return };
+    h.wait(|m| matches!(m, FromPlugin::Started));
+    assert_eq!(h.act("storage-set"), ["storage-set: Ok(())"]);
+    assert_eq!(h.act("storage-read"), ["storage: Some(\"persisted\")"]);
+    let path = &h.storage;
+    let malformed = "not = [valid";
+    std::fs::write(path, malformed).unwrap();
+    assert!(h.act("storage-set")[0].starts_with("storage-set: Err("));
+    let seen = h.act_n("storage-delete", 2);
+    assert!(seen[0].contains("malformed TOML"));
+    assert_eq!(seen[1], "delete returned");
+    let seen = h.act_n("storage-read", 2);
+    assert!(seen[0].contains("malformed TOML"));
+    assert_eq!(seen[1], "storage: None");
+    let seen = h.act_n("storage-keys", 2);
+    assert!(seen[0].contains("malformed TOML"));
+    assert_eq!(seen[1], "keys: []");
+    assert_eq!(std::fs::read_to_string(path).unwrap(), malformed);
+    std::fs::write(path, "other = 'kept'\n").unwrap();
+    assert_eq!(h.act("storage-set"), ["storage-set: Ok(())"]);
+    assert_eq!(h.act("storage-keys"), ["keys: [\"key\", \"other\"]"]);
+    assert_eq!(h.act("storage-delete"), ["delete returned"]);
+    assert_eq!(h.act("storage-read"), ["storage: None"]);
 }

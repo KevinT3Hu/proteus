@@ -17,8 +17,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
-pub(crate) use decode::run_in_background;
 pub use decode::{DecodeError, DecodedImage, decode_image, image_dimensions};
+pub(crate) use decode::{DecodePermit, reserve_decode, run_in_background};
 pub use image::ImageFormat;
 
 use crate::grid::{Grid, LineMap};

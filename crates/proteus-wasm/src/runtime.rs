@@ -135,32 +135,7 @@ pub enum Call {
     ClipboardRead,
     ClipboardWrite(String),
     /// Open a (checked) path or URL with the desktop's default application.
-    Open(String),
-}
-
-impl Call {
-    /// Calls the plugin does not wait for.
-    fn one_way(&self) -> bool {
-        matches!(
-            self,
-            Call::Log(_)
-                | Call::Notify { .. }
-                | Call::Draw(..)
-                | Call::CloseSurface(_)
-                | Call::StartDrag(..)
-                | Call::SetStatus(..)
-                | Call::RegisterAction { .. }
-                | Call::LoadImage(..)
-                | Call::DropImage(_)
-                | Call::Prompt { .. }
-                | Call::Confirm { .. }
-                | Call::TaskStart { .. }
-                | Call::TaskUpdate { .. }
-                | Call::TaskEnd(_)
-                | Call::ClipboardWrite(_)
-                | Call::Open(_)
-        )
-    }
+    Open(String, Option<Arc<std::fs::File>>),
 }
 
 #[derive(Debug, Clone)]
@@ -205,7 +180,7 @@ pub(crate) enum ToPlugin {
 /// watches).
 #[derive(Clone)]
 pub struct Poster {
-    tx: mpsc::Sender<ToPlugin>,
+    tx: mpsc::SyncSender<ToPlugin>,
     backlog: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
 }
@@ -213,7 +188,14 @@ pub struct Poster {
 impl Poster {
     /// False once the plugin is gone.
     pub fn event(&self, e: Event) -> bool {
-        !self.stop.load(Ordering::Relaxed) && self.tx.send(ToPlugin::Event(e)).is_ok()
+        if self.stop.load(Ordering::Relaxed) {
+            return false;
+        }
+        if self.tx.try_send(ToPlugin::Event(e)).is_err() {
+            self.stop.store(true, Ordering::Release);
+            return false;
+        }
+        true
     }
 
     /// An event carrying `n` bytes of output: waits while the plugin is
@@ -242,7 +224,7 @@ impl Poster {
 
     #[cfg(test)]
     pub(crate) fn testing() -> (Self, mpsc::Receiver<ToPlugin>) {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(256);
         (Self { tx, backlog: Arc::default(), stop: Arc::default() }, rx)
     }
 }
@@ -262,7 +244,7 @@ pub struct Spec {
     pub memory: usize,
     /// Pass the plugin's stderr through (debugging).
     pub stderr: bool,
-    /// Keep compiled code here so later starts skip compiling.
+    /// Reserved for API compatibility. Native disk caches are intentionally ignored.
     pub compiled: Option<PathBuf>,
 }
 
@@ -295,7 +277,7 @@ impl Runtime {
     /// Start an instance in a new thread. `init` runs there; the outcome
     /// arrives at `sink` as [`FromPlugin::Started`] or `Failed`.
     pub fn start(&self, spec: Spec, sink: Sink) -> Result<Handle, String> {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(256);
         let stop = Arc::new(AtomicBool::new(false));
         let key = spec.key.clone();
         let poster = Poster { tx: tx.clone(), backlog: Arc::default(), stop: stop.clone() };
@@ -318,17 +300,21 @@ impl Runtime {
 /// A running instance. Dropping it stops the instance too.
 pub struct Handle {
     pub key: Key,
-    tx: mpsc::Sender<ToPlugin>,
+    tx: mpsc::SyncSender<ToPlugin>,
     stop: Arc<AtomicBool>,
 }
 
 impl Handle {
     pub fn event(&self, e: Event) {
-        let _ = self.tx.send(ToPlugin::Event(e));
+        if self.tx.try_send(ToPlugin::Event(e)).is_err() {
+            self.stop();
+        }
     }
 
     pub fn ui(&self, s: SurfaceId, e: UiEvent) {
-        let _ = self.tx.send(ToPlugin::Ui(s, e));
+        if self.tx.try_send(ToPlugin::Ui(s, e)).is_err() {
+            self.stop();
+        }
     }
 
     /// Stop it, interrupting a call in progress within a tick.
@@ -372,6 +358,8 @@ struct State {
     next_task: TaskId,
     /// Streams and questions.
     next_request: RequestId,
+    rate_window: Instant,
+    rate_calls: usize,
 }
 
 impl WasiView for State {
@@ -418,12 +406,22 @@ impl State {
         })
     }
 
-    /// Send a call; wait for the answer unless it is one-way.
+    /// Send one bounded call and wait for its consumption.
     fn rpc(&mut self, call: Call) -> Answer {
-        if call.one_way() {
-            (self.sink)(self.key.clone(), FromPlugin::Call(call, None));
-            return Ok(Reply::Unit);
+        if self.stop.load(Ordering::Acquire) {
+            return Err("stopped".into());
         }
+        if self.rate_window.elapsed() >= Duration::from_secs(1) {
+            self.rate_window = Instant::now();
+            self.rate_calls = 0;
+        }
+        self.rate_calls += 1;
+        if self.rate_calls > 2000 || call_bytes(&call) > 4 << 20 {
+            self.stop.store(true, Ordering::Release);
+            return Err("plugin exceeded host call rate or message size limit".into());
+        }
+        // Every call is acknowledged after consumption, including drawing and
+        // logging. A plugin can have only one host message in flight.
         let (tx, rx) = mpsc::channel();
         (self.sink)(self.key.clone(), FromPlugin::Call(call, Some(tx)));
         self.excluded(|s| {
@@ -444,12 +442,12 @@ impl State {
     }
 
     /// The program and directory for `cmd`.
-    fn command(&self, cmd: &Command) -> Result<(PathBuf, PathBuf), String> {
+    fn command(&self, cmd: &Command) -> Result<(PathBuf, files::Pinned), String> {
         let name = cmd.argv.first().ok_or("the command is empty")?;
         let program = process::resolve(&self.granted.run_command, name)?;
         let cwd = match &cmd.cwd {
-            Some(c) => self.access.resolve(c, false, true)?,
-            None => self.access.data_dir.clone(),
+            Some(c) => self.access.pin(c, false, true)?,
+            None => self.access.pin("/data", false, true)?,
         };
         Ok((program, cwd))
     }
@@ -477,6 +475,46 @@ impl State {
             self.keyring = None;
         }
         r
+    }
+}
+
+fn call_bytes(call: &Call) -> usize {
+    match call {
+        Call::Log(s)
+        | Call::Notify { text: s, .. }
+        | Call::SetStatus(_, s)
+        | Call::ClipboardWrite(s)
+        | Call::SendText { text: s, .. } => s.len(),
+        Call::OpenPane(_, spawn) => {
+            spawn.argv.iter().map(|s| std::mem::size_of::<String>() + s.len()).sum::<usize>()
+                + spawn.cwd.as_ref().map_or(0, String::len)
+        }
+        Call::OpenSurface(o) => o.title.len(),
+        Call::StartDrag(_, paths) => paths.iter().map(|s| std::mem::size_of::<String>() + s.len()).sum(),
+        Call::Open(target, _) => target.len(),
+        Call::LoadImage(..) => 0, // Separately bounded by MAX_IMAGE_BYTES.
+        Call::Draw(_, f) => {
+            f.lines.len().saturating_mul(std::mem::size_of::<Vec<Span>>())
+                + f.lines
+                    .iter()
+                    .flatten()
+                    .map(|s| std::mem::size_of::<Span>() + s.text.len() + s.link.as_ref().map_or(0, String::len))
+                    .sum::<usize>()
+                + f.images.len() * std::mem::size_of::<ImagePlace>()
+                + f.accessibility
+                    .iter()
+                    .map(|n| {
+                        std::mem::size_of_val(n)
+                            + n.id.len()
+                            + n.label.len()
+                            + n.parent.as_ref().map_or(0, String::len)
+                            + n.description.as_ref().map_or(0, String::len)
+                            + n.value.as_ref().map_or(0, String::len)
+                            + n.actions.len() * std::mem::size_of::<AccessibilityAction>()
+                    })
+                    .sum::<usize>()
+        }
+        _ => 0,
     }
 }
 
@@ -513,11 +551,11 @@ impl proteus::plugin::host::Host for State {
     }
 
     fn log(&mut self, message: String) {
-        let _ = self.rpc(Call::Log(message));
+        let _ = self.rpc(Call::Log(short(&message, 4096)));
     }
 
     fn notify(&mut self, text: String, error: bool) {
-        let _ = self.rpc(Call::Notify { text, error });
+        let _ = self.rpc(Call::Notify { text: short(&text, 1000), error });
     }
 
     fn list_panes(&mut self) -> Result<Vec<PaneInfo>, String> {
@@ -637,7 +675,7 @@ impl proteus::plugin::host::Host for State {
 
     fn set_status(&mut self, side: StatusSide, text: String) -> Result<(), String> {
         self.need(self.granted.ui, "ui")?;
-        self.rpc(Call::SetStatus(side, text)).map(|_| ())
+        self.rpc(Call::SetStatus(side, short(&text, 4096))).map(|_| ())
     }
 
     fn register_action(&mut self, name: String, key: Option<String>) -> Result<(), String> {
@@ -722,7 +760,13 @@ impl proteus::plugin::host::Host for State {
     }
 
     fn storage_get(&mut self, key: String) -> Option<String> {
-        self.storage.get(&key)
+        match self.excluded(|s| s.storage.get(&key)) {
+            Ok(value) => value,
+            Err(e) => {
+                let _ = self.rpc(Call::Notify { text: e, error: true });
+                None
+            }
+        }
     }
 
     fn storage_set(&mut self, key: String, value: String) -> Result<(), String> {
@@ -730,11 +774,19 @@ impl proteus::plugin::host::Host for State {
     }
 
     fn storage_delete(&mut self, key: String) {
-        self.excluded(|s| s.storage.delete(&key))
+        if let Err(e) = self.excluded(|s| s.storage.delete(&key)) {
+            let _ = self.rpc(Call::Notify { text: e, error: true });
+        }
     }
 
     fn storage_keys(&mut self) -> Vec<String> {
-        self.storage.keys()
+        match self.excluded(|s| s.storage.keys()) {
+            Ok(keys) => keys,
+            Err(e) => {
+                let _ = self.rpc(Call::Notify { text: e, error: true });
+                Vec::new()
+            }
+        }
     }
 
     fn run(&mut self, cmd: Command, input: Vec<u8>, timeout_ms: u32) -> Result<Output, String> {
@@ -816,7 +868,7 @@ impl proteus::plugin::host::Host for State {
     }
 
     fn watch(&mut self, path: String) -> Result<WatchId, String> {
-        let host = self.access.resolve(&path, false, true)?;
+        let host = self.access.pin(&path, false, true)?;
         if self.watcher.is_none() {
             let post = self.post.clone();
             let on_change: files::OnChange = Box::new(move |watch, path, change| {
@@ -840,11 +892,11 @@ impl proteus::plugin::host::Host for State {
     }
 
     fn trash(&mut self, path: String) -> Result<(), String> {
-        let host = self.access.resolve(&path, true, false)?;
-        if host == self.access.data_dir.canonicalize().unwrap_or_default() {
+        let host = self.access.pin(&path, true, false)?;
+        if host.original == self.access.data_dir.canonicalize().unwrap_or_default() {
             return Err("trash: not the data directory itself".into());
         }
-        self.excluded(|_| files::trash(&host))
+        self.excluded(|_| files::trash_named(&host, &host.original))
     }
 
     fn open(&mut self, path_or_url: String) -> Result<(), String> {
@@ -854,54 +906,56 @@ impl proteus::plugin::host::Host for State {
             if path_or_url.chars().any(|c| c.is_control() || c.is_whitespace()) {
                 return Err("open: not a valid URL".into());
             }
-            path_or_url
+            (path_or_url, None)
         } else {
-            self.access.resolve(&path_or_url, false, true)?.display().to_string()
+            use std::os::fd::AsRawFd;
+            let pinned = self.access.pin(&path_or_url, false, true)?;
+            (format!("/proc/{}/fd/{}", std::process::id(), pinned.file.as_raw_fd()), Some(pinned.file))
         };
-        self.rpc(Call::Open(target)).map(|_| ())
+        self.rpc(Call::Open(target.0, target.1)).map(|_| ())
     }
 
     fn list_dir(&mut self, path: String) -> Result<Vec<DirEntry>, String> {
-        let host = self.access.resolve(&path, false, true)?;
+        let host = self.access.pin(&path, false, true)?;
         let access = self.access.clone();
         let guest = PathBuf::from(&path);
         self.blocking(move || files::list_dir(&host, &guest, &access))?
     }
 
     fn mime_type(&mut self, path: String) -> Result<String, String> {
-        let host = self.access.resolve(&path, false, true)?;
-        self.excluded(|_| files::mime_type(&host))
+        let host = self.access.pin(&path, false, true)?;
+        self.excluded(|_| files::mime_type_named(&host, &host.original))
     }
 
     fn file_mode(&mut self, path: String) -> Result<u32, String> {
         use std::os::unix::fs::PermissionsExt;
-        let host = self.access.resolve(&path, false, true)?;
-        std::fs::metadata(host).map(|m| m.permissions().mode() & 0o777).map_err(|e| e.to_string())
+        let host = self.access.pin(&path, false, true)?;
+        std::fs::metadata(&host).map(|m| m.permissions().mode() & 0o777).map_err(|e| e.to_string())
     }
 
     fn set_file_mode(&mut self, path: String, mode: u32) -> Result<(), String> {
         use std::os::unix::fs::OpenOptionsExt;
         use std::os::unix::fs::PermissionsExt;
-        let host = self.access.resolve(&path, true, false)?;
+        let host = self.access.pin(&path, true, false)?;
         std::fs::File::options()
             .read(true)
             .custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32)
-            .open(host)
+            .open(&host)
             .and_then(|f| f.set_permissions(std::fs::Permissions::from_mode(mode & 0o777)))
             .map_err(|e| e.to_string())
     }
 
     fn create_private(&mut self, path: String, directory: bool) -> Result<(), String> {
         use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-        let host = self.access.resolve(&path, true, false)?;
+        let host = self.access.pin(&path, true, false)?;
         if directory {
-            std::fs::DirBuilder::new().mode(0o700).create(host).map_err(|e| e.to_string())
+            std::fs::DirBuilder::new().mode(0o700).create(&host).map_err(|e| e.to_string())
         } else {
             std::fs::File::options()
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
-                .open(host)
+                .open(&host)
                 .map(|_| ())
                 .map_err(|e| e.to_string())
         }
@@ -909,10 +963,10 @@ impl proteus::plugin::host::Host for State {
 
     fn publish_file(&mut self, staged: String, destination: String, replace: bool) -> Result<(), String> {
         use rustix::fs::{CWD, RenameFlags, renameat_with};
-        let staged = self.access.resolve(&staged, true, false)?;
-        let destination = self.access.resolve(&destination, true, false)?;
+        let staged = self.access.pin(&staged, true, false)?;
+        let destination = self.access.pin(&destination, true, false)?;
         let flags = if replace { RenameFlags::empty() } else { RenameFlags::NOREPLACE };
-        renameat_with(CWD, staged, CWD, destination, flags).map_err(|e| e.to_string())
+        renameat_with(CWD, &*staged, CWD, &*destination, flags).map_err(|e| e.to_string())
     }
 
     fn set_timer(&mut self, ms: u32, repeat: bool) -> TimerId {
@@ -969,53 +1023,6 @@ fn trap_message(e: &wasmtime::Error, state: &State) -> String {
     format!("crashed: {}", s.lines().next().unwrap_or(""))
 }
 
-/// The compiled-code file of a plugin: its wasm hash and the engine's
-/// (wasmtime version and settings), so a stale file is never used.
-fn compiled_path(engine: &Engine, spec: &Spec) -> Option<PathBuf> {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    engine.precompile_compatibility_hash().hash(&mut h);
-    let hex = spec.hash.rsplit(':').next().unwrap_or_default();
-    let ok = hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit());
-    ok.then(|| spec.compiled.as_ref().map(|d| d.join(format!("{hex}-{:016x}.cwasm", h.finish()))))?
-}
-
-fn load_compiled(engine: &Engine, spec: &Spec) -> Option<Component> {
-    let path = compiled_path(engine, spec)?;
-    use std::os::unix::fs::MetadataExt;
-    // Only our own file, not writable by others: it is native code.
-    let m = std::fs::metadata(&path).ok()?;
-    if m.uid() != rustix::process::getuid().as_raw() || m.mode() & 0o022 != 0 {
-        return None;
-    }
-    // SAFETY: the file was written by `save_compiled` with this engine's
-    // settings (checked by wasmtime) and only this user can change it.
-    unsafe { Component::deserialize_file(engine, &path) }.ok()
-}
-
-fn save_compiled(engine: &Engine, spec: &Spec, c: &Component) {
-    let (Some(path), Some(dir)) = (compiled_path(engine, spec), spec.compiled.as_ref()) else { return };
-    let bytes = match c.serialize() {
-        Ok(b) => b,
-        Err(e) => return eprintln!("proteus: cannot keep compiled plugin: {e}"),
-    };
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-    let _ = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir);
-    let tmp = path.with_extension("tmp");
-    let ok = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&tmp)
-        .and_then(|mut f| std::io::Write::write_all(&mut f, &bytes));
-    if ok.is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
-    } else {
-        let _ = std::fs::remove_file(&tmp);
-    }
-}
-
 enum Wake<T> {
     Message(T),
     Timers(Vec<TimerId>),
@@ -1059,15 +1066,14 @@ fn run(
     let component = match cached {
         Some(c) => c,
         None => {
-            let c = match load_compiled(engine, &spec) {
-                Some(c) => c,
-                None => {
-                    let c = Component::new(engine, &spec.wasm).map_err(|e| format!("not a valid plugin: {e}"))?;
-                    save_compiled(engine, &spec, &c);
-                    c
-                }
-            };
-            cache.lock().map_err(err)?.insert(spec.hash.clone(), c.clone());
+            // Only compile verified WASM bytes. Serialized native components
+            // cannot be authenticated by pathname ownership/mode checks.
+            let c = Component::new(engine, &spec.wasm).map_err(|e| format!("not a valid plugin: {e}"))?;
+            let mut cache = cache.lock().map_err(err)?;
+            if cache.len() >= 16 {
+                cache.clear();
+            }
+            cache.insert(spec.hash.clone(), c.clone());
             c
         }
     };
@@ -1110,7 +1116,7 @@ fn run(
         stop: post.stop.clone(),
         timers: BTreeMap::new(),
         next_timer: 0,
-        access: Access { data_dir: spec.data_dir.clone(), fs: spec.granted.fs.clone() },
+        access: Access::new(spec.data_dir.clone(), &spec.granted.fs)?,
         post,
         storage: Storage::new(spec.storage.clone()),
         processes: Processes::default(),
@@ -1122,6 +1128,8 @@ fn run(
         tasks: HashSet::new(),
         next_task: 0,
         next_request: 0,
+        rate_window: Instant::now(),
+        rate_calls: 0,
     };
     let mut store = Store::new(engine, state);
     store.limiter(|s| &mut s.limits);
@@ -1227,10 +1235,8 @@ mod tests {
             timers: BTreeMap::new(),
             next_timer: 0,
             post,
-            access: Access {
-                data_dir: data.clone(),
-                fs: vec![crate::FsGrant { path: read.display().to_string(), write: false }],
-            },
+            access: Access::new(data.clone(), &[crate::FsGrant { path: read.display().to_string(), write: false }])
+                .unwrap(),
             storage: Storage::new(root.join("storage.toml")),
             processes: Processes::default(),
             streams: Streams::default(),
@@ -1241,6 +1247,8 @@ mod tests {
             tasks: HashSet::new(),
             next_task: 0,
             next_request: 0,
+            rate_window: Instant::now(),
+            rate_calls: 0,
         };
         state.create_private("/data/staged".into(), false).unwrap();
         assert_eq!(state.file_mode("/data/staged".into()).unwrap(), 0o600);
@@ -1260,7 +1268,25 @@ mod tests {
         std::os::unix::fs::symlink(read.join("file"), data.join("link")).unwrap();
         assert!(state.set_file_mode("/data/link".into(), 0o600).is_err());
         assert_eq!(std::fs::read_to_string(read.join("file")).unwrap(), "outside");
+        state.rate_window = Instant::now();
+        state.rate_calls = 2000;
+        assert!(state.rpc(Call::Log("over rate".into())).is_err());
+        assert!(state.stop.load(Ordering::Acquire));
+        state.stop.store(false, Ordering::Release);
+        state.rate_calls = 0;
+        assert!(state.rpc(Call::SendText { pane: 1, text: "x".repeat((4 << 20) + 1), paste: false }).is_err());
+        assert!(state.stop.load(Ordering::Acquire));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn event_flood_stops_instead_of_growing_or_blocking_the_gui() {
+        let (post, _events) = Poster::testing();
+        for i in 0..256 {
+            assert!(post.event(Event::Timer(i)));
+        }
+        assert!(!post.event(Event::Timer(257)));
+        assert!(post.stopped());
     }
 
     #[test]

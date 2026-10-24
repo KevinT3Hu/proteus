@@ -1,7 +1,10 @@
 //! PTY spawning, resizing and foreground-process queries for Proteus, plus
 //! automatic shell-integration injection for bash, zsh and fish.
 
+pub mod budget;
+pub mod persistence;
 mod pty;
+pub mod secure_fs;
 mod writer;
 pub use writer::{InputWriter, MAX_PENDING_INPUT};
 pub mod shell;

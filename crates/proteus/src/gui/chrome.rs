@@ -111,7 +111,7 @@ pub fn hint_bar(
 pub fn input_bar(
     badge: &str,
     text: &str,
-    caret_cols: usize,
+    caret_byte: usize,
     status: &str,
     x0: f32,
     y: f32,
@@ -126,22 +126,25 @@ pub fn input_bar(
     let mut out = vec![Label { x: x0, y, cols: bw, text: badge, fg: theme.bg, bg: Some(theme.accent), bold: true }];
     let start = bw + 1;
     let room = cols.saturating_sub(start);
-    // Keep the caret in view: drop text from the left if needed.
-    let (shown, caret) = if caret_cols < room {
-        (text.to_string(), caret_cols)
-    } else {
-        use unicode_segmentation::UnicodeSegmentation;
+    // Choose a logical substring, then resolve its visual caret with the same layout as drawing.
+    use unicode_segmentation::UnicodeSegmentation;
+    let caret_cols: usize =
+        text[..text.floor_char_boundary(caret_byte.min(text.len()))].graphemes(true).map(width).sum();
+    let mut skipped = 0;
+    if caret_cols >= room {
         let mut skip = caret_cols + 1 - room;
-        let mut s = String::new();
-        for g in text.graphemes(true) {
-            if skip > 0 {
-                skip = skip.saturating_sub(width(g));
-                continue;
+        for (byte, g) in text.grapheme_indices(true) {
+            if skip == 0 {
+                break;
             }
-            s.push_str(g);
+            skip = skip.saturating_sub(width(g));
+            skipped = byte + g.len();
         }
-        (s, room.saturating_sub(1))
-    };
+    }
+    let shown = text[skipped..].to_owned();
+    let caret = proteus_core::bidi::TextLayout::new(&shown, room)
+        .caret(caret_byte.saturating_sub(skipped))
+        .min(room.saturating_sub(1));
     out.push(Label {
         x: x0 + start as f32 * cw,
         y,
@@ -181,6 +184,15 @@ mod tests {
             bar: c(30),
             dim: c(150),
         }
+    }
+
+    #[test]
+    fn bidi_input_caret_tracks_the_visual_boundary() {
+        let catalog = crate::i18n::Catalog::new("en").unwrap();
+        let (labels, start) = input_bar("S", "אבג", 0, "", 0.0, 0.0, 40, 10.0, &theme(), &catalog);
+        let (_, end) = input_bar("S", "אבג", "אבג".len(), "", 0.0, 0.0, 40, 10.0, &theme(), &catalog);
+        assert_eq!(start, labels[1].x + 30.0);
+        assert_eq!(end, labels[1].x);
     }
 
     #[test]

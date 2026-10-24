@@ -2,6 +2,7 @@
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct FontSettings {
     pub bold_family: Option<String>,
+    pub fallback_families: Vec<String>,
     pub italic_family: Option<String>,
     pub bold_italic_family: Option<String>,
     pub cell_width: Option<f64>,

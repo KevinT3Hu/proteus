@@ -1,7 +1,8 @@
 //! Scroll mode (keyboard cursor, selection, copy), search, the input line
 //! and the palette, as methods of [`App`].
 
-use std::path::PathBuf;
+use proteus_pty::persistence::StateFile;
+use std::path::{Path, PathBuf};
 
 use proteus_core::Point;
 use proteus_core::event::ClipboardKind;
@@ -105,10 +106,37 @@ fn recent_path() -> Option<PathBuf> {
 
 /// Recently used palette entries, most recent first.
 pub(super) fn load_recent() -> Vec<String> {
-    let Some(text) = recent_path().and_then(|p| std::fs::read_to_string(p).ok()) else {
-        return Vec::new();
-    };
-    text.lines().filter(|l| !l.is_empty()).take(RECENT_MAX).map(String::from).collect()
+    let Some(path) = recent_path() else { return Vec::new() };
+    let result = (|| {
+        let file = StateFile::new(&path)?;
+        let _lock = file.lock(false)?;
+        read_recent(&file)
+    })();
+    result.unwrap_or_else(|e| {
+        eprintln!("proteus: loading palette history: {e}");
+        Vec::new()
+    })
+}
+
+fn read_recent(file: &StateFile) -> std::io::Result<Vec<String>> {
+    let Some(bytes) = file.read(128 << 10)? else { return Ok(Vec::new()) };
+    let text = std::str::from_utf8(&bytes).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    Ok(text.lines().filter(|l| !l.is_empty()).take(RECENT_MAX).map(String::from).collect())
+}
+
+fn remember_at(path: &Path, entry: &str) -> std::io::Result<Vec<String>> {
+    let file = StateFile::new(path)?;
+    let _lock = file.lock(false)?;
+    let mut recent = read_recent(&file)?;
+    recent.retain(|r| r != entry);
+    recent.insert(0, entry.to_string());
+    recent.truncate(RECENT_MAX);
+    let text = recent.join("\n") + "\n";
+    if text.len() > 128 << 10 {
+        return Err(std::io::Error::other("palette history exceeds size limit"));
+    }
+    file.write(text.as_bytes())?;
+    Ok(recent)
 }
 
 impl App {
@@ -199,6 +227,25 @@ impl App {
                 Motion::Up if from_inside => r.start.saturating_sub(1).max(t.grid().first_line()),
                 _ => r.start,
             };
+        }
+        let layout = t.visual_row(c.cursor.line);
+        match m {
+            Motion::Left | Motion::Right => {
+                let x = layout.visual(c.cursor.col);
+                let row = t.grid().abs_row(c.cursor.line);
+                let width = row.and_then(|r| r.cells.get(c.cursor.col)).map_or(1, |c| c.width().max(1));
+                let x = if m == Motion::Left { x.saturating_sub(1) } else { (x + width).min(t.cols() - 1) };
+                to = Point::new(c.cursor.line, layout.logical(x));
+            }
+            Motion::Up
+            | Motion::Down
+            | Motion::HalfPageUp
+            | Motion::HalfPageDown
+            | Motion::PageUp
+            | Motion::PageDown => {
+                to.col = t.visual_row(to.line).logical(layout.visual(c.cursor.col));
+            }
+            _ => {}
         }
         // Paging moves the view along with the cursor, as in vi.
         if matches!(m, Motion::HalfPageUp | Motion::HalfPageDown | Motion::PageUp | Motion::PageDown) {
@@ -532,28 +579,17 @@ impl App {
         let keys: Vec<String> = items.iter().map(|i| i.0.to_lowercase()).collect();
         let mut hits: Vec<(String, Item)> = palette_rank(&keys, query).into_iter().map(|i| items[i].clone()).collect();
         let rank = |s: &str| self.recent.iter().position(|r| r == s).unwrap_or(usize::MAX);
-        hits.sort_by_key(|h| rank(&h.0)); // stable: the rest keeps its order
+        hits.sort_by_key(|h| rank(&h.0)); // Stable: the rest keeps its order.
         hits
     }
 
     /// Show the matching entries, the chosen one first in brackets with
     /// its key.
-    fn palette_update(&mut self) {
+    pub(super) fn palette_update(&mut self) {
         let Some(query) = self.w.input.as_ref().map(|i| i.text.clone()) else {
             return;
         };
         let hits = self.palette_hits(&query);
-        let key = |item: &Item| match item {
-            Item::Action(a) => self.keymap.key_path(*a),
-            Item::Tab(i) if *i < 9 => self.keymap.key_path(Action::GotoTab(*i as u8)),
-            _ => None,
-        };
-        let chosen_key = self
-            .w
-            .input
-            .as_ref()
-            .and_then(|i| hits.get(i.choice.min(hits.len().saturating_sub(1))))
-            .and_then(|h| key(&h.1));
         let Some(i) = self.w.input.as_mut() else {
             return;
         };
@@ -563,25 +599,44 @@ impl App {
             return;
         }
         i.choice = i.choice.min(hits.len() - 1);
-        let mut shown: Vec<String> = hits.iter().skip(i.choice).take(8).map(|s| s.0.clone()).collect();
-        shown[0] = match chosen_key {
-            Some(k) => format!("[{} · {k}]", shown[0]),
-            None => format!("[{}]", shown[0]),
-        };
-        i.status = format!("{}  ({}/{})", shown.join("  "), i.choice + 1, hits.len());
+        i.status = self.cfg.i18n.t(if i.completions { "completion-open-help" } else { "completion-help" }, &[]);
+    }
+
+    /// Snapshot for drawing: actions use exactly the same matching
+    /// and ordering as Enter, so the highlighted row is always the selected one.
+    pub(super) fn completion_items(&self) -> Option<Vec<(String, Option<String>)>> {
+        let input = self.w.input.as_ref()?;
+        if !input.completions || input.purpose != Purpose::Palette {
+            return None;
+        }
+        Some(
+            self.palette_hits(&input.text)
+                .into_iter()
+                .map(|(label, item)| {
+                    let key = match item {
+                        Item::Action(a) => self.keymap.key_path(a),
+                        Item::Tab(i) if i < 9 => self.keymap.key_path(Action::GotoTab(i as u8)),
+                        _ => None,
+                    };
+                    (label, key)
+                })
+                .collect(),
+        )
     }
 
     fn remember(&mut self, entry: String) {
         self.recent.retain(|r| *r != entry);
-        self.recent.insert(0, entry);
+        self.recent.insert(0, entry.clone());
         self.recent.truncate(RECENT_MAX);
         if let Some(path) = recent_path() {
-            let _ = path.parent().map(std::fs::create_dir_all);
-            let _ = std::fs::write(path, self.recent.join("\n") + "\n");
+            match remember_at(&path, &entry) {
+                Ok(recent) => self.recent = recent,
+                Err(e) => eprintln!("proteus: saving palette history: {e}"),
+            }
         }
     }
 
-    fn palette_run(&mut self) {
+    pub(super) fn palette_run(&mut self) {
         let Some((text, choice)) = self.w.input.as_ref().map(|i| (i.text.clone(), i.choice)) else {
             return;
         };
@@ -626,15 +681,17 @@ impl App {
             }
             Edit::Prev | Edit::Next if purpose == Purpose::Palette => {
                 if let Some(i) = self.w.input.as_mut() {
-                    i.choice = if key == Key::Up || mods.contains(Mods::SHIFT) {
-                        i.choice.saturating_sub(1)
-                    } else {
-                        i.choice + 1
-                    };
+                    i.navigate_completions(key == Key::Up || mods.contains(Mods::SHIFT));
                 }
                 self.palette_update();
             }
             Edit::Changed | Edit::Moved | Edit::Prev | Edit::Next => {}
+            Edit::Cancel if self.w.input.as_ref().is_some_and(|i| i.completions) => {
+                if let Some(input) = self.w.input.as_mut() {
+                    input.completions = false;
+                }
+                self.palette_update();
+            }
             Edit::Cancel => {
                 self.w.input = None;
                 if let Purpose::PluginPrompt(n) = purpose {
@@ -665,6 +722,7 @@ impl App {
             return;
         };
         input.insert(text);
+        input.choice = 0;
         match input.purpose {
             Purpose::Search => self.search_update(),
             Purpose::Palette => self.palette_update(),
@@ -733,5 +791,26 @@ mod tests {
         assert_eq!(nearest(&ms, &order, (2, Point::new(9, 0)), true), Some(0)); // wraps
         assert_eq!(nearest(&ms, &order, (1, Point::new(0, 0)), false), Some(3));
         assert_eq!(nearest(&[], &order, (1, Point::new(0, 0)), false), None);
+    }
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+
+    #[test]
+    fn palette_history_merges_instances_and_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("proteus-palette-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("palette_recent");
+        assert_eq!(remember_at(&path, "first").unwrap(), ["first"]);
+        assert_eq!(remember_at(&path, "second").unwrap(), ["second", "first"]);
+        assert_eq!(remember_at(&path, "first").unwrap(), ["first", "second"]);
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        std::fs::write(&path, [0xff]).unwrap();
+        assert!(remember_at(&path, "third").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), [0xff]);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

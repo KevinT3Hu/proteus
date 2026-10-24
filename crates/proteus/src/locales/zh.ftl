@@ -364,3 +364,9 @@ a11y-activate = 打开
 
 a11y-previous-items = 上一页项目
 a11y-next-items = 下一页项目
+
+completion-title = 补全选项
+completion-help = Tab：显示选项
+completion-open-help = Tab/↑/↓：选择 · 回车：确认 · Esc：收起
+action-config-open = 在编辑器中打开当前配置
+ui-no-config = 未选择配置文件（--no-config）

@@ -6,6 +6,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use swash::text::Codepoint;
 
 use bytemuck::{Pod, Zeroable};
 use proteus_core::cell::CellFlags;
@@ -569,7 +570,7 @@ impl Renderer {
         let bgra = matches!(format, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb);
         let mut out = Vec::with_capacity((w * h * 4) as usize);
         for row in data.chunks(stride as usize).take(h as usize) {
-            for px in row[..(w * 4) as usize].chunks_exact(4) {
+            for px in row[..(w * 4) as usize].as_chunks::<4>().0 {
                 if bgra {
                     out.extend_from_slice(&[px[2], px[1], px[0], 255]);
                 } else {
@@ -763,6 +764,7 @@ impl Renderer {
             };
             let Some(row) = grid.abs_row(line) else { continue };
             let is_cursor_row = cursor_row == Some(y);
+            let layout = t.visual_row(line);
             let mut run = Run::default();
             let mut cell_buf = String::new();
             // Run-length merge of backgrounds on this row.
@@ -775,8 +777,16 @@ impl Renderer {
                     x += 1;
                     continue;
                 }
+                let vx = layout.visual(x);
+                let rtl = layout.rtl(x);
                 let style = t.style(cell.style);
-                let selected = selection.is_some_and(|r| r.contains(Point::new(line, x)));
+                let selected = selection.is_some_and(|r| {
+                    if r.rect {
+                        line >= r.start.line && line <= r.end.line && vx <= r.end.col && vx + width > r.start.col
+                    } else {
+                        r.contains(Point::new(line, x))
+                    }
+                });
                 let mut fg = pal.resolve(style.fg, true);
                 let mut bg = pal.resolve(style.bg, false);
                 if style.attrs.contains(Attrs::BOLD)
@@ -819,16 +829,21 @@ impl Renderer {
 
                 // Backgrounds.
                 let cell_bg = if bg == default_bg { None } else { Some(bg) };
-                match (bg_run, cell_bg) {
-                    (Some((_, c)), Some(b)) if c == b => {}
-                    _ => {
-                        if let Some((start, c)) = bg_run.take() {
-                            self.rect(px + start as f32 * cw, top, (x - start) as f32 * cw, ch, rgba(c, 1.0));
+                if layout.has_rtl() {
+                    if let Some(bg) = cell_bg {
+                        self.rect(px + vx as f32 * cw, top, width as f32 * cw, ch, rgba(bg, 1.0));
+                    }
+                } else {
+                    match (bg_run, cell_bg) {
+                        (Some((_, c)), Some(b)) if c == b => {}
+                        _ => {
+                            if let Some((start, c)) = bg_run.take() {
+                                self.rect(px + start as f32 * cw, top, (x - start) as f32 * cw, ch, rgba(c, 1.0));
+                            }
+                            bg_run = cell_bg.map(|b| (x, b));
                         }
-                        bg_run = cell_bg.map(|b| (x, b));
                     }
                 }
-
                 // Glyph. Single-cell clusters the primary face covers are
                 // collected into runs and shaped together (ligatures, mark
                 // positioning); other clusters (wide, emoji, fallback fonts)
@@ -842,9 +857,9 @@ impl Renderer {
                 let text = cell_text(cell, &mut cell_buf);
                 let wide = width == 2;
                 let emoji = drawable && font::emoji_presentation(text, wide);
-                let shapable = drawable && !wide && !emoji && fonts.in_primary(text, st);
+                let shapable = drawable && !wide && !emoji && (rtl || fonts.in_primary(text, st));
                 let script = font::script_tag(text);
-                if !(shapable && info.ligatures && run.continues(x, st, color, script)) {
+                if !(shapable && (info.ligatures || rtl) && run.continues(x, st, color, script, rtl)) {
                     self.flush_run(fonts, &mut run, m, cw);
                 }
                 if shapable {
@@ -855,18 +870,31 @@ impl Renderer {
                         run.style = st;
                         run.color = color;
                         run.script = None;
+                        run.rtl = rtl;
+                        run.ligatures = info.ligatures;
                     }
                     run.script = run.script.or(script);
+                    run.positions.push(vx);
+                    run.colors.push(color);
                     run.starts.push(run.text.len() as u32);
                     run.text.push_str(text);
                 } else if drawable {
-                    let left = px + x as f32 * cw;
+                    let left = px + vx as f32 * cw;
                     let box_w = width as f32 * cw;
                     if cell.extra.is_none() && !emoji {
-                        if let Some(g) = fonts.glyph(cell.ch, st) {
+                        if let Some(g) =
+                            fonts.glyph(if rtl { cell.ch.mirror().unwrap_or(cell.ch) } else { cell.ch }, st)
+                        {
                             self.place_glyph(fonts, g, left, top, box_w, 0.0, 0.0, m, color);
                         }
                     } else {
+                        let mirrored;
+                        let text = if rtl {
+                            mirrored = text.chars().map(|c| c.mirror().unwrap_or(c)).collect::<String>();
+                            &mirrored
+                        } else {
+                            text
+                        };
                         let glyphs = fonts.shape_cluster(text, st, wide);
                         for g in glyphs.iter() {
                             self.place_glyph(fonts, g.glyph, left, top, box_w, g.x, g.y, m, color);
@@ -876,7 +904,7 @@ impl Renderer {
 
                 // Decorations.
                 let w = width as f32 * cw;
-                let left = px + x as f32 * cw;
+                let left = px + vx as f32 * cw;
                 let uc = match style.underline_color {
                     proteus_core::color::Color::Default => fg,
                     c => pal.resolve(c, true),
@@ -1054,27 +1082,50 @@ impl Renderer {
         m: Metrics,
         cw: f32,
     ) {
-        use unicode_segmentation::UnicodeSegmentation;
-        use unicode_width::UnicodeWidthStr;
-        let mut col = 0;
-        let graphemes: Vec<&str> = text.graphemes(true).collect();
-        let total: usize = graphemes.iter().map(|g| g.width().clamp(1, 2)).sum();
-        let limit = if total > cols { cols.saturating_sub(1) } else { cols };
-        let mut full = false;
-        for g in graphemes.iter().copied().chain((total > cols).then_some("…")) {
-            let w = g.width().clamp(1, 2);
-            if g != "…" && (full || col + w > limit) {
-                full = true;
-                continue;
+        let layout = proteus_core::bidi::TextLayout::new(text, cols);
+        let mut run = Run::default();
+        for cell in layout.cells {
+            let emoji = font::emoji_presentation(&cell.text, cell.width == 2);
+            let join = cell.rtl && cell.width == 1 && !emoji && cell.text != " ";
+            let script = font::script_tag(&cell.text);
+            if !join || !run.continues(cell.logical, style, color, script, true) {
+                self.flush_run(fonts, &mut run, m, cw);
             }
-            if g != " " {
-                let x = left + col as f32 * cw;
-                for sg in fonts.shape_cluster(g, style, w == 2).iter() {
-                    self.place_glyph(fonts, sg.glyph, x, top, w as f32 * cw, sg.x, sg.y, m, color);
+            if join {
+                if run.text.is_empty() {
+                    run.start = cell.logical;
+                    run.left = left;
+                    run.top = top;
+                    run.style = style;
+                    run.color = color;
+                    run.rtl = true;
+                    run.ligatures = true;
+                    run.script = None;
+                }
+                run.script = run.script.or(script);
+                run.starts.push(run.text.len() as u32);
+                run.positions.push(cell.visual);
+                run.colors.push(color);
+                run.text.push_str(&cell.text);
+            } else if cell.text != " " {
+                let text =
+                    if cell.rtl { cell.text.chars().map(|c| c.mirror().unwrap_or(c)).collect() } else { cell.text };
+                for sg in fonts.shape_cluster(&text, style, cell.width == 2).iter() {
+                    self.place_glyph(
+                        fonts,
+                        sg.glyph,
+                        left + cell.visual as f32 * cw,
+                        top,
+                        cell.width as f32 * cw,
+                        sg.x,
+                        sg.y,
+                        m,
+                        color,
+                    );
                 }
             }
-            col += w;
         }
+        self.flush_run(fonts, &mut run, m, cw);
     }
 
     /// Draw the input method's composition over the grid at the cursor:
@@ -1094,7 +1145,8 @@ impl Renderer {
         let (cw, ch) = (m.cell_w as f32, m.cell_h as f32);
         let (px, py) = origin;
         let cursor = t.cursor();
-        let start = preedit_start(cursor.x, p.width(), t.cols());
+        let x = t.visual_row(t.grid().abs_line(cursor.y)).visual(cursor.x);
+        let start = preedit_start(x, p.width(), t.cols());
         let top = py + row as f32 * ch;
         let left = px + start as f32 * cw;
         let fg = rgba(pal.foreground(), 1.0);
@@ -1105,27 +1157,21 @@ impl Renderer {
         // In `fg` so it covers the glyphs of the cells underneath.
         self.fg.push(solid(left, top, width, ch, rgba(pal.background(), 1.0)));
         self.fg.push(solid(left, uy, width, th, fg));
+        let layout = proteus_core::bidi::TextLayout::new(&p.text, t.cols() - start);
+        self.text_line(fonts, &p.text, left, top, t.cols() - start, 0, fg, m, cw);
         for c in &cells {
-            if start + c.col + c.width > t.cols() {
-                break;
-            }
-            let x = left + c.col as f32 * cw;
-            let box_w = c.width as f32 * cw;
-            let glyphs = fonts.shape_cluster(c.text, 0, c.width == 2);
-            for g in glyphs.iter() {
-                self.place_glyph(fonts, g.glyph, x, top, box_w, g.x, g.y, m, fg);
-            }
             if let Some((b, e)) = p.cursor
                 && b < e
                 && c.bytes.0 < e
                 && c.bytes.1 > b
+                && let Some(placed) = layout.cells.iter().find(|s| s.start == c.bytes.0)
             {
-                // Segment being converted.
+                let x = left + placed.visual as f32 * cw;
                 let thick = (th * 2.0).max(2.0);
-                self.fg.push(solid(x, (uy + th - thick).max(top), box_w, thick, fg));
+                self.fg.push(solid(x, (uy + th - thick).max(top), placed.width as f32 * cw, thick, fg));
             }
         }
-        if let Some(col) = p.cursor_col().filter(|_| p.cursor.is_some_and(|(b, e)| b == e)) {
+        if let Some(col) = p.cursor.filter(|(b, e)| b == e).map(|(b, _)| layout.caret(b)) {
             let x = left + col.min(t.cols() - start) as f32 * cw;
             let thick = (cw / 8.0).round().max(1.0);
             let c = rgba(pal.cursor().unwrap_or(pal.foreground()), 1.0);
@@ -1138,15 +1184,78 @@ impl Renderer {
         if run.text.is_empty() {
             return;
         }
-        let glyphs = fonts.shape(&run.text, run.style);
+        let glyphs = fonts.shape_directional(&run.text, run.style, run.rtl, run.ligatures);
+        // Fallback fonts can have taller cursive/mark extents than the primary
+        // monospace face. Fit the whole connected run uniformly into its row.
+        let mut vertical_scale = 1.0;
+        let mut vertical_shift = 0.0;
+        if run.rtl {
+            let mut top = f32::INFINITY;
+            let mut bottom = f32::NEG_INFINITY;
+            for g in glyphs.iter() {
+                if let Some(a) = self.glyph(fonts, g.glyph) {
+                    let y = m.baseline as f32 - g.y - a.top as f32;
+                    top = top.min(y);
+                    bottom = bottom.max(y + a.h as f32);
+                }
+            }
+            if top.is_finite() && (top < 0.0 || bottom > m.cell_h as f32) {
+                let height = (bottom - top).max(1.0);
+                vertical_scale = ((m.cell_h as f32 - 2.0).max(1.0) / height).min(1.0);
+                vertical_shift = (m.cell_h as f32 - height * vertical_scale) / 2.0 - top * vertical_scale;
+            }
+        }
         for g in glyphs.iter() {
-            // Cell whose text contains the glyph's cluster start.
             let cell = run.starts.partition_point(|&s| s <= g.src).saturating_sub(1);
-            let left = run.left + (run.start + cell) as f32 * cw;
-            self.place_glyph(fonts, g.glyph, left, run.top, cw, g.x, g.y, m, run.color);
+            if !run.rtl {
+                let left = run.left + run.positions[cell] as f32 * cw;
+                self.place_glyph(fonts, g.glyph, left, run.top, cw, g.x, g.y, m, run.colors[cell]);
+                continue;
+            }
+            let end = run.starts.partition_point(|&s| s < g.end).max(cell + 1).min(run.positions.len());
+            let column = run.positions[cell..end].iter().copied().min().unwrap_or(run.positions[cell]);
+            let box_w = (end - cell) as f32 * cw;
+            let scale = if g.advance > 0.0 { box_w / g.advance } else { 1.0 };
+            let before = self.fg.len();
+            self.place_scaled_glyph(
+                fonts,
+                g.glyph,
+                run.left + column as f32 * cw,
+                run.top,
+                box_w,
+                g.x,
+                g.y,
+                m,
+                run.colors[cell],
+                scale,
+                vertical_scale,
+                vertical_shift,
+            );
+            if self.fg.len() > before {
+                let glyph = self.fg.pop().unwrap();
+                // A ligature can cover differently selected cells. Color each visual slice.
+                for i in cell..end {
+                    let x = run.left + run.positions[i] as f32 * cw;
+                    let l = glyph.pos[0].max(x);
+                    let r = (glyph.pos[0] + glyph.size[0]).min(x + cw);
+                    if r <= l {
+                        continue;
+                    }
+                    let mut part = glyph;
+                    let u = glyph.uv[2] - glyph.uv[0];
+                    part.uv[0] = glyph.uv[0] + u * (l - glyph.pos[0]) / glyph.size[0];
+                    part.uv[2] = glyph.uv[0] + u * (r - glyph.pos[0]) / glyph.size[0];
+                    part.pos[0] = l;
+                    part.size[0] = r - l;
+                    part.color = run.colors[i];
+                    self.fg.push(part);
+                }
+            }
         }
         run.text.clear();
         run.starts.clear();
+        run.positions.clear();
+        run.colors.clear();
     }
 
     /// Draw a glyph in the cell box starting at `left`, offset by (`dx`, `dy`)
@@ -1164,10 +1273,29 @@ impl Renderer {
         m: Metrics,
         color: [f32; 4],
     ) {
+        self.place_scaled_glyph(fonts, g, left, top, box_w, dx, dy, m, color, 1.0, 1.0, 0.0);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn place_scaled_glyph(
+        &mut self,
+        fonts: &mut Fonts,
+        g: GlyphRef,
+        left: f32,
+        top: f32,
+        box_w: f32,
+        dx: f32,
+        dy: f32,
+        m: Metrics,
+        color: [f32; 4],
+        scale: f32,
+        vertical_scale: f32,
+        vertical_shift: f32,
+    ) {
         let Some(a) = self.glyph(fonts, g) else { return };
-        let (mut w, mut h) = (a.w as f32, a.h as f32);
-        let mut x = (left + dx + m.offset_x).round() + a.left as f32;
-        let mut y = (top + m.baseline as f32 - dy).round() - a.top as f32;
+        let (mut w, mut h) = (a.w as f32 * scale, a.h as f32 * vertical_scale);
+        let mut x = (left + dx * scale + m.offset_x).round() + a.left as f32 * scale;
+        let mut y = (top + (m.baseline as f32 - dy - a.top as f32) * vertical_scale + vertical_shift).round();
         if a.color {
             // Fit color glyphs (emoji bitmaps) into their cell box.
             let ch = m.cell_h as f32;
@@ -1206,13 +1334,18 @@ struct Run {
     text: String,
     /// Byte offset in `text` where each cell's text starts.
     starts: Vec<u32>,
+    positions: Vec<usize>,
+    colors: Vec<[f32; 4]>,
+    rtl: bool,
+    ligatures: bool,
 }
 
 impl Run {
-    fn continues(&self, x: usize, style: u8, color: [f32; 4], script: Option<u32>) -> bool {
+    fn continues(&self, x: usize, style: u8, color: [f32; 4], script: Option<u32>, rtl: bool) -> bool {
         self.text.is_empty()
             || (self.style == style
-                && self.color == color
+                && (rtl || self.color == color)
+                && self.rtl == rtl
                 && self.start + self.starts.len() == x
                 && (script.is_none() || self.script.is_none() || script == self.script))
     }

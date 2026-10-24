@@ -25,6 +25,8 @@ pub struct Cell {
     pub flags: CellFlags,
     /// Combining marks / further code points of the grapheme cluster.
     pub extra: Option<Box<str>>,
+    /// Zero-width bidi formatting at the start of a row, before this character.
+    pub prefix: Option<Box<str>>,
 }
 
 impl Default for Cell {
@@ -35,12 +37,16 @@ impl Default for Cell {
 
 impl Cell {
     pub const fn blank(style: StyleId) -> Self {
-        Self { ch: ' ', style, flags: CellFlags::empty(), extra: None }
+        Self { ch: ' ', style, flags: CellFlags::empty(), extra: None, prefix: None }
     }
 
     /// Blank with default style: carries no information and can be trimmed.
     pub fn is_empty(&self) -> bool {
-        self.ch == ' ' && self.style == StyleId::DEFAULT && self.flags.is_empty() && self.extra.is_none()
+        self.ch == ' '
+            && self.style == StyleId::DEFAULT
+            && self.flags.is_empty()
+            && self.extra.is_none()
+            && self.prefix.is_none()
     }
 
     pub fn is_spacer(&self) -> bool {
@@ -60,6 +66,9 @@ impl Cell {
 
     /// Append the cell's text (base char + extras) to `out`.
     pub fn push_text(&self, out: &mut String) {
+        if let Some(prefix) = &self.prefix {
+            out.push_str(prefix);
+        }
         out.push(self.ch);
         if let Some(extra) = &self.extra {
             out.push_str(extra);

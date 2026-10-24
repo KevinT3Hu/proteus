@@ -16,6 +16,7 @@ proteus-pty = { path = "crates/proteus-pty" }
 vte = "=0.15.0"
 bitflags = "=2.13.2"
 unicode-width = "=0.2.2"
+unicode-bidi = "=0.3.18"
 unicode-segmentation = "=1.13.3"
 regex = "=1.13.1"
 base64 = "=0.22.1"

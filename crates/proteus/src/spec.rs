@@ -369,11 +369,53 @@ fn tab(t: &Table, at: &str) -> Result<TabSpec, String> {
 
 /// Evaluate layout (or session) source. `chunk` names it in errors.
 pub fn parse(src: &str, chunk: &str) -> Result<LayoutSpec, String> {
-    let lua = Lua::new_with(StdLib::ALL_SAFE, LuaOptions::default()).map_err(|e| e.to_string())?;
+    if src.len() > 1 << 20 {
+        return Err("layout exceeds 1 MiB".into());
+    }
+    // Layouts are data with bounded computation; no filesystem, process,
+    // module-loading, debug, or coroutine APIs are needed.
+    let lua = Lua::new_with(StdLib::TABLE | StdLib::STRING | StdLib::MATH, LuaOptions::default())
+        .map_err(|e| e.to_string())?;
+    lua.set_memory_limit(16 << 20).map_err(|e| e.to_string())?;
+    let start = std::time::Instant::now();
+    lua.set_hook(mlua::HookTriggers::new().every_nth_instruction(1000), move |_, _| {
+        if start.elapsed() > std::time::Duration::from_millis(100) {
+            Err(mlua::Error::runtime("layout execution limit exceeded"))
+        } else {
+            Ok(mlua::VmState::Continue)
+        }
+    })
+    .map_err(|e| e.to_string())?;
     let value: Value = lua.load(src).set_name(format!("@{chunk}")).eval().map_err(|e| {
         let s = e.to_string();
         s.lines().next().unwrap_or("").trim_start_matches("runtime error: ").to_string()
     })?;
+    fn validate(
+        value: &Value,
+        depth: usize,
+        nodes: &mut usize,
+        seen: &mut std::collections::HashSet<usize>,
+    ) -> Result<(), String> {
+        *nodes += 1;
+        if depth > 32 || *nodes > 16384 {
+            return Err("layout exceeds depth or size limit".into());
+        }
+        if let Value::Table(t) = value {
+            if t.metatable().is_some() {
+                return Err("layout tables cannot have metatables".into());
+            }
+            if !seen.insert(t.to_pointer() as usize) {
+                return Err("layout contains repeated or cyclic tables".into());
+            }
+            for pair in t.pairs::<Value, Value>() {
+                let (k, v) = pair.map_err(|e| e.to_string())?;
+                validate(&k, depth + 1, nodes, seen)?;
+                validate(&v, depth + 1, nodes, seen)?;
+            }
+        }
+        Ok(())
+    }
+    validate(&value, 0, &mut 0, &mut std::collections::HashSet::new())?;
     let Value::Table(t) = value else { return Err(format!("{chunk}: the file must `return {{ tabs = {{ ... }} }}`")) };
     let mut spec = LayoutSpec::default();
     let tabs = |v: Value, prefix: &str| -> Result<Vec<TabSpec>, String> {
@@ -429,7 +471,11 @@ pub fn parse(src: &str, chunk: &str) -> Result<LayoutSpec, String> {
 }
 
 pub fn load(path: &Path) -> Result<LayoutSpec, String> {
-    let src = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    use std::io::Read;
+    let mut src = String::new();
+    std::fs::File::open(path)
+        .and_then(|f| f.take((1 << 20) + 1).read_to_string(&mut src))
+        .map_err(|e| format!("{}: {e}", path.display()))?;
     parse(&src, &path.display().to_string())
 }
 
@@ -685,6 +731,16 @@ mod tests {
           },
         }
     "#;
+
+    #[test]
+    fn runaway_allocating_cyclic_and_deep_layouts_are_rejected() {
+        assert!(parse("while true do end", "loop").is_err());
+        assert!(parse("return string.rep('x', 32 * 1024 * 1024)", "allocation").is_err());
+        assert!(parse("local t = {}; t[1] = t; return {tabs={t}}", "cycle").is_err());
+        assert!(parse("local t = {}; for i=1,100 do t={t} end; return {tabs={t}}", "deep").is_err());
+        assert!(parse("local t = {}; for i=1,20000 do t[i]=i end; return {tabs={t}}", "large").is_err());
+        assert!(parse("return {tabs={{cmd='sh'}}}", "valid").is_ok());
+    }
 
     #[test]
     fn parse_doc_example() {

@@ -66,8 +66,12 @@ impl Pane {
         let mut reader = pty.try_clone_master()?;
         let reader_stop = Arc::new(AtomicBool::new(false));
         let stop = reader_stop.clone();
+        use proteus_pty::budget::Budget;
+        static OUTPUT: std::sync::OnceLock<Budget> = std::sync::OnceLock::new();
+        let total = OUTPUT.get_or_init(|| Budget::new(512 << 10, 64)).clone();
+        let pending = Budget::new(64 << 10, 8);
         std::thread::Builder::new().name(format!("pty-reader-{id}")).spawn(move || {
-            let mut buf = vec![0u8; 64 * 1024];
+            let mut buf = vec![0u8; 8 * 1024];
             loop {
                 if stop.load(Ordering::Relaxed) {
                     return;
@@ -75,7 +79,9 @@ impl Pane {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        if tx.send(Msg::Pty(id, buf[..n].to_vec())).is_err() {
+                        let Some(local) = pending.acquire(n, &stop) else { return };
+                        let Some(global) = total.acquire(n, &stop) else { return };
+                        if tx.send(Msg::Pty(id, buf[..n].to_vec(), (local, global))).is_err() {
                             return;
                         }
                     }

@@ -371,6 +371,8 @@ pub enum Action {
     TabToNextWindow,
     /// Run any action by name.
     Palette,
+    /// Open the selected Lua configuration in an editor pane.
+    OpenConfig,
     /// Copy part of the block at the Scroll cursor (else the last one).
     BlockCopy(Part),
     /// Select part of the block at the Scroll cursor.
@@ -503,6 +505,7 @@ impl Action {
             Action::PaneToNewWindow => "pane.to_new_window".into(),
             Action::TabToNextWindow => "tab.to_next_window".into(),
             Action::Palette => "palette".into(),
+            Action::OpenConfig => "config.open".into(),
             Action::BlockCopy(p) => format!("block.copy_{}", p.key()),
             Action::BlockSelect(p) => format!("block.select_{}", p.key()),
             Action::BlockFold => "block.fold".into(),
@@ -575,6 +578,7 @@ impl Action {
             Action::PaneToNewWindow,
             Action::TabToNextWindow,
             Action::Palette,
+            Action::OpenConfig,
         ]);
         const PARTS: [Part; 3] = [Part::Command, Part::Output, Part::All];
         v.extend(PARTS.map(Action::BlockCopy));
@@ -658,6 +662,7 @@ impl Action {
             Action::TabToNextWindow => "ui-to-next-window",
             Action::Palette if mode.passes_keys() => return None,
             Action::Palette => "action-palette",
+            Action::OpenConfig => "action-config-open",
             Action::BlockCopy(_) => "ui-copy-block",
             Action::BlockSelect(_) => "ui-select-block",
             Action::BlockFold => "ui-fold",

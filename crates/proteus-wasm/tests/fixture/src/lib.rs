@@ -44,6 +44,16 @@ impl Guest for Fixture {
                     #[allow(clippy::empty_loop)]
                     loop {}
                 }
+                "host-flood" => {
+                    for _ in 0..100_000 { host::log("queued payload"); }
+                }
+                "storage-set" => report("storage-set", host::storage_set("key", "persisted")),
+                "storage-read" => host::notify(&format!("storage: {:?}", host::storage_get("key")), false),
+                "storage-keys" => host::notify(&format!("keys: {:?}", host::storage_keys()), false),
+                "storage-delete" => {
+                    host::storage_delete("key");
+                    host::notify("delete returned", false);
+                }
                 "panic" => panic!("on purpose"),
                 "alloc" => {
                     let v: Vec<u8> = vec![1; 1 << 30];

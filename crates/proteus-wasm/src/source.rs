@@ -481,7 +481,7 @@ mod tests {
         let sysroot = PathBuf::from(String::from_utf8(sysroot.stdout).unwrap().trim());
         if !sysroot.join("lib/rustlib/wasm32-wasip2/lib").is_dir() {
             assert!(
-                std::env::var_os("PROTEUS_REQUIRE_WASM_TESTS").is_none(),
+                std::env::var_os("PROTEUS_REQUIRE_WASM_TESTS").is_none() && std::env::var_os("CI").is_none(),
                 "wasm32-wasip2 is required for this test job"
             );
             eprintln!("skipping real source compilation: no wasm32-wasip2 target");

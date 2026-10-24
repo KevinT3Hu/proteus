@@ -15,6 +15,23 @@
 | Lifecycle | Config reload replaces hooks, timers and UI | Explicit source declarations; resolve, build, cache and run |
 | Threading | Runs on the main thread; must be fast (budget per hook, warn if > 5 ms) | Each plugin instance in its own worker thread |
 
+## Actions and config editing
+
+Open Actions with Ctrl+Shift+P. Tab opens matching completions, or all entries
+when the query is empty. Tab/Shift+Tab or Up/Down navigate; Enter or a click
+chooses an entry. Typing filters the open list. Escape dismisses the popup,
+then closes the input bar.
+
+Choose **Open config in editor** (`config.open`) to open the running instance's
+selected Lua file, including a custom `-c` path, in a new pane. The editor is
+`VISUAL`, then `EDITOR`, then `vi`. Missing parent directories are created; the
+editor saves the file. Saving uses normal config hot reload. With `--no-config`,
+the action reports that no file was selected. Bind it directly, for example:
+
+```lua
+p.keymap("normal", "ctrl+alt+s", "config.open")
+```
+
 ## Lua config
 
 - Entry: `$XDG_CONFIG_HOME/proteus/init.lua`; override with `proteus -c /path/to/config.lua` (or `--config`). `require` and relative WASM source paths resolve within the selected config directory. `--no-config` uses defaults and conflicts with `-c`.
@@ -383,11 +400,13 @@ available for prebuilt v1 components; its name acts as its legacy action ID.
 
 Implemented: `wit/proteus.wit` in `crates/proteus-plugin` (the SDK), host in `crates/proteus-wasm` (wasmtime 50, WASI p2), GUI in `gui/plugins.rs`, example `examples/plugins/pane-list`.
 
+- Host traffic is acknowledged after GUI consumption, including frames and logs: each plugin has one host call in flight. Messages are limited to 4 MiB (image loads use the separate 64 MiB image quota); more than 2000 host calls per second stops the instance. Log/status text is truncated; prompts/actions are capped at 16/256. The incoming event queue holds 256 events; overflow stops the instance instead of blocking the GUI or dropping terminal input silently.
+- Custom filesystem helpers retain grant-root and target/parent descriptors using Linux `openat2` containment. Linux 5.6 or newer and mounted `/proc` are required; unsupported containment fails closed. Symlink escapes are rejected. Source builds and allowlisted native processes still have normal user privileges, as described above.
 - Each instance runs in its own thread; a call into it may run 5 s (epoch interruption, also used to stop it at once), memory 256 MiB. Traps and timeouts stop the instance and are shown; it is restarted after 1 s, at most 3 times a session. `init` failures are not retried.
 - Permissions: all of the table above. `run-command` lists program names (looked up in `PATH`, run without a shell in their own process group; `run` with a timeout, `spawn-process` streaming stdout/stderr); `network` lists hosts (`*.example.com`, `host:port`; ureq with rustls and the system's certificates, no redirects followed); `secrets` uses the Secret Service (entries tagged with the plugin id). Every plugin has its own `/data` directory (`$XDG_DATA_HOME/proteus/plugin-data/ID`) and a key-value store next to it (`ID.storage.toml`, 1 MiB); `fs` grants are visible at their real paths, with `watch` (inotify), `trash` (freedesktop), `open` and `mime-type`. Existing single-file grants fail validation rather than silently disappearing. `file-mode`, `set-file-mode`, `create-private`, and `publish-file` let plugins preserve permissions and stage new files privately without widening their filesystem grants. Time spent in host calls does not count against the 5 s limit.
 - Surfaces: `sidebar-left`, `sidebar-right` (take columns from the panes), `float` (centered), `overlay` (below the focused pane's cursor), and `pane-right`, `pane-down`, `tab` (a pane in the layout with no PTY). Layouts may hold plugin panes (`{ plugin = "ID", args = "..." }`); the plugin hears `surface-opened(id, args)` once it runs, and again after a restart (its panes stay while it is stopped). Frames are styled spans plus image placements (`load-image` RGBA, sent to the surface terminal with the kitty protocol); the host writes them into a terminal with control characters of the plugin's text removed, drawn by the pane renderer. Keys reach a focused surface (or a focused plugin pane) unless the mode binds them; plugins register their own actions and default bindings for opening/focusing their surfaces and returning focus with `focus-pane`; mouse events have press, release and drag; files dropped from other programs arrive as `drop(paths)`. Input-method text arrives as `text`; while composing, the host draws the preedit at the frame's cursor and sends `preedit(text, cursor)` (none when it ends), so a plugin need only place its cursor.
 - `list-dir(path)`: a directory's entries with type, size and mtime in one call (WASI needs one call per entry).
-- Compiled plugins are kept in `<cache>/compiled/<sha256>-<engine>.cwasm` (mode 0600, used only if owned by the user and not group/other-writable), so only the first start compiles.
+- Plugins compile from WASM bytes; up to 16 compiled components are cached in memory. Native `.cwasm` files on disk are not deserialized. The old `Spec.compiled` field is ignored for compatibility.
 - `register-action-id(id, name, default-key)` (SDK: `host::register_action`): stable IDs and user-overridable defaults as described above. `pane-remote(id)` names the host of a pane whose cwd (OSC 7) is on another machine. `start-drag(surface, paths)` during a drag on a surface: released over a terminal pane, the paths are pasted there shell-quoted. `prompt` and `confirm` use the input line and the bottom prompt (`answered`); tasks show in the status bar and can be cancelled from the palette (`task-cancelled`). `block-state-changed` and `config-changed` events; `clipboard-read/write`.
 - `pane.toggle_private` hides a pane from `read-screen` and block events.
 - SDK helpers: styled text, grapheme-aware `fit`/`pad`/`clip`, `List`, `TextInput`, `Tree`, `Table`, `Spinner`, `ScrollView`. The `ui` module provides a declarative `Component` trait: `view()` returns an `Element` tree of pages, rows, columns, lists, text, inputs and images. `Component::render` owns layout, clipping, inherited styles, cursors and image placement, and returns a frame plus named regions for hit testing. Custom components nest through `Element::component`; responsive views receive their allocated size. `Canvas` and `Rect` remain the low-level backend. See the [SDK UI guide](../../crates/proteus-plugin/README.md).
@@ -406,6 +425,23 @@ The WIT interfaces below belong to WASM. The Lua config API above uses terminal 
 - `secrets`: get/set/delete own keys.
 - `tasks`: background task handle with progress, cancel.
 - `storage`: plugin data dir + small key-value store.
+
+The key-value store uses a stable private sidecar lock around read/modify/write,
+reloads the latest disk state on each operation, and synchronizes both the new
+file and containing directory before a successful save. Separate terminal
+processes therefore merge individual key updates instead of overwriting a stale
+cached map. Storage files/locks are 0600 and their application-owned parent
+directory is 0700 (existing user-owned state directories are migrated).
+Missing files mean an empty store; malformed, invalid UTF-8, unreadable, or
+oversized files produce errors and are not silently reset or overwritten.
+The 1 MiB quota counts logical keys/values; serialized TOML reads are bounded at
+8 MiB to accommodate escaping. A failed update has no speculative memory cache;
+if rename succeeded before a directory-sync error, reads see the published value
+and a repeated set still retries synchronization. The existing WIT API is
+preserved: `storage-set` returns its error; legacy get/keys/delete calls also
+surface I/O/corruption failures as host error notifications (get/keys return
+none/empty when they cannot read). Repair/move a corrupt store explicitly before
+retrying. Multi-call get-then-set sequences are not atomic transactions.
 
 ## Plugin UI model
 

@@ -16,7 +16,6 @@ use std::rc::Rc;
 use swash::scale::image::Content;
 
 use swash::scale::{Render, ScaleContext, Source, StrikeWith};
-use swash::shape::ShapeContext;
 use swash::text::{Codepoint, Script};
 use swash::zeno::{Angle, Format, Transform};
 use swash::{CacheKey, FontRef};
@@ -43,6 +42,7 @@ struct Face {
     data: Arc<Vec<u8>>,
     offset: u32,
     key: CacheKey,
+    shaping: harfrust::Font,
     synth_bold: bool,
     synth_italic: bool,
 }
@@ -80,6 +80,8 @@ pub struct ShapedGlyph {
     /// Byte offset (within the shaped text) of the cluster the glyph
     /// belongs to; the caller maps it to a cell.
     pub src: u32,
+    pub end: u32,
+    pub advance: f32,
     pub glyph: GlyphRef,
     /// Offset from the left edge of that cluster's cell and from the
     /// baseline, in pixels (`y` is up).
@@ -193,9 +195,8 @@ pub struct Fonts {
     fallback: HashMap<(char, u8), Option<usize>>,
     glyphs: HashMap<(char, u8), Option<GlyphRef>>,
     ctx: ScaleContext,
-    shaper: ShapeContext,
     /// Shaped runs per style.
-    shaped: [HashMap<String, Rc<[ShapedGlyph]>>; STYLES],
+    shaped: [HashMap<String, Rc<[ShapedGlyph]>>; STYLES * 4],
     /// Shaped grapheme clusters (combining sequences, emoji) per style.
     clusters: [HashMap<String, Rc<[ShapedGlyph]>>; STYLES],
     /// Color emoji face, looked up on first use.
@@ -205,7 +206,8 @@ pub struct Fonts {
 
 /// Characters that never get a glyph of their own.
 fn invisible(c: char) -> bool {
-    matches!(c, '\u{200b}'..='\u{200f}' | '\u{fe00}'..='\u{fe0f}' | '\u{2060}'..='\u{2064}')
+    proteus_core::bidi::is_control(c)
+        || matches!(c, '\u{200b}'..='\u{200f}' | '\u{fe00}'..='\u{fe0f}' | '\u{2060}'..='\u{2064}')
 }
 
 /// Whether a cluster should use a color emoji font: explicit emoji
@@ -220,16 +222,7 @@ pub fn emoji_presentation(text: &str, wide: bool) -> bool {
     matches!(base, '\u{1f1e6}'..='\u{1f1ff}') || chars.any(marker) || (wide && base.is_extended_pictographic())
 }
 
-/// Script for shaping: the first one that is not Common/Inherited.
-fn script_of(text: &str) -> Script {
-    text.chars()
-        .map(Codepoint::script)
-        .find(|s| !matches!(s, Script::Common | Script::Inherited | Script::Unknown))
-        .unwrap_or(Script::Latin)
-}
-
-/// Opaque id of a text's script (see [`script_of`]), `None` if it only has
-/// Common/Inherited characters. Runs break where this changes.
+/// Opaque script id, or None for Common/Inherited characters. Runs break on script changes.
 pub fn script_tag(text: &str) -> Option<u32> {
     text.chars()
         .map(Codepoint::script)
@@ -266,7 +259,6 @@ impl Fonts {
             fallback: HashMap::new(),
             glyphs: HashMap::new(),
             ctx: ScaleContext::new(),
-            shaper: ShapeContext::new(),
             shaped: Default::default(),
             clusters: Default::default(),
             emoji: None,
@@ -297,7 +289,9 @@ impl Fonts {
         };
         let font = FontRef::from_index(&data, m.index as usize)?;
         let (offset, key) = (font.offset, font.key);
-        self.faces.push(Face { data, offset, key, synth_bold, synth_italic });
+        let source: Arc<dyn AsRef<[u8]> + Send + Sync> = data.clone();
+        let shaping = harfrust::Font::new(source, m.index)?;
+        self.faces.push(Face { data, offset, key, shaping, synth_bold, synth_italic });
         Some(self.faces.len() - 1)
     }
 
@@ -415,40 +409,69 @@ impl Fonts {
 
     /// Shape `text` with one face; glyph positions are relative to the
     /// start of their (shaper) cluster.
-    fn shape_with_face(&mut self, face_idx: usize, text: &str, style: u8) -> Vec<ShapedGlyph> {
+    fn shape_with_face(
+        &mut self,
+        face_idx: usize,
+        text: &str,
+        style: u8,
+        rtl: bool,
+        ligatures: bool,
+    ) -> Vec<ShapedGlyph> {
         let face = &self.faces[face_idx];
-        let font = face.font();
-        // Variation selectors the face does not map would shape as .notdef
-        // and block sequences (keycaps, VS16 emoji): drop them, remembering
-        // each kept byte's original offset.
-        let cmap = font.charmap();
-        let mut stripped = String::with_capacity(text.len());
-        let mut orig = Vec::with_capacity(text.len() + 1);
-        for (b, c) in text.char_indices() {
-            if matches!(c, '\u{fe00}'..='\u{fe0f}') && cmap.map(c) == 0 {
-                continue;
-            }
-            stripped.push(c);
-            orig.extend((0..c.len_utf8() as u32).map(|i| b as u32 + i));
+        // HarfRust retains UTF-8 cluster offsets while handling normalization,
+        // variation selectors, default ignorables, and RTL mirroring.
+        let mut buffer = harfrust::Buffer::new();
+        buffer.push_str(text);
+        buffer.set_direction(if rtl { harfrust::Direction::RightToLeft } else { harfrust::Direction::LeftToRight });
+        buffer.guess_segment_properties();
+        let features = if ligatures {
+            Vec::new()
+        } else {
+            vec![
+                harfrust::Feature::new(harfrust::Tag::new(b"liga"), 0, ..),
+                harfrust::Feature::new(harfrust::Tag::new(b"clig"), 0, ..),
+            ]
+        };
+        let shaper = harfrust::ShaperFont::new(&face.shaping);
+        if harfrust::shape(&shaper, &mut buffer, harfrust::ShapeOptions::new().features(&features)).is_err() {
+            return Vec::new();
         }
-        orig.push(text.len() as u32);
-        let mut shaper = self.shaper.builder(font).script(script_of(text)).size(self.px).build();
-        shaper.add_str(&stripped);
-        let mut out = Vec::with_capacity(text.len());
-        let mut pen = 0.0f32;
-        shaper.shape_with(|cluster| {
-            let start = pen;
-            let src = orig[(cluster.source.start as usize).min(orig.len() - 1)];
-            for g in cluster.glyphs {
-                out.push(ShapedGlyph {
-                    src,
-                    glyph: GlyphRef { face: face_idx as u16, glyph: g.id, style },
-                    x: pen - start + g.x,
-                    y: g.y,
-                });
-                pen += g.advance;
+        let infos = buffer.glyph_infos();
+        let positions = buffer.glyph_positions();
+        let mut boundaries: Vec<_> = infos.iter().map(|g| g.cluster as usize).collect();
+        boundaries.push(text.len());
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        let scale = self.px / face.shaping.units_per_em().max(1) as f32;
+        let mut out = Vec::with_capacity(infos.len());
+        let mut i = 0;
+        while i < infos.len() {
+            let begin = infos[i].cluster as usize;
+            let mut j = i + 1;
+            while j < infos.len() && infos[j].cluster as usize == begin {
+                j += 1;
             }
-        });
+            let end = boundaries[boundaries.partition_point(|&b| b <= begin).min(boundaries.len() - 1)];
+            let advance = positions[i..j].iter().map(|p| p.x_advance as f32 * scale).sum();
+            let mut pen = 0.0;
+            for index in i..j {
+                let g = &infos[index];
+                let p = &positions[index];
+                if g.glyph_id > u16::MAX as u32 {
+                    continue;
+                }
+                out.push(ShapedGlyph {
+                    src: begin as u32,
+                    end: end as u32,
+                    advance,
+                    glyph: GlyphRef { face: face_idx as u16, glyph: g.glyph_id as u16, style },
+                    x: pen + p.x_offset as f32 * scale,
+                    y: p.y_offset as f32 * scale,
+                });
+                pen += p.x_advance as f32 * scale;
+            }
+            i = j;
+        }
         out
     }
 
@@ -456,18 +479,32 @@ impl Fonts {
     /// see [`Fonts::in_primary`]) so the font's ligatures, contextual
     /// alternates and mark positioning apply. Glyphs are positioned relative
     /// to the cell their cluster starts at, so the grid never drifts.
+    #[cfg(test)]
     pub fn shape(&mut self, text: &str, style: u8) -> Rc<[ShapedGlyph]> {
-        if let Some(r) = self.shaped[style as usize].get(text) {
+        self.shape_directional(text, style, false, true)
+    }
+
+    pub fn shape_directional(&mut self, text: &str, style: u8, rtl: bool, ligatures: bool) -> Rc<[ShapedGlyph]> {
+        let index = style as usize + usize::from(rtl) * STYLES + usize::from(!ligatures) * STYLES * 2;
+        if let Some(r) = self.shaped[index].get(text) {
             return r.clone();
         }
-        let mut out = self.shape_with_face(self.primary[style as usize], text, style);
+        let chars: Vec<_> =
+            text.chars().filter(|&c| !invisible(c)).map(|c| if rtl { c.mirror().unwrap_or(c) } else { c }).collect();
+        let primary = self.primary[style as usize];
+        let face = if chars.iter().all(|&c| self.faces[primary].font().charmap().map(c) != 0) {
+            primary
+        } else {
+            self.fallback_for(&chars, style).unwrap_or(primary)
+        };
+        let mut out = self.shape_with_face(face, text, style, rtl, ligatures);
         out.retain(|g| g.glyph.glyph != 0);
         let out: Rc<[ShapedGlyph]> = out.into();
-        let cache = &mut self.shaped[style as usize];
+        let cache = &mut self.shaped[index];
         if cache.len() >= SHAPE_CACHE {
             cache.clear();
         }
-        cache.insert(text.to_string(), out.clone());
+        cache.insert(text.to_owned(), out.clone());
         out
     }
 
@@ -510,17 +547,18 @@ impl Fonts {
             face = self.fallback_for(&visible, style).filter(|&f| covers(self, f));
         }
         if let Some(f) = face {
-            let out = self.shape_with_face(f, text, style);
+            let out = self.shape_with_face(f, text, style, false, true);
             if !out.is_empty() && out.iter().all(|g| g.glyph.glyph != 0) {
                 // A cluster is one cell: everything is relative to its start.
                 return out.into_iter().map(|g| ShapedGlyph { src: 0, ..g }).collect();
             }
         }
         // No single face covers it: overlay each char's own glyph.
+        let advance = self.metrics.cell_w as f32;
         visible
             .iter()
             .filter_map(|&c| self.glyph(c, style))
-            .map(|glyph| ShapedGlyph { src: 0, glyph, x: 0.0, y: 0.0 })
+            .map(|glyph| ShapedGlyph { src: 0, end: text.len() as u32, advance, glyph, x: 0.0, y: 0.0 })
             .collect()
     }
 
@@ -539,6 +577,26 @@ impl Fonts {
     fn fallback_for(&mut self, chars: &[char], style: u8) -> Option<usize> {
         let w = if style & BOLD != 0 { FC_WEIGHT_BOLD } else { FC_WEIGHT_REGULAR };
         let s = if style & ITALIC != 0 { FC_SLANT_ITALIC } else { FC_SLANT_ROMAN };
+        for family in self.settings.fallback_families.clone() {
+            let Some(m) = self.fc.as_ref()?.find(&family, w, s, chars, false) else {
+                continue;
+            };
+            let generic = matches!(
+                family.as_str(),
+                "serif" | "sans-serif" | "monospace" | "emoji" | "system-ui" | "cursive" | "fantasy"
+            );
+            if !generic && !m.family.to_lowercase().contains(&family.to_lowercase()) {
+                continue;
+            }
+            if let Some(face) = self.face_for(
+                &m,
+                style & BOLD != 0 && m.weight < FC_WEIGHT_SEMIBOLD,
+                style & ITALIC != 0 && m.slant == FC_SLANT_ROMAN,
+            ) && chars.iter().all(|&c| self.faces[face].font().charmap().map(c) != 0)
+            {
+                return Some(face);
+            }
+        }
         let m = self.fc.as_ref()?.find(&self.family, w, s, chars, false)?;
         let synth_bold = style & BOLD != 0 && m.weight < FC_WEIGHT_SEMIBOLD;
         let synth_italic = style & ITALIC != 0 && m.slant == FC_SLANT_ROMAN;
@@ -627,6 +685,39 @@ impl Fonts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arabic_fallback_shapes_joining_even_without_optional_ligatures() {
+        let Ok(mut font) = Fonts::new("monospace", 16.0, 1.0) else {
+            return;
+        };
+        let joined = font.shape_directional("بب", 0, true, false);
+        let sample = font.shape_directional("السلام عليكم", 0, true, true);
+        eprintln!("Arabic sample: {:?}", sample);
+        if let Some(g) = sample.first() {
+            eprintln!(
+                "Arabic face {:?}",
+                font.faces[g.glyph.face as usize]
+                    .font()
+                    .localized_strings()
+                    .map(|s| s.to_string())
+                    .filter(|s| s.len() < 100)
+                    .take(10)
+                    .collect::<Vec<_>>()
+            );
+        }
+        if joined.is_empty() {
+            eprintln!("Arabic fallback font unavailable");
+            return;
+        }
+        assert!(joined.iter().all(|g| g.end > g.src && g.advance > 0.0));
+        let isolated = font.shape_directional("ب", 0, true, false);
+        assert!(!isolated.is_empty());
+        assert!(joined.iter().any(|g| g.glyph != isolated[0].glyph), "contextual forms must not be isolated glyphs");
+        let normal = font.shape_directional("(", 0, false, true);
+        let mirrored = font.shape_directional(")", 0, true, true);
+        assert_eq!(normal[0].glyph, mirrored[0].glyph);
+    }
 
     #[test]
     fn configured_cells_spacing_offsets_and_scale() {

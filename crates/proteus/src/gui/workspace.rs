@@ -2,6 +2,7 @@
 //! [`LayoutSpec`] as tabs, describing the window as one, and keeping the
 //! session file up to date.
 
+use proteus_pty::persistence::StateFile;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io;
@@ -24,8 +25,11 @@ use crate::spec::{self, FloatSpec, LayoutSpec, NodeSpec, PaneSpec, TabSpec};
 pub struct SessionStore {
     path: PathBuf,
     _lock: File,
-    /// Last text written, to skip identical saves.
-    last: String,
+    file: StateFile,
+    /// Only a fully synchronized save may populate this cache.
+    last: Option<String>,
+    /// Preserve unreadable/oversized snapshots if they cannot be backed up.
+    blocked: bool,
 }
 
 /// `$XDG_STATE_HOME/proteus` (default `~/.local/state/proteus`).
@@ -39,39 +43,97 @@ pub(super) fn state_dir() -> Option<PathBuf> {
 
 impl SessionStore {
     pub fn acquire() -> Option<SessionStore> {
-        let dir = state_dir()?;
-        std::fs::create_dir_all(&dir).ok()?;
-        let lock = File::options().create(true).truncate(false).write(true).open(dir.join("session.lock")).ok()?;
-        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).ok()?;
-        Some(SessionStore { path: dir.join("session.lua"), _lock: lock, last: String::new() })
+        Self::acquire_at(state_dir()?)
+            .map_err(|e| {
+                if e.kind() != io::ErrorKind::WouldBlock {
+                    eprintln!("proteus: session persistence disabled: {e}");
+                }
+                e
+            })
+            .ok()
     }
 
-    pub fn read(&self) -> Option<LayoutSpec> {
-        match spec::load(&self.path) {
-            Ok(s) => Some(s),
+    fn acquire_at(dir: PathBuf) -> io::Result<SessionStore> {
+        let path = dir.join("session.lua");
+        let file = StateFile::new(&path)?;
+        // Preserve the existing session.lock filename across upgrades.
+        let lock = StateFile::new(&dir.join("session"))?.lock(true)?;
+        Ok(SessionStore { path, file, _lock: lock, last: None, blocked: false })
+    }
+
+    pub fn read(&mut self) -> Option<LayoutSpec> {
+        self.last = None;
+        self.blocked = false;
+        let bytes = match self.file.read(1 << 20) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return None,
             Err(e) => {
-                if self.path.exists() {
-                    eprintln!("proteus: ignoring saved session: {e}");
+                self.blocked = true;
+                eprintln!("proteus: cannot read saved session; preserving it without autosaving: {e}");
+                return None;
+            }
+        };
+        let parsed = std::str::from_utf8(&bytes)
+            .map_err(|e| e.to_string())
+            .and_then(|text| spec::parse(text, &self.path.display().to_string()));
+        match parsed {
+            Ok(spec) => Some(spec),
+            Err(e) => {
+                match self.file.backup(&bytes) {
+                    Ok(name) => eprintln!(
+                        "proteus: ignoring malformed session ({e}); recovery copy: {}",
+                        self.path.with_file_name(name).display()
+                    ),
+                    Err(backup_error) => {
+                        self.blocked = true;
+                        eprintln!(
+                            "proteus: malformed session ({e}); cannot back up ({backup_error}); autosave disabled to preserve original"
+                        );
+                    }
                 }
                 None
             }
         }
     }
 
-    fn write(&mut self, text: String) {
-        if text == self.last {
-            return;
+    fn write(&mut self, text: String) -> io::Result<()> {
+        self.write_with(text, |file, bytes| file.write(bytes))
+    }
+
+    fn write_with(
+        &mut self,
+        text: String,
+        persist: impl FnOnce(&StateFile, &[u8]) -> io::Result<()>,
+    ) -> io::Result<()> {
+        if self.blocked {
+            return Err(io::Error::other("saved session needs manual recovery; original preserved"));
         }
-        let tmp = self.path.with_extension("lua.tmp");
-        match std::fs::write(&tmp, &text).and_then(|_| std::fs::rename(&tmp, &self.path)) {
-            Ok(()) => self.last = text,
-            Err(e) => eprintln!("proteus: saving session: {e}"),
+        if text.len() > 1 << 20 {
+            return Err(io::Error::other("session exceeds 1 MiB"));
+        }
+        if self.last.as_ref() == Some(&text) {
+            return Ok(());
+        }
+        match persist(&self.file, text.as_bytes()) {
+            Ok(()) => {
+                self.last = Some(text);
+                Ok(())
+            }
+            Err(e) => {
+                // Rename may already have succeeded before directory sync
+                // failed. A subsequent identical save must retry durability.
+                self.last = None;
+                Err(e)
+            }
         }
     }
 
-    pub fn remove(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-        self.last.clear();
+    pub fn remove(&mut self) -> io::Result<()> {
+        if self.blocked {
+            return Err(io::Error::other("saved session needs manual recovery; original preserved"));
+        }
+        self.last = None;
+        self.file.remove()
     }
 }
 
@@ -287,7 +349,10 @@ impl App {
     pub(super) fn save_layout(&mut self, name: &str) {
         let Some(path) = spec::resolve(name) else { return self.notice("no config directory for layouts".into()) };
         let text = spec::to_lua(&self.current_spec(false));
-        let res = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|_| std::fs::write(&path, text));
+        let res = StateFile::in_directory(&path).and_then(|file| {
+            let _lock = file.lock(false)?;
+            file.write(text.as_bytes())
+        });
         match res {
             Ok(()) => self.notice(format!("Layout saved to {}", path.display())),
             Err(e) => self.notice(format!("cannot save layout: {}: {e}", path.display())),
@@ -342,8 +407,11 @@ impl App {
         let mut spec = self.current_spec(true);
         spec.clean = Some(false);
         let text = spec::to_lua(&spec);
-        if let Some(s) = self.session.as_mut() {
-            s.write(text);
+        if let Some(s) = self.session.as_mut()
+            && let Err(e) = s.write(text)
+        {
+            eprintln!("proteus: saving session: {e}");
+            self.toast(format!("Session could not be saved: {e}"), true, None);
         }
     }
 
@@ -358,11 +426,15 @@ impl App {
             let mut spec = self.current_spec(true);
             spec.clean = Some(true);
             let text = spec::to_lua(&spec);
-            if let Some(s) = self.session.as_mut() {
-                s.write(text);
+            if let Some(s) = self.session.as_mut()
+                && let Err(e) = s.write(text)
+            {
+                eprintln!("proteus: saving final session: {e}");
             }
-        } else if let Some(s) = self.session.as_mut() {
-            s.remove();
+        } else if let Some(s) = self.session.as_mut()
+            && let Err(e) = s.remove()
+        {
+            eprintln!("proteus: removing session: {e}");
         }
     }
 
@@ -383,6 +455,67 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sessions_lock_recover_corruption_and_retry_failed_saves() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("proteus-session-persistence-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut session = SessionStore::acquire_at(dir.clone()).unwrap();
+        assert!(SessionStore::acquire_at(dir.clone()).is_err());
+        let first = "return {tabs={{name='original'}}}".to_string();
+        session.write(first.clone()).unwrap();
+        assert_eq!(std::fs::metadata(&session.path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(
+            session
+                .write_with("return {tabs={{name='new'}}}".into(), |file, bytes| {
+                    file.write(bytes)?;
+                    Err(io::Error::other("directory sync failed"))
+                })
+                .is_err()
+        );
+        assert!(session.last.is_none());
+        // Returning to the previously saved layout must still write, since
+        // the failed publication may already have replaced it on disk.
+        session.write(first.clone()).unwrap();
+        assert_eq!(std::fs::read_to_string(&session.path).unwrap(), first);
+        let malformed = b"return { tabs = [";
+        std::fs::write(&session.path, malformed).unwrap();
+        assert!(session.read().is_none());
+        assert!(!session.blocked);
+        let backup = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .find(|e| e.file_name().to_string_lossy().contains(".corrupt-"))
+            .unwrap()
+            .path();
+        assert_eq!(std::fs::read(&backup).unwrap(), malformed);
+        assert_eq!(std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777, 0o600);
+        session.write(first.clone()).unwrap();
+        assert!(session.read().is_some());
+        drop(session);
+        let mut restarted = SessionStore::acquire_at(dir.clone()).unwrap();
+        assert!(restarted.read().is_some());
+        restarted.remove().unwrap();
+        assert!(!dir.join("session.lua").exists());
+        drop(restarted);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn oversized_session_is_preserved_until_manual_recovery() {
+        let dir = std::env::temp_dir().join(format!("proteus-session-oversized-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut session = SessionStore::acquire_at(dir.clone()).unwrap();
+        let bytes = vec![b'x'; (1 << 20) + 1];
+        std::fs::write(&session.path, &bytes).unwrap();
+        assert!(session.read().is_none());
+        assert!(session.write("return {tabs={{}}}".into()).is_err());
+        assert!(session.remove().is_err());
+        assert_eq!(std::fs::read(&session.path).unwrap(), bytes);
+        drop(session);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn quoting() {

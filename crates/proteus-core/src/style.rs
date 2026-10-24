@@ -112,22 +112,51 @@ impl StyleTable {
 /// Intern table for hyperlinks.
 #[derive(Debug, Default)]
 pub struct HyperlinkTable {
-    links: Vec<Hyperlink>,
+    links: Vec<Option<Hyperlink>>,
+    free: Vec<u32>,
     map: HashMap<Hyperlink, HyperlinkId>,
 }
 
 impl HyperlinkTable {
+    #[cfg(test)]
+    pub(crate) fn links_capacity_for_test(&self) -> usize {
+        self.links.len()
+    }
+
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    pub fn retain(&mut self, live: &std::collections::HashSet<HyperlinkId>) {
+        self.map.retain(|_, id| live.contains(id));
+        for (i, slot) in self.links.iter_mut().enumerate() {
+            if slot.is_some() && !live.contains(&HyperlinkId(i as u32)) {
+                *slot = None;
+                self.free.push(i as u32);
+            }
+        }
+    }
+
     pub fn intern(&mut self, link: Hyperlink) -> HyperlinkId {
         if let Some(&id) = self.map.get(&link) {
             return id;
         }
-        let id = HyperlinkId(self.links.len() as u32);
-        self.links.push(link.clone());
+        let id = if let Some(slot) = self.free.pop() {
+            self.links[slot as usize] = Some(link.clone());
+            HyperlinkId(slot)
+        } else {
+            let id = HyperlinkId(self.links.len() as u32);
+            self.links.push(Some(link.clone()));
+            id
+        };
         self.map.insert(link, id);
         id
     }
 
     pub fn get(&self, id: HyperlinkId) -> Option<&Hyperlink> {
-        self.links.get(id.0 as usize)
+        self.links.get(id.0 as usize).and_then(Option::as_ref)
     }
 }

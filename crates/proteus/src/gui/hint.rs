@@ -273,7 +273,7 @@ impl App {
             };
             let text = h.label[st.typed.len()..].to_string();
             out.push(Label {
-                x: (r.x + h.start.col as i32 * cw as i32) as f32,
+                x: (r.x + p.term.visual_row(h.start.line).visual(h.start.col) as i32 * cw as i32) as f32,
                 y: (r.y + (row - skip) as i32 * ch as i32) as f32,
                 cols: text.len(),
                 text,

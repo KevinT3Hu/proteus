@@ -367,3 +367,9 @@ a11y-activate = Activate
 
 a11y-previous-items = Previous items
 a11y-next-items = Next items
+
+completion-title = Completions
+completion-help = Tab: show choices
+completion-open-help = Tab/↑/↓: select · Enter: choose · Esc: dismiss
+action-config-open = Open config in editor
+ui-no-config = No config file selected (--no-config)

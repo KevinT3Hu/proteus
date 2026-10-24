@@ -40,7 +40,7 @@ fn pane_node(id: u64) -> NodeId {
     NodeId(id << 32)
 }
 fn text_node(pane: u64, row: usize) -> NodeId {
-    NodeId((pane << 32) | (row as u64 + 1))
+    NodeId((pane << 32) | ((row as u64 + 1) << 16))
 }
 
 fn character_lengths(text: &str) -> Vec<u8> {
@@ -58,6 +58,136 @@ fn text_run(text: &str, bounds: Rect) -> Node {
     let lengths = character_lengths(text);
     node.set_character_lengths(lengths);
     node
+}
+
+/// Build logical-order text runs, each monotonic in visual space, for AT-SPI.
+fn terminal_text(
+    t: &proteus_core::Terminal,
+    pane: u64,
+    rect: crate::layout::Rect,
+    cw: u32,
+    ch: u32,
+    nodes: &mut Vec<(NodeId, Node)>,
+) -> (Vec<NodeId>, Option<TextPosition>) {
+    let mut children = Vec::new();
+    let mut caret = None;
+    for y in 0..t.lines() {
+        let row = t.grid().row(y);
+        let layout = t.visual_row(t.grid().abs_line(y));
+        let used =
+            row.cells.iter().rposition(|c| c.ch != ' ' || c.extra.is_some() || c.prefix.is_some()).map_or(0, |i| i + 1);
+        let cursor_col =
+            if t.cursor().x > 0 && row.cells[t.cursor().x].is_spacer() { t.cursor().x - 1 } else { t.cursor().x };
+        let end = if y == t.cursor().y { used.max(cursor_col + 1) } else { used };
+        struct Run {
+            text: String,
+            lengths: Vec<u8>,
+            positions: Vec<f32>,
+            widths: Vec<f32>,
+            rtl: bool,
+            left: usize,
+            right: usize,
+            last: usize,
+            caret: Option<usize>,
+        }
+        let mut runs: Vec<Run> = Vec::new();
+        for (col, cell) in row.cells.iter().take(end).enumerate() {
+            if cell.is_spacer() {
+                continue;
+            }
+            let x = layout.visual(col);
+            let w = cell.width().max(1);
+            let rtl = layout.rtl(col);
+            let joins = runs.last().is_some_and(|r| r.rtl == rtl && if rtl { x + w == r.last } else { r.right == x });
+            if !joins {
+                runs.push(Run {
+                    text: String::new(),
+                    lengths: vec![],
+                    positions: vec![],
+                    widths: vec![],
+                    rtl,
+                    left: x,
+                    right: x + w,
+                    last: x,
+                    caret: None,
+                });
+            }
+            let r = runs.last_mut().unwrap();
+            if y == t.cursor().y && col == cursor_col {
+                r.caret = Some(r.lengths.len());
+            }
+            r.left = r.left.min(x);
+            r.right = r.right.max(x + w);
+            r.last = x;
+            let mut text = String::new();
+            cell.push_text(&mut text);
+            let lengths = character_lengths(&text);
+            let mut byte = 0;
+            let mut ink = false;
+            for length in lengths {
+                let value = &text[byte..byte + length as usize];
+                byte += length as usize;
+                let control = value.chars().all(proteus_core::bidi::is_control);
+                r.lengths.push(length);
+                r.positions.push(x as f32 * cw as f32);
+                r.widths.push(if control || ink { 0.0 } else { w as f32 * cw as f32 });
+                if !control {
+                    ink = true;
+                }
+            }
+            r.text.push_str(&text);
+        }
+        if runs.is_empty() {
+            runs.push(Run {
+                text: String::new(),
+                lengths: vec![],
+                positions: vec![],
+                widths: vec![],
+                rtl: false,
+                left: 0,
+                right: 0,
+                last: 0,
+                caret: None,
+            });
+        }
+        if !row.wrapped && y + 1 < t.lines() {
+            let r = runs.last_mut().unwrap();
+            r.text.push('\n');
+            r.lengths.push(1);
+            r.positions.push(if r.rtl { r.left as f32 * cw as f32 } else { r.right as f32 * cw as f32 });
+            r.widths.push(0.0);
+        }
+        for (i, mut r) in runs.into_iter().enumerate() {
+            let id = NodeId(text_node(pane, y).0 + i as u64);
+            let mut node = Node::new(Role::TextRun);
+            node.set_value(r.text);
+            node.set_character_lengths(r.lengths);
+            let left = rect.x as f64 + r.left as f64 * cw as f64;
+            let right = rect.x as f64 + r.right as f64 * cw as f64;
+            node.set_bounds(Rect::new(
+                left,
+                rect.y as f64 + y as f64 * ch as f64,
+                right,
+                rect.y as f64 + (y + 1) as f64 * ch as f64,
+            ));
+            if r.rtl {
+                node.set_text_direction(accesskit::TextDirection::RightToLeft);
+            } else {
+                node.set_text_direction(accesskit::TextDirection::LeftToRight);
+            }
+            for (x, w) in r.positions.iter_mut().zip(&r.widths) {
+                *x = if r.rtl { r.right as f32 * cw as f32 - *x - *w } else { *x - r.left as f32 * cw as f32 };
+            }
+            node.set_character_positions(r.positions);
+            node.set_character_widths(r.widths);
+            if let Some(character_index) = r.caret {
+                caret = Some(TextPosition { node: id, character_index });
+            }
+            children.push(id);
+            nodes.push((id, node));
+        }
+    }
+    (children, caret)
 }
 
 impl App {
@@ -90,14 +220,13 @@ impl App {
                     }
                 }
                 Action::SetValue if request.target_node == INPUT => {
-                    if let Some(accesskit::ActionData::Value(value)) = request.data {
-                        if value.len() <= 1 << 20
-                            && let Some(input) = self.w.input.as_mut()
-                        {
-                            input.text.clear();
-                            input.cursor = 0;
-                            self.input_text(&value);
-                        }
+                    if let Some(accesskit::ActionData::Value(value)) = request.data
+                        && value.len() <= 1 << 20
+                        && let Some(input) = self.w.input.as_mut()
+                    {
+                        input.text.clear();
+                        input.cursor = 0;
+                        self.input_text(&value);
                     }
                 }
                 _ => {}
@@ -364,42 +493,15 @@ impl App {
                 children.push(pane_node(id));
                 continue;
             }
-            let mut rows = Vec::new();
             if !pane.private {
-                let t = &pane.term;
-                for row in 0..t.lines() {
-                    let mut text = t.row_text(row);
-                    // Keep the caret representable even beyond the last nonblank cell.
-                    if row == t.cursor().y {
-                        use unicode_width::UnicodeWidthStr;
-                        let width = text.width();
-                        text.extend(std::iter::repeat_n(' ', t.cursor().x.saturating_sub(width)));
-                    }
-                    if !t.grid().row(row).wrapped && row + 1 < t.lines() {
-                        text.push('\n');
-                    }
-                    let row_id = text_node(id, row);
-                    let top = rect.y as f64 + row as f64 * ch as f64;
-                    let bounds =
-                        Rect::new(rect.x as f64, top, rect.x as f64 + t.cols() as f64 * cw as f64, top + ch as f64);
-                    nodes.push((row_id, text_run(&text, bounds)));
-                    rows.push(row_id);
+                let (text, caret) = terminal_text(&pane.term, id, rect, cw, ch, &mut nodes);
+                node.set_children(text);
+                if let Some(position) = caret {
+                    node.set_text_selection(TextSelection { anchor: position, focus: position });
                 }
-                let row = t.cursor().y.min(t.lines() - 1);
-                let line = t.grid().row(row);
-                let mut prefix = String::new();
-                for cell in line.cells.iter().take(t.cursor().x) {
-                    if !cell.is_spacer() {
-                        cell.push_text(&mut prefix);
-                    }
-                }
-                let position =
-                    TextPosition { node: text_node(id, row), character_index: character_lengths(&prefix).len() };
-                node.set_text_selection(TextSelection { anchor: position, focus: position });
             } else {
                 node.set_description(self.cfg.i18n.t("a11y-private-pane", &[]));
             }
-            node.set_children(rows);
             nodes.push((pane_node(id), node));
             children.push(pane_node(id));
             if id == self.focused_id() && self.w.surface_focus.is_none() {
@@ -483,8 +585,29 @@ impl App {
 mod tests {
     use super::*;
     #[test]
+    fn bidi_accessibility_runs_keep_logical_text_and_visual_geometry() {
+        let mut t = proteus_core::Terminal::new(20, 2, Default::default());
+        t.advance("abc אבג 123".as_bytes());
+        let mut nodes = vec![];
+        let (children, caret) = terminal_text(&t, 1, crate::layout::Rect::new(10, 20, 200, 40), 10, 20, &mut nodes);
+        assert!(caret.is_some());
+        let text: String =
+            children.iter().filter_map(|id| nodes.iter().find(|(n, _)| n == id).and_then(|(_, n)| n.value())).collect();
+        assert!(text.starts_with("abc אבג 123"));
+        assert!(nodes.iter().any(|(_, n)| n.text_direction() == Some(accesskit::TextDirection::RightToLeft)));
+        for (_, node) in nodes {
+            assert_eq!(node.character_lengths().len(), node.character_positions().unwrap().len());
+            assert_eq!(node.character_lengths().len(), node.character_widths().unwrap().len());
+            assert!(
+                node.character_positions().unwrap().windows(2).all(|p| p[0] <= p[1]),
+                "each directional run must be monotonic"
+            );
+        }
+    }
+
+    #[test]
     fn text_runs_preserve_unicode_and_bound_character_lengths() {
-        let text = format!("e\u{301} 中 👨‍👩‍👧‍👦 {}\n", format!("x{}", "\u{301}".repeat(300)));
+        let text = format!("e\u{301} 中 👨‍👩‍👧‍👦 x{}\n", "\u{301}".repeat(300));
         let node = text_run(&text, Rect::new(0.0, 0.0, 100.0, 20.0));
         assert_eq!(node.value(), Some(text.as_str()));
         assert_eq!(node.character_lengths().iter().map(|n| *n as usize).sum::<usize>(), text.len());

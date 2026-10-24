@@ -8,6 +8,7 @@
 mod accessibility;
 mod blocks;
 mod chrome;
+mod completion;
 mod config_ui;
 mod copy;
 mod font;
@@ -24,6 +25,7 @@ mod rows;
 mod scripting;
 mod scroll;
 mod textinput;
+mod transfer;
 mod viewer;
 mod workspace;
 
@@ -32,7 +34,7 @@ pub use scripting::Overrides;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::ptr::NonNull;
@@ -154,9 +156,9 @@ pub(crate) enum Msg {
     Accessibility(WinId, Option<accesskit::ActionRequest>),
     GpuLost(WinId),
     Exported(Result<(), String>),
-    Pty(PaneId, Vec<u8>),
+    Pty(PaneId, Vec<u8>, (proteus_pty::budget::Permit, proteus_pty::budget::Permit)),
     PtyClosed(PaneId),
-    Clipboard(ClipTarget, String),
+    Clipboard(ClipTarget, String, proteus_pty::budget::Permit),
     /// A desktop notification about this pane was clicked (with an
     /// xdg-activation token, if the daemon sent one).
     NotifyActivated(PaneId, Option<String>),
@@ -523,6 +525,7 @@ fn gpu_surface(
     .map_err(|e| format!("cannot create GPU surface: {e}"))
 }
 
+#[allow(clippy::too_many_arguments)] // Wayland globals needed to construct one window.
 fn make_win(
     id: WinId,
     conn: &Connection,
@@ -665,12 +668,23 @@ pub fn run(
             channel::Event::Msg(Msg::Accessibility(window, action)) => app.accessibility_event(window, action),
             channel::Event::Msg(Msg::Ipc(call)) => app.ipc_call(call),
             channel::Event::Msg(Msg::GpuLost(id)) => app.recover_gpu(id),
-            channel::Event::Msg(Msg::Pty(id, bytes)) => app.pty_output(id, &bytes),
-            channel::Event::Msg(Msg::PtyClosed(id)) => app.close_pane(id),
-            channel::Event::Msg(Msg::Clipboard(target, text)) => app.clipboard_received(target, text),
+            channel::Event::Msg(Msg::Pty(id, bytes, permits)) => {
+                // Retain permits until idle processing: producers cannot
+                // continuously refill this source and starve input/rendering.
+                app.handle.insert_idle(move |app| {
+                    app.pty_output(id, &bytes);
+                    drop(permits);
+                });
+            }
+            channel::Event::Msg(Msg::PtyClosed(id)) => {
+                app.handle.insert_idle(move |app| app.close_pane(id));
+            }
+            channel::Event::Msg(Msg::Clipboard(target, text, _permit)) => app.clipboard_received(target, text),
             channel::Event::Msg(Msg::NotifyActivated(pane, token)) => app.notification_clicked(pane, token),
             channel::Event::Msg(Msg::ImagesDecoded(id)) => app.pty_output(id, &[]),
-            channel::Event::Msg(Msg::Plugin(key, m)) => app.plugin_msg(key, m),
+            channel::Event::Msg(Msg::Plugin(key, m)) => {
+                app.handle.insert_idle(move |app| app.plugin_msg(key, m));
+            }
             channel::Event::Msg(Msg::PluginsResolved(generation, results)) => app.plugins_resolved(generation, results),
             channel::Event::Msg(Msg::Dropped(s, list)) => app.surface_dropped(s, &list),
             channel::Event::Closed => app.exit = true,
@@ -766,7 +780,7 @@ pub fn run(
     if app.cfg.restore != Restore::Never {
         app.session = SessionStore::acquire();
     }
-    let saved = app.session.as_ref().and_then(SessionStore::read);
+    let saved = app.session.as_mut().and_then(SessionStore::read);
     let explicit = command.is_some() || layout.is_some();
     match (layout, saved) {
         (Some(l), _) => app.open_layout(&l)?,
@@ -1236,7 +1250,9 @@ impl App {
     fn point_in(&self, id: PaneId, pos: (f64, f64)) -> Option<Point> {
         let (col, row, _) = self.cell_in(id, pos)?;
         let rows = rows::Rows::of(&self.panes.get(&id)?.term);
-        Some(Point::new(rows.line(row).or_else(|| rows.last_line())?, col))
+        let line = rows.line(row).or_else(|| rows.last_line())?;
+        let col = self.panes.get(&id)?.term.visual_row(line).logical(col);
+        Some(Point::new(line, col))
     }
 
     // --- drawing -------------------------------------------------------------
@@ -1441,13 +1457,11 @@ impl App {
             rects.push(([0.0, y - py / 2.0, pw as f32, ph as f32 - y + py / 2.0], theme.bar));
             let cols = ((pw as f32 - 2.0 * p) / cw).max(1.0) as usize;
             if let Some(i) = &self.w.input {
-                use unicode_segmentation::UnicodeSegmentation;
-                use unicode_width::UnicodeWidthStr;
-                let caret_cols: usize = i.before_cursor().graphemes(true).map(|g| g.width().clamp(1, 2)).sum();
+                let caret_byte = i.before_cursor().len();
                 let (l, x) = chrome::input_bar(
                     i.purpose.badge(),
                     &i.text,
-                    caret_cols,
+                    caret_byte,
                     &i.status,
                     p,
                     y,
@@ -1532,6 +1546,8 @@ impl App {
         rects.extend(r);
         labels.extend(l);
 
+        labels.extend(self.completion_labels(&theme));
+
         FrameParts {
             panes,
             info: FrameInfo {
@@ -1602,7 +1618,8 @@ impl App {
                     .row_of(t.grid().abs_line(t.cursor().y))
                     .unwrap_or(t.cursor().y)
                     .saturating_sub(skip);
-                (r, t.cols(), t.cursor().x, y)
+                let x = t.visual_row(t.grid().abs_line(t.cursor().y)).visual(t.cursor().x);
+                (r, t.cols(), x, y)
             }
         };
         let s = self.w.scale;
@@ -2263,6 +2280,7 @@ impl App {
                 self.move_tab(from, old, next, None);
             }
             Action::Palette => self.open_palette(),
+            Action::OpenConfig => self.open_config_editor(),
             Action::BlockCopy(p) => self.block_copy(p),
             Action::BlockSelect(p) => self.block_select(p),
             Action::BlockFold => self.block_fold(),
@@ -2753,12 +2771,17 @@ impl App {
             self.clipboard_received(target, String::new());
             return;
         };
+        static TRANSFERS: std::sync::OnceLock<proteus_pty::budget::Budget> = std::sync::OnceLock::new();
+        let budget = TRANSFERS.get_or_init(|| proteus_pty::budget::Budget::new(64 << 20, 4));
+        let Some(permit) = budget.try_acquire(16 << 20) else {
+            self.clipboard_received(target, String::new());
+            return;
+        };
         let tx = self.sender.clone();
-        // Read off the main thread: the source may be slow (or be us).
         let _ = std::thread::Builder::new().name("paste".into()).spawn(move || {
-            let mut data = Vec::new();
-            let _ = File::from(fd).take(64 << 20).read_to_end(&mut data);
-            let _ = tx.send(Msg::Clipboard(target, String::from_utf8_lossy(&data).into_owned()));
+            // Timeout/overflow discards the whole selection, never a partial command.
+            let data = transfer::read(File::from(fd), 16 << 20, Duration::from_secs(3)).unwrap_or_default();
+            let _ = tx.send(Msg::Clipboard(target, String::from_utf8_lossy(&data).into_owned(), permit));
         });
     }
 
@@ -2936,6 +2959,11 @@ impl App {
 
     fn report_mouse(&mut self, id: PaneId, action: MouseAction, button: Option<MouseButton>) -> bool {
         let Some((col, line, pixel)) = self.cell_in(id, self.w.mouse.pos) else { return false };
+        let t = &self.panes.get(&id).unwrap().term;
+        let map = t.visual_row(t.grid().viewport_line(line));
+        let logical = map.logical(col);
+        let col = logical + col.saturating_sub(map.visual(logical));
+        let pixel = (col as u32 * self.cell().0 + pixel.0 % self.cell().0, pixel.1);
         let ev = MouseEvent { action, button, col, line, pixel: Some(pixel), mods: keys::mods(&self.mods) };
         let Some(p) = self.panes.get_mut(&id) else { return false };
         match input::encode_mouse(&ev, p.term.mode()) {
@@ -2962,6 +2990,9 @@ impl App {
 
     fn pointer_event(&mut self, ev: &PointerEvent) {
         self.w.mouse.pos = ev.position;
+        if self.w.prompts.is_empty() && self.completion_pointer(ev) {
+            return;
+        }
         if self.w.viewer.is_some() && self.viewer_pointer(ev) {
             return;
         }
@@ -3619,8 +3650,8 @@ impl DataDeviceHandler for App {
             let Ok(pipe) = o.receive(URI_LIST.into()) else { return };
             let tx = self.sender.clone();
             let _ = std::thread::Builder::new().name("drop".into()).spawn(move || {
-                let mut data = Vec::new();
-                let _ = File::from(OwnedFd::from(pipe)).take(1 << 20).read_to_end(&mut data);
+                let data = transfer::read(File::from(OwnedFd::from(pipe)), 1 << 20, Duration::from_secs(3))
+                    .unwrap_or_default();
                 o.finish();
                 o.destroy();
                 let _ = tx.send(Msg::Dropped(s, String::from_utf8_lossy(&data).into_owned()));

@@ -20,7 +20,7 @@ fn run_shell(shell: &str, inputs: &[&str]) -> Option<String> {
     // Isolated HOME so the user's rc files don't affect the result.
     let tag = format!("{}-{}", std::process::id(), shell.replace('/', "_"));
     let home = std::env::temp_dir().join(format!("proteus-e2e-{tag}"));
-    std::fs::create_dir_all(&home).unwrap();
+    proteus_pty::secure_fs::private_dir(&home).unwrap();
     let mut spec = CommandSpec::new(shell)
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", home.join(".config"))

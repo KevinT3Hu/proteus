@@ -54,18 +54,32 @@ pub fn data_dir() -> Option<PathBuf> {
 
 /// Write the integration scripts under `dir` (only files whose content changed).
 pub fn install(dir: &Path) -> io::Result<()> {
+    use rustix::fs::{AtFlags, Mode, OFlags, openat, renameat, unlinkat};
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    // The parent is our runtime directory, including the /tmp fallback.
+    crate::secure_fs::private_dir(dir.parent().ok_or(io::ErrorKind::InvalidInput)?)?;
+    crate::secure_fs::private_dir(dir)?;
     for (rel, content) in FILES {
         let path = dir.join(rel);
-        if std::fs::read(&path).is_ok_and(|old| old == content.as_bytes()) {
-            continue;
-        }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        // Write-then-rename so a concurrently starting shell never reads half a file.
-        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-        std::fs::write(&tmp, content)?;
-        std::fs::rename(&tmp, &path)?;
+        let parent = crate::secure_fs::private_dir(path.parent().unwrap())?;
+        let name = path.file_name().unwrap();
+        let tmp = format!(".integration-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed));
+        let fd = openat(
+            &parent,
+            &tmp,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        )?;
+        let result: io::Result<()> = (|| {
+            let mut file = std::fs::File::from(fd);
+            file.write_all(content.as_bytes())?;
+            renameat(&parent, &tmp, &parent, name)?;
+            Ok(())
+        })();
+        let _ = unlinkat(&parent, &tmp, AtFlags::empty());
+        result?;
     }
     Ok(())
 }
@@ -152,6 +166,40 @@ pub fn apply_term(spec: &mut CommandSpec, terminfo_dir: Option<&Path>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn integration_rejects_untrusted_directories_and_replaces_links_safely() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let root = std::env::temp_dir().join(format!("proteus-install-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        crate::secure_fs::private_dir(&root).unwrap();
+        let dir = root.join("integration");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(install(&dir).is_err());
+        std::fs::remove_dir(&dir).unwrap();
+        let outside = root.join("outside");
+        crate::secure_fs::private_dir(&outside).unwrap();
+        symlink(&outside, &dir).unwrap();
+        assert!(install(&dir).is_err());
+        std::fs::remove_file(&dir).unwrap();
+        install(&dir).unwrap();
+        std::fs::remove_dir_all(dir.join("bash")).unwrap();
+        symlink(&outside, dir.join("bash")).unwrap();
+        assert!(install(&dir).is_err());
+        std::fs::remove_file(dir.join("bash")).unwrap();
+        install(&dir).unwrap();
+        let victim = outside.join("victim");
+        std::fs::write(&victim, "unchanged").unwrap();
+        let script = dir.join("bash/proteus.bash");
+        std::fs::remove_file(&script).unwrap();
+        symlink(&victim, &script).unwrap();
+        install(&dir).unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "unchanged");
+        assert!(!std::fs::symlink_metadata(&script).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::metadata(script).unwrap().permissions().mode() & 0o777, 0o600);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn inject_per_shell() {

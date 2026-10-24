@@ -1,10 +1,11 @@
 //! Proteus terminal emulation core.
 //!
-//! This crate has no GUI or OS dependencies: feed it PTY bytes with
+//! This crate has no GUI dependency; Linux file-backed graphics use rustix. Feed it PTY bytes with
 //! [`Terminal::advance`], read back the grid for rendering, drain
 //! [`Terminal::take_pty_output`] (replies the terminal sends to the app) and
 //! [`Terminal::take_events`] (things the host must act on).
 
+pub mod bidi;
 pub mod blocks;
 pub mod cell;
 pub mod color;
@@ -44,6 +45,7 @@ pub struct Config {
     pub scrollback: usize,
     /// Treat East Asian ambiguous-width characters as wide (`text.ambiguous_width = 2`).
     pub ambiguous_wide: bool,
+    pub bidi: bidi::Mode,
     pub osc52_write: bool,
     pub osc52_read: ClipboardRead,
     /// At most this many OSC 9/777 notifications per `notify_window`.
@@ -62,6 +64,7 @@ impl Default for Config {
         Self {
             scrollback: 10_000,
             ambiguous_wide: false,
+            bidi: bidi::Mode::default(),
             osc52_write: true,
             osc52_read: ClipboardRead::Ask,
             notify_burst: 5,

@@ -81,22 +81,54 @@ pub(crate) fn read(medium: Medium, name: &[u8], size: u64, offset: u64, max: usi
         return Err(ReadFailed);
     }
     let (path, unlink) = resolve(medium, name)?;
-    let result = read_at(&path, size, offset, max);
+    use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, openat2};
+    use std::os::fd::AsRawFd;
+    let parent = path.parent().ok_or(ReadFailed)?;
+    let name = path.file_name().ok_or(ReadFailed)?;
+    let parent = openat2(
+        CWD,
+        parent,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::NO_SYMLINKS,
+    )
+    .map_err(|_| ReadFailed)?;
+    let pinned = openat2(
+        &parent,
+        name,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+    )
+    .map_err(|_| ReadFailed)?;
+    let meta = rustix::fs::fstat(&pinned).map_err(|_| ReadFailed)?;
+    if rustix::fs::FileType::from_raw_mode(meta.st_mode) != rustix::fs::FileType::RegularFile {
+        return Err(ReadFailed);
+    }
+    let object = PathBuf::from(format!("/proc/self/fd/{}", pinned.as_raw_fd()));
+    let result = read_at(&object, size, offset, max);
     if unlink {
-        let _ = fs::remove_file(&path);
+        // Never traverse a replacement parent or unlink a symlink target.
+        let current = rustix::fs::statat(&parent, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW);
+        if current.is_ok_and(|m| m.st_ino == meta.st_ino && m.st_dev == meta.st_dev) {
+            let _ = rustix::fs::unlinkat(&parent, name, rustix::fs::AtFlags::empty());
+        }
     }
     result
 }
 
 fn read_at(path: &Path, size: u64, offset: u64, max: usize) -> Result<Vec<u8>, ReadFailed> {
-    let mut f = File::open(path).map_err(|_| ReadFailed)?;
-    // Re-check on the open descriptor in case the path was swapped.
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = File::options()
+        .read(true)
+        .custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32)
+        .open(path)
+        .map_err(|_| ReadFailed)?;
     let meta = f.metadata().map_err(|_| ReadFailed)?;
     if !meta.is_file() {
         return Err(ReadFailed);
     }
-    let len = meta.len();
-    let avail = len.checked_sub(offset).ok_or(ReadFailed)?;
+    let avail = meta.len().checked_sub(offset).ok_or(ReadFailed)?;
     let want = if size > 0 { size } else { avail };
     if want > avail || want > max as u64 {
         return Err(ReadFailed);

@@ -12,6 +12,7 @@ name = "proteus"
 path = "src/main.rs"
 
 [dependencies]
+harfrust = "=0.15.0"
 accesskit = "=0.25.1"
 accesskit_unix = "=0.24.0"
 proteus-i18n = { path = "../proteus-i18n" }

@@ -127,6 +127,23 @@ panes = { confirm_close = true, confirm_close_ignore = { "less", "man" } },
 10. Saved layouts and the session record only foreground commands listed in `session.restore_commands`, stored as `run`. The two use the same file format and parser.
 11. Session file: only the instance holding `$XDG_STATE_HOME/proteus/session.lock` saves and restores. It saves every 2 s when the file's contents would change, marked `clean = false`. Closing the window writes `clean = true`; the last pane ending deletes the file. `"ask"` (default) offers a restore only when the file is unclean, `"always"` restores whenever a file exists, and `"never"` neither saves nor restores. An explicit `--layout` or `-- COMMAND` skips restore.
 
+Persistence uses private 0700 state directories and 0600 files. Session/layout
+replacement writes an exclusive temporary file, synchronizes it, renames it, and
+synchronizes the containing directory before reporting success. Failed saves
+invalidate the identical-save cache so the next autosave retries. The existing
+`session.lock` sidecar remains the cross-process owner lock. Deletion also syncs
+the directory. Layout saves use the same replacement protocol and a sidecar lock,
+without changing permissions of an explicitly chosen layout directory.
+
+A malformed session up to 1 MiB is preserved in a private
+`session.lua.corrupt-PID-N` recovery copy before fresh autosaves are allowed.
+Unreadable/oversized sessions, or failures to create that recovery copy, disable
+autosave/removal for that instance to preserve the original. Errors are reported
+on stderr; periodic save failures also appear in a toast. After manually repairing
+or moving the problematic snapshot, restart Proteus to re-enable session saving.
+Restoration still recreates layout/cwd and allowlisted commands, not live jobs or
+scrollback.
+
 12. Floating panes (zellij keys): `Alt+f` or Pane-mode `w` shows or hides them (it creates the first one if there are none), Pane-mode `e` floats or embeds the focused pane, and `n` opens another floating pane while a float is focused. Floats have a frame with a title row: drag the title to move a float and its corner to resize it. In Move mode `hjkl` moves the float; in Resize mode it grows or shrinks it. The focused float is raised to the top.
 13. Stacks: Pane-mode `S` stacks the focused pane with its sibling subtree, or unstacks it. The expanded pane has a title row, and the other panes collapse to one-row titles. Focus moves across those titles, and clicking a title expands its pane. Layout files write a stack as `stacked = true` on a split.
 14. Pane title rows: `ui.pane_titles = "never"` (default), `"auto"` (when a tab has splits) or `"always"`; Pane-mode `T` toggles them. The focused pane's title shows the current mode.

@@ -53,6 +53,8 @@ pub struct Input {
     pub status: String,
     /// Palette: the highlighted entry among the matches.
     pub choice: usize,
+    /// Completion list requested by Tab or an arrow key.
+    pub completions: bool,
 }
 
 /// Result of a key press in the input.
@@ -81,6 +83,7 @@ impl Input {
             output: false,
             status: String::new(),
             choice: 0,
+            completions: false,
         }
     }
 
@@ -170,6 +173,15 @@ impl Input {
         }
     }
 
+    /// Opening the list preserves the first match; subsequent navigation moves.
+    pub fn navigate_completions(&mut self, previous: bool) {
+        if self.completions {
+            self.choice = if previous { self.choice.saturating_sub(1) } else { self.choice.saturating_add(1) };
+        } else {
+            self.completions = true;
+        }
+    }
+
     /// Text before the caret (for placing the caret).
     pub fn before_cursor(&self) -> &str {
         &self.text[..self.cursor]
@@ -198,6 +210,29 @@ pub fn palette_rank(keys: &[String], query: &str) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completion_opening_navigation_and_filtering_share_semantics() {
+        let mut input = Input::new(Purpose::Palette, "");
+        let items = vec!["font size".into(), "font family".into(), "pane close".into()];
+        // Empty input exposes every entry, not an empty completion set.
+        assert_eq!(palette_rank(&items, &input.text).len(), 3);
+        assert_eq!(input.key(Key::Tab, Mods::empty(), ""), Edit::Next);
+        input.navigate_completions(false);
+        assert!(input.completions);
+        assert_eq!(input.choice, 0);
+        input.navigate_completions(false);
+        assert_eq!(input.choice, 1);
+        input.navigate_completions(true);
+        assert_eq!(input.choice, 0);
+        input.insert("font");
+        assert_eq!(palette_rank(&items, &input.text).len(), 2);
+        input.insert(" missing");
+        assert!(palette_rank(&items, &input.text).is_empty());
+        // Escape handling can dismiss the list while retaining the query.
+        assert_eq!(input.key(Key::Escape, Mods::empty(), ""), Edit::Cancel);
+        assert_eq!(input.text, "font missing");
+    }
 
     #[test]
     fn editing() {

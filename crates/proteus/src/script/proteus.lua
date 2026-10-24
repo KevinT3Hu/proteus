@@ -126,6 +126,7 @@ function Timer:stop() end
 ---@field family string? Regular font family or fontconfig pattern.
 ---@field size number? Font size in points, 4–96.
 ---@field ligatures boolean?
+---@field fallback_families string[]? Ordered fonts to try before system fallback.
 ---@field bold_family (string|false)? false restores automatic style selection.
 ---@field italic_family (string|false)?
 ---@field bold_italic_family (string|false)?
@@ -160,7 +161,7 @@ function Timer:stop() end
 ---@field window proteus.Window?
 ---@field font proteus.Font?
 ---@field cursor { blink: (boolean|"app")?, shape: ("app"|"block"|"bar"|"underline")? }?
----@field text { grapheme_clustering: boolean?, ambiguous_width: (1|2)? }?
+---@field text { grapheme_clustering: boolean?, ambiguous_width: (1|2)?, bidi: ("auto"|"on"|"off")? }?
 ---@field clipboard { osc52_read: ("ask"|"allow"|"deny")?, osc52_write: boolean?, paste_protection: boolean? }?
 ---@field shell { command: (string|string[])?, integration: boolean?, term: string? }?
 ---@field scrollback integer?

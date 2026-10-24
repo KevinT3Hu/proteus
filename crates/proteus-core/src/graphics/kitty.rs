@@ -124,7 +124,7 @@ pub(crate) fn to_rgba(format: u32, data: Vec<u8>, w: u32, h: u32, max: usize) ->
                 d
             } else {
                 let mut out = Vec::with_capacity(px * 4);
-                for p in data[..px * 3].chunks_exact(3) {
+                for p in data[..px * 3].as_chunks::<3>().0 {
                     out.extend_from_slice(&[p[0], p[1], p[2], 255]);
                 }
                 out

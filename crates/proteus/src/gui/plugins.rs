@@ -888,6 +888,14 @@ impl App {
                 Ok(Reply::Unit)
             }
             Call::RegisterAction { id, name, key: default_key } => {
+                if self
+                    .pl
+                    .running
+                    .get(&key.id)
+                    .is_some_and(|r| r.actions.len() >= 256 && !r.actions.iter().any(|a| a.id == id))
+                {
+                    return Err("at most 256 plugin actions".into());
+                }
                 let action = RegisteredAction::parse(id, name, default_key)?;
                 let Some(running) = self.pl.running.get_mut(&key.id) else {
                     return Err("plugin is not running".into());
@@ -909,6 +917,9 @@ impl App {
                 Ok(Reply::Unit)
             }
             Call::Prompt { id, question, initial } => {
+                if self.pl.asks.values().filter(|(owner, _)| owner == key).count() >= 16 {
+                    return Err("too many pending questions".into());
+                }
                 let n = self.ask(key, id);
                 let q: String = clean(&question).take(200).collect();
                 self.open_input(
@@ -919,6 +930,9 @@ impl App {
                 Ok(Reply::Unit)
             }
             Call::Confirm { id, question } => {
+                if self.pl.asks.values().filter(|(owner, _)| owner == key).count() >= 16 {
+                    return Err("too many pending questions".into());
+                }
                 let n = self.ask(key, id);
                 let q: String = clean(&question).take(300).collect();
                 self.w.prompts.push_back(super::Prompt::PluginConfirm(n, format!("{}: {q}", self.name_of(&key.id))));
@@ -953,8 +967,25 @@ impl App {
                 self.set_selection(super::ClipboardKind::Clipboard, text);
                 Ok(Reply::Unit)
             }
-            Call::Open(target) => {
-                self.xdg_open(&target, None);
+            Call::Open(target, file) => {
+                static OPENERS: std::sync::OnceLock<proteus_pty::budget::Budget> = std::sync::OnceLock::new();
+                let permit = OPENERS
+                    .get_or_init(|| proteus_pty::budget::Budget::new(4, 4))
+                    .try_acquire(1)
+                    .ok_or("too many pending desktop opens")?;
+                let mut cmd = std::process::Command::new("xdg-open");
+                cmd.arg(&target)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+                let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+                std::thread::Builder::new()
+                    .name("plugin-open".into())
+                    .spawn(move || {
+                        let _guard = (file, permit);
+                        let _ = child.wait();
+                    })
+                    .map_err(|e| e.to_string())?;
                 Ok(Reply::Unit)
             }
         }
@@ -1040,6 +1071,7 @@ impl App {
         self.pl.next_surface += 1;
         let id = self.pl.next_surface;
         let mut term = surface_term(1, 1);
+        term.set_bidi(self.cfg.bidi);
         term.set_palette(self.cfg.theme.palette());
         let s = Surface {
             owner,
@@ -1065,6 +1097,7 @@ impl App {
         let pid = self.next_id;
         self.next_id += 1;
         let mut term = surface_term(cols.max(2) as usize, rows.max(1) as usize);
+        term.set_bidi(self.cfg.bidi);
         term.set_palette(self.cfg.theme.palette());
         term.set_cell_pixel_size(self.cell().0, self.cell().1);
         self.panes.insert(pid, super::pane::Pane::plugin(term, id, title.to_string()));
@@ -1190,8 +1223,21 @@ impl App {
         }
     }
 
-    pub(super) fn surface_ui(&mut self, id: u32, e: UiEvent) {
+    pub(super) fn surface_ui(&mut self, id: u32, mut e: UiEvent) {
         let Some(s) = self.pl.surfaces.get(&id) else { return };
+        if let UiEvent::Mouse(mouse) = &mut e {
+            let t = match s.pane {
+                Some(p) => self.panes.get(&p).map(|p| &p.term),
+                None => Some(&s.term),
+            };
+            if let Some(t) = t {
+                let row = (mouse.row as usize).min(t.lines() - 1);
+                let map = t.visual_row(t.grid().viewport_line(row));
+                let visual = (mouse.col as usize).min(t.cols() - 1);
+                let logical = map.logical(visual);
+                mouse.col = (logical + visual.saturating_sub(map.visual(logical))) as u32;
+            }
+        }
         if s.owner.id == CONFIG {
             self.sc.queue.push_back(super::scripting::ScriptCall::Ui(id, e));
             return;
@@ -1334,6 +1380,7 @@ impl App {
                 continue;
             }
             s.term = surface_term(cols, rows);
+            s.term.set_bidi(self.cfg.bidi);
             s.term.set_palette(self.cfg.theme.palette());
             s.term.set_cell_pixel_size(cw as u32, ch as u32);
             s.sent.clear();
@@ -1375,7 +1422,8 @@ impl App {
                 Some(p) => &self.panes.get(&p)?.term,
                 None => &s.term,
             };
-            let cell = t.grid().row(row as usize).cells.get(col as usize)?;
+            let logical = t.visual_row(t.grid().viewport_line(row as usize)).logical(col as usize);
+            let cell = t.grid().row(row as usize).cells.get(logical)?;
             Some(t.hyperlink(t.style(cell.style).hyperlink?)?.uri.clone())
         });
         if button == PButton::Left
@@ -1454,7 +1502,8 @@ impl App {
         let id = self.w.surface_focus?;
         let p = self.surfaces_here().into_iter().find(|p| p.id == id)?;
         let t = &self.pl.surfaces.get(&id)?.term;
-        Some((p.content, t.cols(), (t.cursor().x, t.cursor().y)))
+        let x = t.visual_row(t.grid().abs_line(t.cursor().y)).visual(t.cursor().x);
+        Some((p.content, t.cols(), (x, t.cursor().y)))
     }
 
     /// Files dropped on surface `id`.

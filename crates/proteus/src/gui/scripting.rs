@@ -457,6 +457,14 @@ impl App {
             self.retheme_surfaces(&palette);
             self.emit(ScriptEvent::new("theme_changed"));
         }
+        if old.bidi != self.cfg.bidi {
+            for pane in self.panes.values_mut() {
+                pane.term.set_bidi(self.cfg.bidi);
+            }
+            for surface in self.pl.surfaces.values_mut() {
+                surface.term.set_bidi(self.cfg.bidi);
+            }
+        }
         self.plugins_config_changed();
         self.hint_patterns = super::hint::patterns(&self.cfg.hint_patterns);
         let font_changed = old.font_family != self.cfg.font_family

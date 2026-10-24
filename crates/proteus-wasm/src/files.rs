@@ -15,7 +15,7 @@ use crate::manifest::FsGrant;
 #[derive(Clone)]
 pub struct Access {
     pub data_dir: PathBuf,
-    pub fs: Vec<FsGrant>,
+    roots: Vec<(PathBuf, Arc<std::fs::File>, bool)>,
 }
 
 /// `..` and `.` removed without touching the disk.
@@ -48,6 +48,29 @@ fn real(p: &Path, follow: bool) -> Option<PathBuf> {
 }
 
 impl Access {
+    pub fn new(data_dir: PathBuf, fs: &[FsGrant]) -> Result<Self, String> {
+        use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, openat2};
+        let mut roots = Vec::new();
+        for (path, write) in
+            std::iter::once((data_dir.clone(), true)).chain(fs.iter().map(|g| (g.host_path(), g.write)))
+        {
+            if !path.exists() {
+                continue;
+            }
+            let path = path.canonicalize().map_err(|e| e.to_string())?;
+            let fd = openat2(
+                CWD,
+                &path,
+                OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+                ResolveFlags::NO_SYMLINKS,
+            )
+            .map_err(|e| e.to_string())?;
+            roots.push((path, Arc::new(std::fs::File::from(fd)), write));
+        }
+        Ok(Self { data_dir: data_dir.canonicalize().map_err(|e| e.to_string())?, roots })
+    }
+
     /// Host path for `path` as the plugin names it; `write` needs an `rw`
     /// grant. `follow`: the last component may be a symlink to follow.
     pub fn resolve(&self, path: &str, write: bool, follow: bool) -> Result<PathBuf, String> {
@@ -57,17 +80,61 @@ impl Access {
         }
         let p = lexical(Path::new(path)).ok_or_else(denied)?;
         if let Ok(rest) = p.strip_prefix("/data") {
-            let data = self.data_dir.canonicalize().map_err(|e| format!("{}: {e}", self.data_dir.display()))?;
+            let data = self.data_dir.clone();
             let host = real(&data.join(rest), follow).ok_or_else(|| format!("{path}: not found"))?;
             return if host.starts_with(&data) { Ok(host) } else { Err(denied()) };
         }
         let host = real(&p, follow).ok_or_else(|| format!("{path}: not found"))?;
-        let ok = self.fs.iter().any(|g| {
-            let root = g.host_path();
-            let root = root.canonicalize().unwrap_or(root);
-            host.starts_with(&root) && (g.write || !write)
-        });
+        let ok = self.roots.iter().any(|(root, _, writable)| host.starts_with(root) && (*writable || !write));
         if ok { Ok(host) } else { Err(denied()) }
+    }
+}
+
+/// An authorized object (or parent plus final name), retained until the host
+/// operation finishes. /proc only names our already-open descriptor here.
+#[derive(Debug, Clone)]
+pub struct Pinned {
+    pub file: Arc<std::fs::File>,
+    path: PathBuf,
+    pub original: PathBuf,
+}
+impl std::ops::Deref for Pinned {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+impl AsRef<Path> for Pinned {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Access {
+    pub fn pin(&self, path: &str, write: bool, follow: bool) -> Result<Pinned, String> {
+        use rustix::fs::{Mode, OFlags, ResolveFlags, openat2};
+        use std::os::fd::AsRawFd;
+        let host = self.resolve(path, write, follow)?;
+        let (root, base, _) = self
+            .roots
+            .iter()
+            .filter(|(_, _, writable)| !write || *writable)
+            .find(|(r, _, _)| host.starts_with(r))
+            .ok_or("filesystem grant disappeared")?;
+        let relative = host.strip_prefix(root).map_err(|e| e.to_string())?;
+        let target = if follow { relative } else { relative.parent().unwrap_or(Path::new("")) };
+        let target = if target.as_os_str().is_empty() { Path::new(".") } else { target };
+        let flags = OFlags::PATH | OFlags::CLOEXEC | if follow { OFlags::empty() } else { OFlags::DIRECTORY };
+        let fd = openat2(base, target, flags, Mode::empty(), ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS)
+            .map_err(|e| e.to_string())?;
+        let file = Arc::new(std::fs::File::from(fd));
+        let mut pinned = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+        if !follow {
+            let name = relative.file_name().ok_or("cannot modify a grant root")?;
+            pinned.push(name);
+        }
+
+        Ok(Pinned { file, path: pinned, original: host })
     }
 }
 
@@ -87,7 +154,7 @@ pub fn list_dir(host: &Path, guest: &Path, access: &Access) -> Result<Vec<crate:
         let name = e.file_name().to_string_lossy().into_owned();
         let target = if link {
             let child = guest.join(&name).display().to_string();
-            access.resolve(&child, false, true).ok().and_then(|p| std::fs::metadata(p).ok())
+            access.pin(&child, false, true).ok().and_then(|p| std::fs::metadata(&p).ok())
         } else {
             None
         };
@@ -256,8 +323,8 @@ fn percent_encode(p: &Path) -> String {
 /// trash on the same file system, else the file system's own.
 fn trash_dir(path: &Path, dev: u64) -> Result<PathBuf, String> {
     let home = data_home().ok_or("no home directory")?.join("Trash");
-    let _ = std::fs::create_dir_all(home.join("files"));
-    let _ = std::fs::create_dir_all(home.join("info"));
+    proteus_pty::secure_fs::private_dir(&home.join("files")).map_err(|e| e.to_string())?;
+    proteus_pty::secure_fs::private_dir(&home.join("info")).map_err(|e| e.to_string())?;
     if std::fs::metadata(&home).is_ok_and(|m| m.dev() == dev) {
         return Ok(home);
     }
@@ -275,37 +342,55 @@ fn trash_dir(path: &Path, dev: u64) -> Result<PathBuf, String> {
         && m.mode() & 0o1000 != 0
     {
         let mine = shared.join(uid.to_string());
-        if std::fs::create_dir_all(mine.join("files")).is_ok() && std::fs::create_dir_all(mine.join("info")).is_ok() {
+        if proteus_pty::secure_fs::private_dir(&mine.join("files")).is_ok()
+            && proteus_pty::secure_fs::private_dir(&mine.join("info")).is_ok()
+        {
             return Ok(mine);
         }
     }
     let own = top.join(format!(".Trash-{uid}"));
     for d in [own.join("files"), own.join("info")] {
-        std::fs::create_dir_all(&d).map_err(|e| format!("{}: {e}", d.display()))?;
+        proteus_pty::secure_fs::private_dir(&d).map_err(|e| format!("{}: {e}", d.display()))?;
     }
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o700));
+
     Ok(own)
 }
 
 /// Move `path` (resolved, not followed) to the trash.
 pub fn trash(path: &Path) -> Result<(), String> {
+    trash_named(path, path)
+}
+
+pub fn trash_named(path: &Path, original: &Path) -> Result<(), String> {
     let io = |e: std::io::Error| format!("{}: {e}", path.display());
     let meta = std::fs::symlink_metadata(path).map_err(io)?;
-    let dir = trash_dir(path, meta.dev())?;
-    let name = path.file_name().ok_or_else(|| format!("{}: cannot trash this", path.display()))?;
+    let dir = trash_dir(original, meta.dev())?;
+    let files = proteus_pty::secure_fs::private_dir(&dir.join("files")).map_err(|e| e.to_string())?;
+    let info_dir = proteus_pty::secure_fs::private_dir(&dir.join("info")).map_err(|e| e.to_string())?;
+    use std::os::fd::AsRawFd;
+    let files_path = PathBuf::from(format!("/proc/self/fd/{}", files.as_raw_fd()));
+    let info_dir_path = PathBuf::from(format!("/proc/self/fd/{}", info_dir.as_raw_fd()));
+    let name = original.file_name().ok_or_else(|| format!("{}: cannot trash this", path.display()))?;
     let name = name.to_string_lossy();
     let info =
-        format!("[Trash Info]\nPath={}\nDeletionDate={}\n", percent_encode(path), deletion_date(SystemTime::now()));
+        format!("[Trash Info]\nPath={}\nDeletionDate={}\n", percent_encode(original), deletion_date(SystemTime::now()));
     for n in 1..10_000 {
         let candidate = if n == 1 { name.to_string() } else { format!("{name}.{n}") };
-        let info_path = dir.join("info").join(format!("{candidate}.trashinfo"));
+        let info_path = info_dir_path.join(format!("{candidate}.trashinfo"));
         match std::fs::File::create_new(&info_path) {
             Ok(mut f) => {
                 use std::io::Write;
                 f.write_all(info.as_bytes()).map_err(|e| format!("{}: {e}", info_path.display()))?;
-                let target = dir.join("files").join(&candidate);
-                return match std::fs::rename(path, &target) {
+                let target = files_path.join(&candidate);
+                return match rustix::fs::renameat_with(
+                    rustix::fs::CWD,
+                    path,
+                    rustix::fs::CWD,
+                    &target,
+                    rustix::fs::RenameFlags::NOREPLACE,
+                )
+                .map_err(std::io::Error::from)
+                {
                     Ok(()) => Ok(()),
                     Err(e) => {
                         let _ = std::fs::remove_file(&info_path);
@@ -416,6 +501,10 @@ fn sniff(head: &[u8]) -> &'static str {
 }
 
 pub fn mime_type(path: &Path) -> Result<String, String> {
+    mime_type_named(path, path)
+}
+
+pub fn mime_type_named(path: &Path, original: &Path) -> Result<String, String> {
     let meta = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
     if meta.is_dir() {
         return Ok("inode/directory".into());
@@ -434,7 +523,7 @@ pub fn mime_type(path: &Path) -> Result<String, String> {
         };
         return Ok(kind.into());
     }
-    if let Some(m) = path.file_name().and_then(|n| by_name(&n.to_string_lossy(), globs())) {
+    if let Some(m) = original.file_name().and_then(|n| by_name(&n.to_string_lossy(), globs())) {
         return Ok(m);
     }
     if meta.len() == 0 {
@@ -452,6 +541,33 @@ pub fn mime_type(path: &Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_descriptors_resist_directory_and_grant_root_swaps() {
+        let root = std::env::temp_dir().join(format!("proteus-fs-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let data = root.join("data");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(data.join("sub")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(data.join("sub/file"), "inside").unwrap();
+        std::fs::write(outside.join("file"), "outside").unwrap();
+        let access = Access::new(data.clone(), &[]).unwrap();
+        let parent = access.pin("/data/sub/new", true, false).unwrap();
+        let object = access.pin("/data/sub/file", false, true).unwrap();
+        std::fs::rename(data.join("sub"), data.join("old")).unwrap();
+        std::os::unix::fs::symlink(&outside, data.join("sub")).unwrap();
+        std::fs::write(&parent, "safe").unwrap();
+        assert_eq!(std::fs::read_to_string(&object).unwrap(), "inside");
+        assert!(data.join("old/new").exists());
+        assert!(!outside.join("new").exists());
+        assert!(access.pin("/data/sub/file", false, true).is_err());
+        std::fs::rename(&data, root.join("old-data")).unwrap();
+        std::os::unix::fs::symlink(&outside, &data).unwrap();
+        assert!(access.pin("/data/file", false, true).is_err());
+        assert_eq!(std::fs::read_to_string(outside.join("file")).unwrap(), "outside");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn mime_globs_and_magic() {
@@ -487,7 +603,7 @@ mod tests {
             std::fs::create_dir_all(d).unwrap();
         }
         std::os::unix::fs::symlink(&other, src.join("escape")).unwrap();
-        let a = Access { data_dir: data.clone(), fs: vec![FsGrant { path: src.display().to_string(), write: false }] };
+        let a = Access::new(data.clone(), &[FsGrant { path: src.display().to_string(), write: false }]).unwrap();
         let s = src.display().to_string();
         assert_eq!(a.resolve("/data/x", true, true).unwrap(), data.canonicalize().unwrap().join("x"));
         assert!(a.resolve("/data/../src", false, true).is_err());

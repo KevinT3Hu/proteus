@@ -118,6 +118,7 @@ struct Dcs {
 /// palette and shell-integration state.
 pub struct Terminal {
     parser: vte::Parser,
+    bidi_cache: std::cell::RefCell<crate::bidi::Cache>,
     config: Config,
     grid: Grid,
     /// The screen that is not shown (alternate while on primary and vice versa).
@@ -133,6 +134,7 @@ pub struct Terminal {
     tabs: Vec<bool>,
     styles: StyleTable,
     style_limit: usize,
+    link_limit: usize,
     links: HyperlinkTable,
     palette: Palette,
     cursor_shape: CursorShape,
@@ -177,6 +179,7 @@ impl Terminal {
         mode.set(TermMode::GRAPHEME_CLUSTERING, config.grapheme_clustering);
         Self {
             parser: vte::Parser::new(),
+            bidi_cache: Default::default(),
             grid: Grid::new(cols, lines, config.scrollback),
             inactive: Grid::new(cols, lines, 0),
             config,
@@ -191,6 +194,7 @@ impl Terminal {
             tabs: default_tabs(cols),
             styles: StyleTable::default(),
             style_limit: STYLE_COMPACT_MIN,
+            link_limit: 4096,
             links: HyperlinkTable::default(),
             palette: Palette::default(),
             cursor_shape: CursorShape::default(),
@@ -223,6 +227,7 @@ impl Terminal {
 
     /// Feed bytes read from the PTY.
     pub fn advance(&mut self, bytes: &[u8]) {
+        self.bidi_cache.get_mut().clear();
         self.poll_images();
         let mut parser = std::mem::take(&mut self.parser);
         self.feed(&mut parser, bytes);
@@ -239,6 +244,22 @@ impl Terminal {
     pub fn primary_grid(&self) -> &Grid {
         if self.is_alt_screen() { &self.inactive } else { &self.grid }
     }
+    pub fn set_bidi(&mut self, mode: crate::bidi::Mode) {
+        self.config.bidi = mode;
+        self.bidi_cache.get_mut().clear();
+        self.damage.full = true;
+    }
+    pub fn bidi_enabled(&self) -> bool {
+        self.config.bidi.enabled(self.is_alt_screen())
+    }
+    /// Logical storage stays intact; this map is shared by drawing and hit testing.
+    pub fn visual_row(&self, line: Line) -> std::sync::Arc<crate::bidi::RowLayout> {
+        if !self.bidi_enabled() {
+            return std::sync::Arc::new(crate::bidi::RowLayout::default());
+        }
+        self.bidi_cache.borrow_mut().row(&self.grid, line)
+    }
+
     pub fn cols(&self) -> usize {
         self.grid.cols()
     }
@@ -468,12 +489,47 @@ impl Terminal {
 
     pub fn selection_range(&self) -> Option<SelectionRange> {
         let blocks = if self.is_alt_screen() { None } else { Some(&self.blocks) };
-        self.selection.as_ref()?.range(&self.grid, blocks, &self.config.word_separators, self.live_end())
+        let selection = self.selection.as_ref()?;
+        if selection.kind == SelectionKind::Block && self.bidi_enabled() {
+            let a = selection.anchor;
+            let b = selection.cursor;
+            let visual =
+                Selection::new(SelectionKind::Block, Point::new(a.line, self.visual_row(a.line).visual(a.col)));
+            let visual = Selection { cursor: Point::new(b.line, self.visual_row(b.line).visual(b.col)), ..visual };
+            visual.range(&self.grid, blocks, &self.config.word_separators, self.live_end())
+        } else {
+            selection.range(&self.grid, blocks, &self.config.word_separators, self.live_end())
+        }
     }
 
     pub fn selection_text(&self) -> Option<String> {
         let r = self.selection_range()?;
-        Some(text::extract(&self.grid, r.start, r.end, r.rect))
+        if r.rect && self.bidi_enabled() {
+            let mut out = String::new();
+            for line in r.start.line..=r.end.line {
+                if line > r.start.line {
+                    out.push('\n');
+                }
+                let layout = self.visual_row(line);
+                let Some(row) = self.grid.abs_row(line) else {
+                    continue;
+                };
+                let mut text = String::new();
+                for (col, cell) in row.cells.iter().enumerate() {
+                    if cell.is_spacer() {
+                        continue;
+                    }
+                    let x = layout.visual(col);
+                    if x <= r.end.col && x + cell.width().max(1) > r.start.col {
+                        cell.push_text(&mut text);
+                    }
+                }
+                out.push_str(text.trim_end_matches(' '));
+            }
+            Some(out)
+        } else {
+            Some(text::extract(&self.grid, r.start, r.end, r.rect))
+        }
     }
 
     // --- blocks ----------------------------------------------------------
@@ -518,6 +574,7 @@ impl Terminal {
 
     /// Resize both screens. The primary screen reflows soft-wrapped lines.
     pub fn resize(&mut self, cols: usize, lines: usize) {
+        self.bidi_cache.get_mut().clear();
         let cols = cols.max(2);
         let lines = lines.max(1);
         if cols == self.cols() && lines == self.lines() {
@@ -625,6 +682,16 @@ impl Terminal {
             }
         }
         self.style_limit = STYLE_COMPACT_MIN.max(self.styles.len() * 2);
+        let mut live = std::collections::HashSet::new();
+        for style in (0..self.styles.len()).map(|i| self.styles.get(StyleId(i as u32))) {
+            live.extend(style.hyperlink);
+        }
+        live.extend(self.cursor.style.hyperlink);
+        for saved in [&self.saved, &self.saved_inactive].into_iter().flatten() {
+            live.extend(saved.cursor.style.hyperlink);
+        }
+        self.links.retain(&live);
+        self.link_limit = 4096.max(self.links.len() * 2);
     }
 
     fn clamp_cursor(&mut self) {
@@ -641,6 +708,16 @@ impl Terminal {
         };
         // Image placeholders are always one column, even with ambiguous = wide.
         let width = if c == PLACEHOLDER { 1 } else { text::char_width(c, self.config.ambiguous_wide) };
+        if crate::bidi::is_control(c) && self.prev_cell().is_none() {
+            let cell = self.grid.cell_mut(self.cursor.x, self.cursor.y);
+            let mut prefix = cell.prefix.take().map(String::from).unwrap_or_default();
+            if prefix.len() < MAX_GRAPHEME_EXTRA {
+                prefix.push(c);
+            }
+            cell.prefix = Some(prefix.into_boxed_str());
+            self.damage_line(self.cursor.y);
+            return;
+        }
         if width == 0 || self.extends_cluster(c) {
             self.append_to_prev(c);
             return;
@@ -695,7 +772,8 @@ impl Terminal {
         if widen && x + 1 < cols && !self.cursor.pending_wrap && self.cursor.x == x + 1 {
             self.clear_wide(x + 1, y);
             self.grid.cell_mut(x, y).flags.insert(CellFlags::WIDE);
-            *self.grid.cell_mut(x + 1, y) = Cell { ch: ' ', style, flags: CellFlags::WIDE_SPACER, extra: None };
+            *self.grid.cell_mut(x + 1, y) =
+                Cell { ch: ' ', style, flags: CellFlags::WIDE_SPACER, extra: None, prefix: None };
             if x + 2 >= cols {
                 self.cursor.x = cols - 1;
                 self.cursor.pending_wrap = self.mode.contains(TermMode::AUTOWRAP);
@@ -745,15 +823,18 @@ impl Terminal {
             self.insert_blank(width);
         }
         let (x, y) = (self.cursor.x, self.cursor.y);
+        let prefix = if self.grid.row(y).cells[x].ch == ' ' { self.grid.cell_mut(x, y).prefix.take() } else { None };
         self.clear_wide(x, y);
         let style = self.style_id;
         if width == 2 {
             self.clear_wide(x + 1, y);
-            *self.grid.cell_mut(x, y) = Cell { ch: c, style, flags: CellFlags::WIDE, extra: None };
-            *self.grid.cell_mut(x + 1, y) = Cell { ch: ' ', style, flags: CellFlags::WIDE_SPACER, extra: None };
+            *self.grid.cell_mut(x, y) = Cell { ch: c, style, flags: CellFlags::WIDE, extra: None, prefix: None };
+            *self.grid.cell_mut(x + 1, y) =
+                Cell { ch: ' ', style, flags: CellFlags::WIDE_SPACER, extra: None, prefix: None };
         } else {
-            *self.grid.cell_mut(x, y) = Cell { ch: c, style, flags: CellFlags::empty(), extra: None };
+            *self.grid.cell_mut(x, y) = Cell { ch: c, style, flags: CellFlags::empty(), extra: None, prefix: None };
         }
+        self.grid.cell_mut(x, y).prefix = prefix;
         self.damage_line(y);
         if x + width >= cols {
             self.cursor.x = cols - 1;
@@ -1605,6 +1686,9 @@ impl Terminal {
 
     /// OSC 8;params;uri — start (or end, with empty uri) a hyperlink.
     fn osc_hyperlink(&mut self, params: &[&[u8]]) {
+        if self.links.len() >= self.link_limit {
+            self.compact_styles();
+        }
         let uri = join_params(params, 2);
         self.cursor.style.hyperlink = if uri.is_empty() || uri.len() > MAX_URI {
             None
@@ -2079,4 +2163,23 @@ fn version_number() -> u32 {
     let mut it = VERSION.split('.').map(|p| p.parse::<u32>().unwrap_or(0));
     let (a, b, c) = (it.next().unwrap_or(0), it.next().unwrap_or(0), it.next().unwrap_or(0));
     a * 10000 + b * 100 + c
+}
+
+#[cfg(test)]
+mod resource_tests {
+    use super::*;
+
+    #[test]
+    fn hyperlink_churn_reclaims_metadata_and_preserves_saved_cursor() {
+        let mut t = Terminal::new(8, 2, Config { scrollback: 2, ..Config::default() });
+        t.advance(b"\x1b]8;;https://saved.example\x1b\\\x1b7");
+        for i in 0..20_000 {
+            t.advance(format!("\x1b]8;id={i};https://example.com/{i}\x1b\\x\r\n").as_bytes());
+        }
+        assert!(t.links.len() < 8192, "link metadata must track live cells, not total output");
+        assert!(t.links.links_capacity_for_test() < 8192);
+        t.advance(b"\x1b8");
+        let id = t.cursor.style.hyperlink.unwrap();
+        assert_eq!(t.hyperlink(id).unwrap().uri, "https://saved.example");
+    }
 }

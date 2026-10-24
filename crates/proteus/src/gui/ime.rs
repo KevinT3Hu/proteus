@@ -39,7 +39,7 @@ impl Preedit {
         self.text
             .grapheme_indices(true)
             .map(|(b, g)| {
-                let width = g.width().clamp(1, 2);
+                let width = if g.chars().all(proteus_core::bidi::is_control) { 0 } else { g.width().clamp(1, 2) };
                 let cell = PreeditCell { col, width, text: g, bytes: (b, b + g.len()) };
                 col += width;
                 cell
@@ -54,8 +54,8 @@ impl Preedit {
     /// Column offset of the cursor (start of the selected segment).
     pub fn cursor_col(&self) -> Option<usize> {
         let (begin, _) = self.cursor?;
-        let cells = self.cells();
-        Some(cells.iter().find(|c| c.bytes.0 >= begin).map_or_else(|| self.width(), |c| c.col))
+        let byte = self.cells().iter().find(|c| c.bytes.0 >= begin).map_or(self.text.len(), |c| c.bytes.0);
+        Some(proteus_core::bidi::TextLayout::new(&self.text, usize::MAX).caret(byte))
     }
 }
 
@@ -181,6 +181,18 @@ impl Dispatch2<ZwpTextInputV3, App> for ImeData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bidi_preedit_keeps_zero_width_controls_and_visual_caret() {
+        let mut p = Preedit {
+            text: "\u{2067}אבג\u{2069}".into(),
+            cursor: Some(("\u{2067}אבג\u{2069}".len(), "\u{2067}אבג\u{2069}".len())),
+        };
+        assert_eq!(p.width(), 3);
+        assert_eq!(p.cursor_col(), Some(0));
+        p.cursor = Some((0, 0));
+        assert_eq!(p.cursor_col(), Some(3));
+    }
 
     #[test]
     fn preedit_layout() {

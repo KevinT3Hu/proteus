@@ -102,6 +102,29 @@ pub fn image_dimensions(data: &[u8]) -> Option<(u32, u32)> {
     ImageReader::new(Cursor::new(data)).with_guessed_format().ok()?.into_dimensions().ok()
 }
 
+// Reserve both encoded input and the decoder's output/scratch allowance.
+// The permit follows the result until the GUI consumes it, not just until
+// decoding ends. This bounds queued jobs and queued decoded frames together.
+static DECODE_USAGE: std::sync::Mutex<(usize, usize)> = std::sync::Mutex::new((0, 0));
+#[derive(Debug)]
+pub(crate) struct DecodePermit(usize);
+impl Drop for DecodePermit {
+    fn drop(&mut self) {
+        let mut used = DECODE_USAGE.lock().unwrap();
+        used.0 -= self.0;
+        used.1 -= 1;
+    }
+}
+pub(crate) fn reserve_decode(bytes: usize) -> Option<DecodePermit> {
+    let mut used = DECODE_USAGE.lock().unwrap();
+    if used.1 >= 32 || bytes > (512usize << 20).saturating_sub(used.0) {
+        return None;
+    }
+    used.0 += bytes;
+    used.1 += 1;
+    Some(DecodePermit(bytes))
+}
+
 type Job = Box<dyn FnOnce() + Send>;
 
 /// Run `job` on a small pool of decoder threads shared by all terminals.
@@ -140,5 +163,22 @@ pub(crate) fn run_in_background(job: Job) {
         }
         // No threads: decode right here.
         None => job(),
+    }
+}
+
+#[cfg(test)]
+mod resource_tests {
+    use super::*;
+
+    #[test]
+    fn queued_and_completed_decodes_share_byte_and_job_limits() {
+        assert!(reserve_decode((512 << 20) + 1).is_none());
+        let large = reserve_decode(512 << 20).unwrap();
+        assert!(reserve_decode(1).is_none());
+        drop(large);
+        let permits: Vec<_> = (0..32).map(|_| reserve_decode(1).unwrap()).collect();
+        assert!(reserve_decode(1).is_none());
+        drop(permits);
+        assert!(reserve_decode(1).is_some());
     }
 }

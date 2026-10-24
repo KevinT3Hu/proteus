@@ -48,6 +48,7 @@ pub(super) struct HeldReply {
 /// Result of a background decode.
 pub(super) struct Decoded {
     key: u64,
+    _permit: Option<crate::graphics::DecodePermit>,
     result: Result<DecodedImage, DecodeError>,
     reply: Option<HeldReply>,
 }
@@ -477,12 +478,24 @@ impl Terminal {
     fn decode_later(&mut self, key: u64, data: Vec<u8>, reply: Option<HeldReply>) {
         let tx = self.decodes.tx.clone();
         let waker = self.config.graphics.waker.clone();
-        let max = self.config.graphics.max_image_bytes;
+        let configured_max = self.config.graphics.max_image_bytes;
+        let max = if data.starts_with(b"GIF8") {
+            configured_max
+        } else {
+            image_dimensions(&data)
+                .and_then(|(w, h)| (w as usize).checked_mul(h as usize)?.checked_mul(4))
+                .unwrap_or(1 << 20)
+                .min(configured_max)
+        };
         self.decodes.pending += 1;
+        let Some(permit) = crate::graphics::reserve_decode(data.len().saturating_add(max.saturating_mul(2))) else {
+            self.finish_decode(Decoded { key, _permit: None, result: Err(DecodeError::TooLarge), reply });
+            return;
+        };
         run_in_background(Box::new(move || {
             let decode = std::panic::AssertUnwindSafe(|| decode_image(&data, max));
             let result = std::panic::catch_unwind(decode).unwrap_or_else(|_| Err(DecodeError::Invalid("panic".into())));
-            if tx.send(Decoded { key, result, reply }).is_ok()
+            if tx.send(Decoded { key, _permit: Some(permit), result, reply }).is_ok()
                 && let Some(w) = waker
             {
                 (w.0)();
