@@ -11,6 +11,10 @@ impl App {
         let Some(path) = self.sc.config_path.clone() else {
             return self.notice(self.cfg.i18n.t("ui-no-config", &[]));
         };
+        self.open_editor_path(&path);
+    }
+
+    pub(super) fn open_editor_path(&mut self, path: &std::path::Path) {
         // Preserve argv boundaries; never interpolate a path into shell code.
         if let Some(parent) = path.parent()
             && let Err(e) = std::fs::create_dir_all(parent)
@@ -18,7 +22,7 @@ impl App {
             return self.notice(format!("{}: {e}", parent.display()));
         }
         let editor = std::env::var("VISUAL").ok().filter(|s| !s.is_empty()).or_else(|| std::env::var("EDITOR").ok());
-        let argv = super::hint::editor_command(editor.as_deref().unwrap_or("vi"), &path, None, None);
+        let argv = super::hint::editor_command(editor.as_deref().unwrap_or("vi"), path, None, None);
         if let Err(e) = self.split_with(None, path.parent().map(std::path::Path::to_path_buf), Some(argv)) {
             self.notice(e);
         }

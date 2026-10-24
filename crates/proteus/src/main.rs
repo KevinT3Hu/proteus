@@ -11,9 +11,11 @@ mod icat;
 mod ipc;
 mod layout;
 mod modes;
+mod project;
 mod script;
 mod session;
 mod spec;
+mod ssh;
 mod theme;
 
 use std::ffi::OsString;

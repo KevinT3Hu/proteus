@@ -91,6 +91,10 @@ fn nearest(matches: &[(PaneId, Match)], order: &[PaneId], from: (PaneId, Point),
 #[derive(Debug, Clone, PartialEq)]
 enum Item {
     Action(Action),
+    Ssh(super::ssh::Pick),
+    Task(crate::project::Task),
+    ProjectFile(PathBuf),
+    ProjectError(String),
     Tab(usize),
     Pane(PaneId),
     Layout(String),
@@ -530,6 +534,18 @@ impl App {
     }
 
     pub(super) fn open_palette(&mut self) {
+        self.ssh_transfer_path = None;
+        self.ssh_suggestions = std::env::var_os("HOME")
+            .map(|home| crate::ssh::discover(std::path::Path::new(&home), std::path::Path::new("/etc/ssh")))
+            .unwrap_or_default();
+        self.project = if self.focused_pane().remote.is_some() {
+            Ok(None)
+        } else {
+            self.focused_pane()
+                .cwd(&self.hostname)
+                .or_else(|| std::env::current_dir().ok())
+                .map_or(Ok(None), |cwd| crate::project::Workspace::discover(&cwd))
+        };
         self.open_input(Purpose::Palette, "", String::new());
         self.palette_update();
     }
@@ -545,6 +561,28 @@ impl App {
                 (if label == id { id } else { format!("{label} ({id})") }, Item::Action(a))
             })
             .collect();
+        v.extend(self.ssh_items().into_iter().map(|(label, pick)| (label, Item::Ssh(pick))));
+        match &self.project {
+            Ok(Some(project)) => {
+                v.push((
+                    format!("Workspace: {} · Edit definition", project.name),
+                    Item::ProjectFile(project.path.clone()),
+                ));
+                v.extend(project.tasks.iter().map(|task| {
+                    (
+                        format!(
+                            "Task: {} · {} · {}",
+                            task.name,
+                            project.name,
+                            super::workspace::shell_join(&task.command)
+                        ),
+                        Item::Task(task.clone()),
+                    )
+                }));
+            }
+            Err(error) => v.push((format!("Workspace error: {error}"), Item::ProjectError(error.clone()))),
+            Ok(None) => {}
+        }
         v.sort_by(|a, b| a.0.cmp(&b.0));
         v.extend(self.sc.palette.iter().map(|(name, f)| (name.clone(), Item::Lua(*f))));
         v.extend(self.plugin_palette().into_iter().map(|(label, id, a)| (label, Item::Plugin(id, a))));
@@ -644,6 +682,24 @@ impl App {
         self.w.input = None;
         let Some((label, item)) = hit else { return };
         match item {
+            Item::Ssh(pick) => self.ssh_pick(pick),
+            Item::Task(task) => {
+                // Use a normal integrated shell so completed output remains in
+                // its pane and command blocks provide status/search/copy.
+                match self.split_with(None, Some(task.cwd), None) {
+                    Ok(id) => {
+                        let command = super::workspace::shell_join(&task.command);
+                        if let Some(pane) = self.panes.get_mut(&id) {
+                            pane.name = Some(format!("Task: {}", task.name));
+                            pane.queue_run(command);
+                        }
+                        self.watch_runs();
+                    }
+                    Err(e) => self.notice(e),
+                }
+            }
+            Item::ProjectFile(path) => self.open_editor_path(&path),
+            Item::ProjectError(error) => self.notice(error),
             Item::Action(a) => {
                 self.remember(label);
                 self.dispatch(a);
@@ -702,7 +758,18 @@ impl App {
                 }
             }
             Edit::Submit => {
-                let text = self.w.input.as_ref().map(|i| i.text.trim().to_string()).unwrap_or_default();
+                let text = self
+                    .w
+                    .input
+                    .as_ref()
+                    .map(|i| {
+                        if matches!(purpose, Purpose::SshTransferLocal(..) | Purpose::SshTransferRemote(..)) {
+                            i.text.clone()
+                        } else {
+                            i.text.trim().to_string()
+                        }
+                    })
+                    .unwrap_or_default();
                 if purpose == Purpose::Search {
                     return self.search_submit();
                 }
@@ -735,6 +802,10 @@ impl App {
         let name = (!text.is_empty()).then_some(text.clone());
         match purpose {
             Purpose::Search => {}
+            purpose @ (Purpose::SshConnect(_)
+            | Purpose::SshForward(..)
+            | Purpose::SshTransferLocal(..)
+            | Purpose::SshTransferRemote(..)) => self.ssh_submit(purpose, text),
             Purpose::RenameTab(pane) => {
                 if let Some(t) = self.w.tabs.iter_mut().find(|t| t.contains(pane)) {
                     t.name = name;

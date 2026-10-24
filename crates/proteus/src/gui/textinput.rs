@@ -10,6 +10,10 @@ use crate::layout::PaneId;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Purpose {
     Search,
+    SshConnect(bool),
+    SshForward(PaneId, bool),
+    SshTransferLocal(PaneId, bool),
+    SshTransferRemote(PaneId, bool),
     /// Rename the tab that contains this pane.
     RenameTab(PaneId),
     RenamePane(PaneId),
@@ -26,6 +30,10 @@ impl Purpose {
     pub fn badge(self) -> &'static str {
         match self {
             Purpose::Search => "badge-search",
+            Purpose::SshConnect(_)
+            | Purpose::SshForward(..)
+            | Purpose::SshTransferLocal(..)
+            | Purpose::SshTransferRemote(..) => "badge-ssh",
             Purpose::RenameTab(_) => "badge-rename-tab",
             Purpose::RenamePane(_) => "badge-rename-pane",
             Purpose::SaveLayout => "badge-save-layout",

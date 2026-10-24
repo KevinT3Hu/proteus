@@ -28,6 +28,7 @@ pub struct Pane {
     pub name: Option<String>,
     /// What the pane runs instead of the shell (from a layout), for saving.
     pub cmd: Option<Cmd>,
+    pub(super) remote: Option<super::ssh::Remote>,
     /// A layout's `run` command, typed once the shell waits for input.
     pending_run: Option<(String, Instant)>,
     /// None for a plugin's pane.
@@ -108,6 +109,7 @@ impl Pane {
             term,
             name: None,
             cmd: None,
+            remote: None,
             pending_run: None,
             pty: Some(pty),
             writer: Some(writer),
@@ -131,6 +133,7 @@ impl Pane {
             term,
             name: Some(title),
             cmd: None,
+            remote: None,
             pending_run: None,
             pty: None,
             writer: None,
@@ -167,6 +170,9 @@ impl Pane {
     }
 
     pub fn try_write(&mut self, bytes: &[u8]) -> io::Result<()> {
+        if self.remote.as_ref().is_some_and(|r| r.closed) {
+            return Ok(());
+        }
         self.writer.as_ref().map_or(Ok(()), |w| w.write(bytes))
     }
 
@@ -193,13 +199,24 @@ impl Pane {
         }
     }
 
+    pub(super) fn ended_title(&mut self, title: String) {
+        self.proc_title = title;
+        self.reader_stop.store(true, Ordering::Relaxed);
+        self.writer = None;
+        self.pty = None;
+    }
+
     /// Hang up and collect the exit status, waiting briefly.
     pub fn finish(&mut self) -> i32 {
         let Some(pty) = &mut self.pty else { return 0 };
+        use std::os::unix::process::ExitStatusExt;
+        if let Ok(Some(st)) = pty.try_wait() {
+            return st.code().unwrap_or_else(|| 128 + st.signal().unwrap_or(0));
+        }
         pty.hangup();
         for _ in 0..50 {
             if let Ok(Some(st)) = pty.try_wait() {
-                return st.code().unwrap_or(0);
+                return st.code().unwrap_or_else(|| 128 + st.signal().unwrap_or(0));
             }
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -212,7 +229,7 @@ impl Pane {
         if let Some(n) = &self.name {
             return n;
         }
-        if self.term.title().is_empty() { &self.proc_title } else { self.term.title() }
+        if self.remote.is_some() || self.term.title().is_empty() { &self.proc_title } else { self.term.title() }
     }
 
     /// Foreground job (not the shell): program name and argv.
@@ -242,6 +259,20 @@ impl Pane {
             return false;
         }
         self.proc_checked = Some(Instant::now());
+        if let Some(remote) = &self.remote {
+            if remote.closed {
+                return false;
+            }
+            let location = self
+                .term
+                .cwd()
+                .map(|c| format!(" · {}:{}", c.host.as_deref().unwrap_or("remote"), c.path))
+                .unwrap_or_default();
+            let title = format!("{} · running{location}", remote.connection.label());
+            let changed = self.proc_title != title;
+            self.proc_title = title;
+            return changed;
+        }
         let Some(fg) = self.pty.as_ref().and_then(|p| p.foreground_process()) else { return false };
         let dir = fg.cwd.as_deref().map(home_relative).unwrap_or_default();
         let title = if dir.is_empty() { fg.name } else { format!("{} {dir}", fg.name) };
@@ -266,6 +297,9 @@ impl Pane {
     /// Working directory for a new pane opened from this one: OSC 7 if it
     /// is local, else the foreground process's cwd.
     pub fn cwd(&self, hostname: &str) -> Option<PathBuf> {
+        if self.remote.is_some() {
+            return None;
+        }
         if let Some(c) = self.term.cwd().filter(|c| c.is_local(hostname)) {
             let p = PathBuf::from(&c.path);
             if p.is_dir() {

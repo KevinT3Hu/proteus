@@ -1,0 +1,11 @@
+name = "My Rust project"
+presets = ["rust"]
+
+# Project definitions replace preset tasks with the same ID.
+[tasks.test]
+name = "Test workspace"
+command = ["cargo", "test", "--workspace"]
+
+# Disable a preset task when it is inappropriate for this project.
+[tasks.format]
+disabled = true

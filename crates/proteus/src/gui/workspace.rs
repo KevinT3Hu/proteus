@@ -180,7 +180,7 @@ impl App {
 
     /// Poll panes with a queued `run` line until all are sent. Output also
     /// triggers delivery (see `pty_output`); this covers a quiet shell.
-    fn watch_runs(&mut self) {
+    pub(super) fn watch_runs(&mut self) {
         if self.run_timer {
             return;
         }

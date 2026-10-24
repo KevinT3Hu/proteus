@@ -373,6 +373,7 @@ pub enum Action {
     Palette,
     /// Open the selected Lua configuration in an editor pane.
     OpenConfig,
+    Ssh(crate::ssh::Action),
     /// Copy part of the block at the Scroll cursor (else the last one).
     BlockCopy(Part),
     /// Select part of the block at the Scroll cursor.
@@ -506,6 +507,7 @@ impl Action {
             Action::TabToNextWindow => "tab.to_next_window".into(),
             Action::Palette => "palette".into(),
             Action::OpenConfig => "config.open".into(),
+            Action::Ssh(action) => action.name().into(),
             Action::BlockCopy(p) => format!("block.copy_{}", p.key()),
             Action::BlockSelect(p) => format!("block.select_{}", p.key()),
             Action::BlockFold => "block.fold".into(),
@@ -553,6 +555,7 @@ impl Action {
             ]
             .map(Action::Scroll),
         );
+        v.extend(crate::ssh::Action::ALL.map(Action::Ssh));
         v.extend([Action::Copy, Action::Paste, Action::PastePrimary]);
         v.extend([Action::Font(1), Action::Font(-1), Action::Font(0), Action::Quit]);
         v.extend(MOTIONS.map(|m| Action::CopyMove(m.0)));
@@ -663,6 +666,20 @@ impl Action {
             Action::Palette if mode.passes_keys() => return None,
             Action::Palette => "action-palette",
             Action::OpenConfig => "action-config-open",
+            Action::Ssh(action) => {
+                return Some(match action {
+                    crate::ssh::Action::Connect => "action-ssh-connect",
+                    crate::ssh::Action::ConnectBash => "action-ssh-connect-bash",
+                    crate::ssh::Action::Reconnect => "action-ssh-reconnect",
+                    crate::ssh::Action::Workspace => "action-ssh-workspace",
+                    crate::ssh::Action::Sftp => "action-ssh-sftp",
+                    crate::ssh::Action::Upload => "action-ssh-upload",
+                    crate::ssh::Action::Download => "action-ssh-download",
+                    crate::ssh::Action::ForwardLocal => "action-ssh-forward-local",
+                    crate::ssh::Action::ForwardRemote => "action-ssh-forward-remote",
+                    crate::ssh::Action::Stop => "action-ssh-stop",
+                });
+            }
             Action::BlockCopy(_) => "ui-copy-block",
             Action::BlockSelect(_) => "ui-select-block",
             Action::BlockFold => "ui-fold",

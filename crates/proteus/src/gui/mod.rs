@@ -24,6 +24,7 @@ mod render;
 mod rows;
 mod scripting;
 mod scroll;
+mod ssh;
 mod textinput;
 mod transfer;
 mod viewer;
@@ -156,6 +157,7 @@ pub(crate) enum Msg {
     Accessibility(WinId, Option<accesskit::ActionRequest>),
     GpuLost(WinId),
     Exported(Result<(), String>),
+    SshWorkspace(PaneId, Result<Option<crate::project::Workspace>, String>),
     Pty(PaneId, Vec<u8>, (proteus_pty::budget::Permit, proteus_pty::budget::Permit)),
     PtyClosed(PaneId),
     Clipboard(ClipTarget, String, proteus_pty::budget::Permit),
@@ -476,6 +478,9 @@ struct App {
     hint_patterns: Vec<proteus_core::hints::HintPattern>,
     /// Palette entries used recently, most recent first.
     recent: Vec<String>,
+    project: Result<Option<crate::project::Workspace>, String>,
+    ssh_suggestions: crate::ssh::Suggestions,
+    ssh_transfer_path: Option<(PaneId, bool, PathBuf)>,
     /// Decoded image memory shared by all panes (`graphics.total_memory`).
     image_budget: std::sync::Arc<proteus_core::ImageBudget>,
 
@@ -677,8 +682,9 @@ pub fn run(
                 });
             }
             channel::Event::Msg(Msg::PtyClosed(id)) => {
-                app.handle.insert_idle(move |app| app.close_pane(id));
+                app.handle.insert_idle(move |app| app.ssh_closed(id));
             }
+            channel::Event::Msg(Msg::SshWorkspace(id, result)) => app.ssh_workspace_received(id, result),
             channel::Event::Msg(Msg::Clipboard(target, text, _permit)) => app.clipboard_received(target, text),
             channel::Event::Msg(Msg::NotifyActivated(pane, token)) => app.notification_clicked(pane, token),
             channel::Event::Msg(Msg::ImagesDecoded(id)) => app.pty_output(id, &[]),
@@ -737,6 +743,9 @@ pub fn run(
         activation,
         hint_patterns,
         recent: scroll::load_recent(),
+        project: Ok(None),
+        ssh_suggestions: Default::default(),
+        ssh_transfer_path: None,
         image_budget: proteus_core::ImageBudget::new(cfg_total_memory),
         keyboard: None,
         pointer: None,
@@ -2281,6 +2290,7 @@ impl App {
             }
             Action::Palette => self.open_palette(),
             Action::OpenConfig => self.open_config_editor(),
+            Action::Ssh(action) => self.ssh_action(action),
             Action::BlockCopy(p) => self.block_copy(p),
             Action::BlockSelect(p) => self.block_select(p),
             Action::BlockFold => self.block_fold(),
