@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/proteus-core", "crates/proteus-pty", "crates/proteus-wasm", "crates/proteus"]
+members = ["crates/proteus-i18n", "crates/proteus-core", "crates/proteus-pty", "crates/proteus-wasm", "crates/proteus"]
 # Built for wasm32-wasip2 on their own (see examples/plugins/README.md).
 exclude = ["crates/proteus-plugin", "crates/proteus-wasm/tests/fixture", "examples/plugins"]
 
@@ -19,9 +19,9 @@ unicode-width = "=0.2.2"
 unicode-segmentation = "=1.13.3"
 regex = "=1.13.1"
 base64 = "=0.22.1"
-rustix = { version = "=1.1.5", features = ["pty", "termios", "process", "fs", "stdio", "system"] }
+rustix = { version = "=1.1.5", features = ["pty", "termios", "process", "fs", "stdio", "system", "net", "event"] }
 clap = { version = "=4.6.7", features = ["derive"] }
-mlua = { version = "=0.12.2", features = ["lua54", "vendored"] }
+mlua = { version = "=0.12.2", features = ["lua54", "vendored", "serialize"] }
 image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 miniz_oxide = { version = "=0.9.1", features = ["with-alloc"] }
 wgpu = "=30.0.1"
@@ -40,6 +40,7 @@ wasmtime = { version = "=50.0.0", default-features = false, features = ["runtime
 wasmtime-wasi = { version = "=50.0.0", default-features = false, features = ["p2"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 toml = "=1.1.8"
+serde_json = "=1.0.154"
 sha2 = "=0.11.1"
 proteus-wasm = { path = "crates/proteus-wasm" }
 ureq = { version = "=3.4.2", default-features = false, features = ["rustls", "platform-verifier", "gzip"] }

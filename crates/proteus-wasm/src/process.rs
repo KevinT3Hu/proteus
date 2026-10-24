@@ -2,11 +2,13 @@
 //! checked against the manifest's list, started without a shell in their
 //! own process group (so stopping kills what they started too).
 
+use proteus_pty::InputWriter;
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::Read;
+use std::os::fd::AsFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -56,20 +58,35 @@ fn kill_group(child: &mut Child) {
     let _ = child.kill();
 }
 
+fn wait_readable(fd: impl AsFd) {
+    let mut polls = [rustix::event::PollFd::new(&fd, rustix::event::PollFlags::IN)];
+    let wait = rustix::event::Timespec::try_from(Duration::from_millis(50)).expect("small timeout");
+    let _ = rustix::event::poll(&mut polls, Some(&wait));
+}
+
 /// Read all of `r`, keeping the first `max` bytes.
-fn drain(mut r: impl Read + Send + 'static, max: usize) -> std::thread::JoinHandle<Vec<u8>> {
-    std::thread::spawn(move || {
+fn drain(
+    mut r: impl Read + AsFd + Send + 'static,
+    max: usize,
+    stop: Arc<AtomicBool>,
+) -> std::io::Result<std::thread::JoinHandle<Vec<u8>>> {
+    rustix::io::ioctl_fionbio(r.as_fd(), true)?;
+    Ok(std::thread::spawn(move || {
         let (mut out, mut buf) = (Vec::new(), [0u8; 16384]);
-        loop {
+        while !stop.load(Ordering::Relaxed) {
             match r.read(&mut buf) {
-                Ok(0) | Err(_) => return out,
+                Ok(0) => break,
                 Ok(n) => {
                     let keep = n.min(max.saturating_sub(out.len()));
                     out.extend_from_slice(&buf[..keep]);
                 }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => wait_readable(r.as_fd()),
+                Err(_) => break,
             }
         }
-    })
+        out
+    }))
 }
 
 /// Run to the end (or `timeout`, or `stop`) and collect the output.
@@ -83,27 +100,51 @@ pub fn run(
 ) -> Result<Output, String> {
     let name = &cmd.argv[0];
     let mut child = build(program, cmd, cwd).spawn().map_err(|e| format!("{name}: {e}"))?;
-    let mut stdin = child.stdin.take();
-    let feeder = std::thread::spawn(move || {
-        if let Some(s) = stdin.as_mut() {
-            let _ = s.write_all(&input);
+    let io_stop = Arc::new(AtomicBool::new(false));
+    let setup = (|| {
+        let mut stdin = InputWriter::new(child.stdin.take().expect("piped"))?;
+        stdin.write(&input)?;
+        stdin.close();
+        let out = drain(child.stdout.take().expect("piped"), MAX_OUTPUT, io_stop.clone())?;
+        let err = drain(child.stderr.take().expect("piped"), MAX_OUTPUT, io_stop.clone())?;
+        Ok::<_, std::io::Error>((stdin, out, err))
+    })();
+    let (stdin, out, err) = match setup {
+        Ok(v) => v,
+        Err(e) => {
+            io_stop.store(true, Ordering::Relaxed);
+            kill_group(&mut child);
+            let _ = child.wait();
+            return Err(e.to_string());
         }
-    });
-    let out = drain(child.stdout.take().expect("piped"), MAX_OUTPUT);
-    let err = drain(child.stderr.take().expect("piped"), MAX_OUTPUT);
+    };
     let end = Instant::now() + timeout;
-    let status = loop {
-        if let Ok(Some(st)) = child.try_wait() {
-            break Some(st);
+    let mut status = None;
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => status = Some(st),
+            Ok(None) => {}
+            Err(e) => {
+                io_stop.store(true, Ordering::Relaxed);
+                stdin.cancel();
+                kill_group(&mut child);
+                let _ = child.wait();
+                return Err(e.to_string());
+            }
+        }
+        if status.is_some() && out.is_finished() && err.is_finished() && stdin.is_finished() {
+            break;
         }
         if stop.load(Ordering::Relaxed) || Instant::now() >= end {
             kill_group(&mut child);
             let _ = child.wait();
-            break None;
+            stdin.cancel();
+            io_stop.store(true, Ordering::Relaxed);
+            status = None;
+            break;
         }
         std::thread::sleep(Duration::from_millis(5));
-    };
-    let _ = feeder.join();
+    }
     let (stdout, stderr) = (out.join().unwrap_or_default(), err.join().unwrap_or_default());
     if stop.load(Ordering::Relaxed) {
         return Err("stopped".into());
@@ -111,9 +152,19 @@ pub fn run(
     Ok(Output { exit_code: status.and_then(|s| s.code()), stdout, stderr })
 }
 
+trait Pipe: Read + AsFd + Send {}
+impl<T: Read + AsFd + Send> Pipe for T {}
+
 struct Live {
     child: Arc<Mutex<Child>>,
-    stdin: Option<ChildStdin>,
+    stdin: Option<InputWriter>,
+}
+impl Drop for Live {
+    fn drop(&mut self) {
+        if let Some(stdin) = &self.stdin {
+            stdin.cancel();
+        }
+    }
 }
 
 /// Processes from `spawn`. Dropping it kills them.
@@ -143,19 +194,36 @@ impl Processes {
         let mut child = build(program, cmd, cwd).spawn().map_err(|e| format!("{name}: {e}"))?;
         self.next = self.next.wrapping_add(1).max(1);
         let id = self.next;
-        let stdin = child.stdin.take();
+        let stdin = match InputWriter::new(child.stdin.take().expect("piped")) {
+            Ok(w) => Some(w),
+            Err(e) => {
+                kill_group(&mut child);
+                let _ = child.wait();
+                return Err(e.to_string());
+            }
+        };
         let readers: Vec<_> = [
-            (false, Box::new(child.stdout.take().expect("piped")) as Box<dyn Read + Send>),
+            (false, Box::new(child.stdout.take().expect("piped")) as Box<dyn Pipe>),
             (true, Box::new(child.stderr.take().expect("piped"))),
         ]
         .into_iter()
         .map(|(stderr, mut r)| {
             let post = post.clone();
+            let nonblocking = rustix::io::ioctl_fionbio(r.as_fd(), true);
             std::thread::spawn(move || {
+                if nonblocking.is_err() {
+                    return;
+                }
                 let mut buf = vec![0u8; 65536];
-                loop {
+                while !post.stopped() {
                     match r.read(&mut buf) {
-                        Ok(0) | Err(_) => return,
+                        Ok(0) => return,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            wait_readable(r.as_fd());
+                            continue;
+                        }
+                        Err(_) => return,
                         Ok(n) => {
                             let e = Event::ProcessOutput(ProcessOutput { id, stderr, data: buf[..n].to_vec() });
                             if !post.data(n, e) {
@@ -194,12 +262,14 @@ impl Processes {
         self.reap();
         let p = self.live.get_mut(&id).ok_or_else(|| format!("no process {id}"))?;
         let s = p.stdin.as_mut().ok_or("stdin is closed")?;
-        s.write_all(data).map_err(|e| e.to_string())
+        s.write(data).map_err(|e| e.to_string())
     }
 
     pub fn close_stdin(&mut self, id: u32) {
-        if let Some(p) = self.live.get_mut(&id) {
-            p.stdin = None;
+        if let Some(p) = self.live.get_mut(&id)
+            && let Some(stdin) = p.stdin.as_mut()
+        {
+            stdin.close();
         }
     }
 
@@ -207,6 +277,9 @@ impl Processes {
         if let Some(p) = self.live.get(&id)
             && let Ok(mut c) = p.child.lock()
         {
+            if let Some(stdin) = &p.stdin {
+                stdin.cancel();
+            }
             kill_group(&mut c);
         }
     }
@@ -225,6 +298,37 @@ impl Drop for Processes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timeout_covers_descendants_holding_pipes() {
+        let cmd = Command { argv: vec!["sh".into(), "-c".into(), "sleep 10 &".into()], cwd: None, env: vec![] };
+        let start = Instant::now();
+        let out = run(
+            Path::new("/bin/sh"),
+            &cmd,
+            Path::new("/"),
+            vec![],
+            Duration::from_millis(100),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(out.exit_code.is_none());
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn spawned_stdin_backpressure_does_not_block_stop() {
+        let (post, _events) = Poster::testing();
+        let mut processes = Processes::default();
+        let cmd = Command { argv: vec!["sh".into(), "-c".into(), "sleep 10".into()], cwd: None, env: vec![] };
+        let id = processes.spawn(Path::new("/bin/sh"), &cmd, Path::new("/"), post).unwrap();
+        let start = Instant::now();
+        processes.write(id, &vec![0; 1 << 20]).unwrap();
+        processes.close_stdin(id);
+        processes.kill(id);
+        drop(processes);
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
 
     #[test]
     fn only_listed_programs() {

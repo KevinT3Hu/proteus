@@ -1,6 +1,6 @@
-//! WASM plugins in the GUI (doc 05): starting and stopping the installed
-//! plugins as `plugins.lock` changes, answering their calls, and their UI —
-//! surfaces (sidebars, floats), status segments and palette entries.
+//! WASM plugins are resolved exclusively from Lua config paths/URLs.
+//! Fetching and source compilation run off the GUI thread. Config Lua uses
+//! the same UI backend directly, without a plugin declaration or lifecycle.
 //!
 //! A surface is a small [`Terminal`] that the plugin's frames are written
 //! into (as escape sequences we generate from styled spans, with every
@@ -16,7 +16,7 @@ use proteus_core::Terminal;
 use proteus_wasm::types::{
     self, Attrs, Color, Event, Frame, MouseButton as PButton, Placement, StatusSide, SurfaceKind, UiEvent,
 };
-use proteus_wasm::{Answer, Call, Entry, FromPlugin, Key, Pixels, Reply, Responder, Runtime, Spec, Store};
+use proteus_wasm::{Answer, Cache, Call, FromPlugin, Key, Pixels, Reply, Resolved, Responder, Runtime, Spec};
 use smithay_client_toolkit::reexports::calloop::timer::{TimeoutAction, Timer};
 use unicode_width::UnicodeWidthChar;
 
@@ -28,8 +28,8 @@ use crate::script::{ScriptEvent, Val};
 /// Crashes in a session before a plugin is no longer restarted.
 const MAX_RESTARTS: u32 = 3;
 const RESTART_DELAY: Duration = Duration::from_secs(1);
-/// Owner id of the surfaces of Lua scripts (no plugin id is empty).
-const LUA: &str = "";
+/// Internal owner key for config UI, outside the WASM source lifecycle.
+pub(super) const CONFIG: &str = "";
 /// Surfaces one plugin may have open.
 const MAX_SURFACES: usize = 8;
 
@@ -59,6 +59,8 @@ pub(super) struct Surface {
     pub sent: HashSet<u32>,
     /// The last frame, painted again after a resize.
     pub frame: Option<Frame>,
+    pub accessibility_ids: HashMap<String, u32>,
+    next_accessibility_id: u32,
 }
 
 /// Work in progress shown in the status bar.
@@ -72,11 +74,7 @@ pub(super) struct Task {
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum Pick {
     Action(String),
-    Enable,
-    Disable,
     Restart,
-    /// Take back one permission (as `manifest::revoke` names it).
-    Revoke(String),
     CancelTask(u32),
 }
 
@@ -89,12 +87,42 @@ pub(super) struct Placed {
     pub float: bool,
 }
 
+/// Display labels can change without changing config references or event IDs.
+#[derive(Debug, Clone)]
+pub(super) struct RegisteredAction {
+    id: String,
+    name: String,
+    default: Option<(modes::Mode, modes::Chord)>,
+}
+impl RegisteredAction {
+    fn parse(id: String, name: String, key: Option<String>) -> Result<Self, String> {
+        if id.is_empty() || id.len() > 100 || id.chars().any(char::is_control) {
+            return Err("invalid plugin action ID".into());
+        }
+        let name: String = clean(&name).take(100).collect();
+        if name.trim().is_empty() {
+            return Err("plugin action label is empty".into());
+        }
+        let default = key
+            .map(|key| suggested_key(&key).ok_or_else(|| format!("invalid plugin default key `{key}`")))
+            .transpose()?;
+        Ok(Self { id, name, default })
+    }
+}
+fn upsert_action(actions: &mut Vec<RegisteredAction>, action: RegisteredAction) {
+    if let Some(old) = actions.iter_mut().find(|old| old.id == action.id) {
+        *old = action;
+    } else {
+        actions.push(action);
+    }
+}
+
 pub(super) struct Running {
-    pub entry: Entry,
+    pub entry: Resolved,
     pub handle: proteus_wasm::Handle,
     pub started: bool,
-    /// Palette entries it registered.
-    pub actions: Vec<String>,
+    /// Stable action IDs, labels and defaults registered by this instance.
+    pub actions: Vec<RegisteredAction>,
     /// Status segments: left, right.
     pub status: [String; 2],
 }
@@ -102,15 +130,16 @@ pub(super) struct Running {
 #[derive(Default)]
 pub(super) struct Plugins {
     pub runtime: Option<Runtime>,
-    pub store: Option<Store>,
+    pub cache: Option<Cache>,
+    pub generation: u64,
     pub running: HashMap<String, Running>,
     /// Failures this session.
     pub failures: HashMap<String, u32>,
     pub next_instance: u64,
     pub surfaces: BTreeMap<u32, Surface>,
     pub next_surface: u32,
-    /// The lock file as last read.
-    pub installed: Vec<Entry>,
+    /// Only successfully resolved declarations from the current config.
+    pub resolved: Vec<Resolved>,
     /// Images plugins loaded: (plugin id, image id).
     pub images: HashMap<(String, u32), Arc<Pixels>>,
     /// Prompts and confirmations waiting for the user.
@@ -120,8 +149,6 @@ pub(super) struct Plugins {
     pub clip_waiters: HashMap<u64, Responder>,
     /// Tasks: (plugin id, task id).
     pub tasks: BTreeMap<(String, u32), Task>,
-    /// Keys suggested by plugins for their actions (chord, action).
-    pub keys: Vec<(modes::Mode, modes::Chord, modes::Action)>,
 }
 
 /// 0xRRGGBB.
@@ -294,60 +321,91 @@ fn plugin_event(ev: &ScriptEvent) -> Option<Event> {
 }
 
 impl App {
-    /// Find the plugin store, start the enabled plugins and watch the
-    /// lock file for changes.
     pub(super) fn plugins_init(&mut self) {
-        let Some(root) =
-            std::env::var_os("PROTEUS_DATA_DIR").map(PathBuf::from).or_else(proteus_wasm::store::default_root)
-        else {
-            return;
-        };
-        let _ = std::fs::create_dir_all(&root);
-        let store = Store::new(root.clone());
-        for e in crate::bundled::install(&store) {
-            eprintln!("proteus: bundled plugin: {e}");
-        }
-        self.pl.store = Some(store);
+        self.pl.cache = Cache::default_paths();
         self.sync_plugins();
-        self.watch_dir(&root, |name| name == "plugins.lock", |app| app.sync_plugins());
     }
 
-    /// Make the running plugins match the lock file.
+    /// Start a new resolution generation. Removed sources stop immediately;
+    /// slow fetch/build results from superseded configs can never start a plugin.
     pub(super) fn sync_plugins(&mut self) {
-        let Some(store) = &self.pl.store else { return };
-        let lock = match store.read() {
-            Ok(l) => l,
-            Err(e) => return self.toast(format!("plugins: {e}"), true, None),
-        };
-        self.pl.installed = lock.plugins.clone();
-        let stale: Vec<String> = self
+        self.pl.generation += 1;
+        let generation = self.pl.generation;
+        let stale: Vec<_> = self
             .pl
             .running
             .iter()
-            .filter(|(id, r)| lock.get(id).is_none_or(|e| !e.enabled || *e != r.entry))
+            .filter(|(_, r)| !self.cfg.plugin_should_load(&r.entry))
             .map(|(id, _)| id.clone())
             .collect();
         for id in stale {
             self.stop_plugin(&id);
         }
-        for e in lock.plugins {
-            if e.enabled && !self.pl.running.contains_key(&e.id) {
-                // A new version gets a fresh start.
-                if self.pl.failures.get(&e.id).is_some_and(|&n| n > MAX_RESTARTS) {
-                    continue;
+        self.pl.resolved.retain(|e| self.cfg.plugin_should_load(e));
+        if self.cfg.plugins.is_empty() {
+            return;
+        }
+        let Some(cache) = self.pl.cache.clone() else {
+            self.toast("plugins: no cache/data directory available".into(), true, None);
+            return;
+        };
+        let sources = self.cfg.plugins.clone();
+        let tx = self.sender.clone();
+        // No directory scans, installed-plugin registry, or bundled defaults.
+        if let Err(e) = std::thread::Builder::new().name("plugin-sources".into()).spawn(move || {
+            let results = sources.iter().map(|s| cache.resolve(s)).collect();
+            let _ = tx.send(Msg::PluginsResolved(generation, results));
+        }) {
+            self.toast(format!("plugins: {e}"), true, None);
+        }
+    }
+
+    pub(super) fn plugins_resolved(&mut self, generation: u64, results: Vec<Result<Resolved, String>>) {
+        if generation != self.pl.generation {
+            return;
+        }
+        let mut resolved = Vec::new();
+        let mut duplicates = HashSet::new();
+        for result in results {
+            match result {
+                Ok(e) if self.cfg.plugin_should_load(&e) => {
+                    if resolved.iter().any(|other: &Resolved| other.id == e.id) {
+                        duplicates.insert(e.id.clone());
+                    }
+                    resolved.push(e);
                 }
+                Ok(_) => {}
+                Err(e) => self.toast(format!("plugin source: {e}"), true, None),
+            }
+        }
+        for id in &duplicates {
+            self.toast(format!("plugins: multiple sources declare ID `{id}`; neither is loaded"), true, None);
+        }
+        resolved.retain(|e| !duplicates.contains(&e.id));
+        let stale: Vec<_> =
+            self.pl.running.iter().filter(|(_, r)| !resolved.contains(&r.entry)).map(|(id, _)| id.clone()).collect();
+        for id in stale {
+            self.stop_plugin(&id);
+            self.pl.failures.remove(&id);
+        }
+        self.pl.resolved = resolved;
+        for e in self.pl.resolved.clone() {
+            if !self.pl.running.contains_key(&e.id) && !self.pl.failures.get(&e.id).is_some_and(|&n| n > MAX_RESTARTS) {
                 self.start_plugin(e);
             }
         }
+        self.keymap = self.cfg.keymap();
+        self.apply_plugin_keys();
         self.mark_all_dirty();
     }
 
-    fn start_plugin(&mut self, entry: Entry) {
-        let Some(store) = &self.pl.store else { return };
-        let wasm = match store.load_component(&entry) {
-            Ok(w) => w,
-            Err(e) => return self.toast(format!("plugin {}: {e}", entry.name), true, None),
-        };
+    fn start_plugin(&mut self, entry: Resolved) {
+        // The final gate covers synchronization, delayed crash restarts and manual actions.
+        if !self.cfg.plugin_should_load(&entry) {
+            return;
+        }
+        let Some(cache) = &self.pl.cache else { return };
+        let wasm = (*entry.wasm).clone();
         if self.pl.runtime.is_none() {
             match Runtime::new() {
                 Ok(r) => self.pl.runtime = Some(r),
@@ -363,15 +421,16 @@ impl App {
             }
         });
         let spec = Spec {
+            config: entry.source.config.clone(),
             key,
             wasm,
             hash: entry.hash.clone(),
             granted: entry.granted.clone(),
-            data_dir: store.data_dir(&entry.id),
-            storage: store.storage_path(&entry.id),
+            data_dir: cache.data_dir(&entry.id),
+            storage: cache.storage_path(&entry.id),
             memory: proteus_wasm::runtime::MEMORY,
             stderr: std::env::var_os("PROTEUS_DEBUG").is_some(),
-            compiled: Some(store.compiled_dir()),
+            compiled: Some(cache.compiled_dir()),
         };
         let Some(rt) = &self.pl.runtime else { return };
         match rt.start(spec, sink) {
@@ -388,6 +447,8 @@ impl App {
         if let Some(r) = self.pl.running.remove(id) {
             r.handle.stop();
             self.remove_plugin_ui(&r.handle.key);
+            self.keymap = self.cfg.keymap();
+            self.apply_plugin_keys();
         }
     }
 
@@ -415,8 +476,6 @@ impl App {
                 w.input = None;
             }
         }
-        let prefix = format!("plugin:{id}:");
-        self.pl.keys.retain(|(_, _, a)| !a.name().starts_with(&prefix));
         self.status_changed();
         self.mark_all_dirty();
     }
@@ -431,8 +490,9 @@ impl App {
             cursor: None,
             background: None,
             images: Vec::new(),
+            accessibility: Vec::new(),
         };
-        self.show_frame(id, frame);
+        let _ = self.show_frame(id, frame);
     }
 
     fn name_of(&self, id: &str) -> String {
@@ -490,7 +550,12 @@ impl App {
                     let _ =
                         self.handle.insert_source(Timer::from_duration(RESTART_DELAY), move |_, _, app: &mut App| {
                             if !app.pl.running.contains_key(&id)
-                                && let Some(e) = app.pl.installed.iter().find(|e| e.id == id && e.enabled).cloned()
+                                && let Some(e) = app
+                                    .pl
+                                    .resolved
+                                    .iter()
+                                    .find(|e| e.id == id && app.cfg.plugin_should_load(e))
+                                    .cloned()
                             {
                                 app.start_plugin(e);
                             }
@@ -555,84 +620,80 @@ impl App {
     }
 
     /// Palette entries: plugin actions, tasks to cancel, and managing
-    /// installed plugins.
+    /// resolved plugins.
     pub(super) fn plugin_palette(&self) -> Vec<(String, String, Pick)> {
         let mut v = Vec::new();
         let mut ids: Vec<&String> = self.pl.running.keys().collect();
         ids.sort();
         for id in ids {
-            for a in &self.pl.running[id].actions {
-                v.push((a.clone(), id.clone(), Pick::Action(a.clone())));
+            for action in &self.pl.running[id].actions {
+                v.push((action.name.clone(), id.clone(), Pick::Action(action.id.clone())));
             }
         }
         for ((id, n), t) in &self.pl.tasks {
             v.push((format!("plugins: cancel {} ({})", t.title, self.name_of(id)), id.clone(), Pick::CancelTask(*n)));
         }
-        for e in &self.pl.installed {
-            let picks: &[(&str, Pick)] = if e.enabled {
-                &[("disable", Pick::Disable), ("restart", Pick::Restart)]
-            } else {
-                &[("enable", Pick::Enable)]
-            };
-            for (verb, pick) in picks {
-                v.push((format!("plugins: {verb} {}", e.name), e.id.clone(), pick.clone()));
-            }
-            for perm in e.granted.names() {
-                v.push((format!("plugins: revoke {perm} from {}", e.name), e.id.clone(), Pick::Revoke(perm)));
-            }
+        for e in &self.pl.resolved {
+            v.push((format!("plugins: restart {}", e.name), e.id.clone(), Pick::Restart));
         }
         v
     }
 
     /// Run a palette entry from [`App::plugin_palette`].
     pub(super) fn plugin_palette_run(&mut self, _label: &str, id: &str, pick: Pick) {
-        let result = match (pick, &self.pl.store) {
-            (Pick::Action(a), _) => {
+        match pick {
+            Pick::Action(a) => {
                 if let Some(r) = self.pl.running.get(id) {
                     r.handle.event(Event::Action(a));
                 }
-                return;
             }
-            (Pick::CancelTask(n), _) => {
+            Pick::CancelTask(n) => {
                 if self.pl.tasks.remove(&(id.to_string(), n)).is_some() {
                     if let Some(r) = self.pl.running.get(id) {
                         r.handle.event(Event::TaskCancelled(n));
                     }
                     self.status_changed();
                 }
-                return;
             }
-            (Pick::Enable, Some(s)) => s.set_enabled(id, true),
-            (Pick::Disable, Some(s)) => s.set_enabled(id, false),
-            (Pick::Revoke(perm), Some(s)) => s.revoke(id, &perm),
-            (Pick::Restart, _) => {
+            Pick::Restart => {
                 self.pl.failures.remove(id);
                 self.stop_plugin(id);
-                Ok(())
+                self.sync_plugins();
             }
-            _ => Ok(()),
-        };
-        if let Err(e) = result {
-            self.toast(format!("plugins: {e}"), true, None);
         }
-        self.sync_plugins();
     }
 
     /// A key bound to a plugin's action.
     pub(super) fn run_plugin_action(&mut self, i: u16) {
         let Some((id, name)) = modes::plugin_action_name(i) else { return };
-        if let Some(r) = self.pl.running.get(&id).filter(|r| r.started) {
+        if let Some(r) = self.pl.running.get(&id).filter(|r| r.started && r.actions.iter().any(|a| a.id == name)) {
             r.handle.event(Event::Action(name));
         }
     }
 
-    /// Bind the keys plugins suggested that the user's keymap leaves free.
+    /// Rebuild from preset + plugin defaults + explicit user overrides.
     pub(super) fn apply_plugin_keys(&mut self) {
-        for (mode, chord, action) in self.pl.keys.clone() {
-            let taken = self.keymap.bindings(mode).iter().any(|(c, a)| *c == chord && *a != action);
-            if !taken {
-                self.keymap.set(mode, chord, Some(action));
+        let mut actions = Vec::new();
+        for (owner, running) in &self.pl.running {
+            let priority = self.cfg.plugins.iter().position(|s| s == &running.entry.source).unwrap_or(usize::MAX);
+            for registered in &running.actions {
+                if let Some((mode, chord)) = registered.default
+                    && let Some(action) = modes::plugin_action(owner, &registered.id)
+                {
+                    actions.push((priority, owner.clone(), registered.id.clone(), (mode, chord, action)));
+                }
             }
+        }
+        // Conflicting plugin defaults are deterministic: source declaration
+        // order, then stable ID, independent of thread startup order.
+        actions.sort_by(|a, b| (&a.0, &a.1, &a.2).cmp(&(&b.0, &b.1, &b.2)));
+        let defaults = actions.into_iter().map(|(_, _, _, binding)| binding).collect::<Vec<_>>();
+        self.keymap = modes::Keymap::with_plugin_defaults(&self.cfg.keys, &defaults);
+    }
+
+    pub(super) fn retheme_surfaces(&mut self, palette: &proteus_core::color::Palette) {
+        for s in self.pl.surfaces.values_mut() {
+            s.term.rebase_palette(palette);
         }
     }
 
@@ -712,6 +773,7 @@ impl App {
             if app.panes.get(&id).is_some_and(|p| p.private) { Err(format!("pane {id} is private")) } else { Ok(()) }
         };
         match call {
+            Call::Locale => Ok(Reply::Text(self.cfg.i18n.locale().into())),
             Call::Log(m) => {
                 if std::env::var_os("PROTEUS_DEBUG").is_some() {
                     eprintln!("proteus: plugin {}: {m}", key.id);
@@ -778,10 +840,11 @@ impl App {
                 Ok(Reply::Unit)
             }
             Call::Draw(id, frame) => {
+                proteus_wasm::accessibility::validate(&frame.accessibility)?;
                 if !self.pl.surfaces.get(&id).is_some_and(|s| s.owner == *key) {
                     return Err(format!("no surface {id}"));
                 }
-                self.show_frame(id, frame);
+                self.show_frame(id, frame)?;
                 Ok(Reply::Unit)
             }
             Call::CloseSurface(id) => {
@@ -799,6 +862,19 @@ impl App {
                 self.activate_kbd();
                 Ok(Reply::Unit)
             }
+            Call::SetSurfaceTitle(id, title) => {
+                let s = self.pl.surfaces.get_mut(&id).filter(|s| s.owner == *key).ok_or(format!("no surface {id}"))?;
+                let title: String = clean(&title).take(100).collect();
+                if let Some(p) = s.pane.and_then(|id| self.panes.get_mut(&id))
+                    && p.name.as_deref() == Some(&s.title)
+                {
+                    p.name = Some(title.clone());
+                }
+                s.title = title;
+                self.update_title();
+                self.mark_all_dirty();
+                Ok(Reply::Unit)
+            }
             Call::SurfaceSize(id) => {
                 let s = self.pl.surfaces.get(&id).filter(|s| s.owner == *key).ok_or(format!("no surface {id}"))?;
                 Ok(Reply::Size(s.size.0 as u32, s.size.1 as u32))
@@ -811,20 +887,13 @@ impl App {
                 self.status_changed();
                 Ok(Reply::Unit)
             }
-            Call::RegisterAction(name, chord) => {
-                let name: String = clean(&name).take(100).collect();
-                if let Some((mode, chord)) = chord.as_deref().and_then(suggested_key)
-                    && let Some(action) = modes::plugin_action(&key.id, &name)
-                    && !self.pl.keys.iter().any(|(m, c, _)| (*m, *c) == (mode, chord))
-                {
-                    self.pl.keys.push((mode, chord, action));
-                    self.apply_plugin_keys();
-                }
-                if let Some(r) = self.pl.running.get_mut(&key.id)
-                    && !r.actions.contains(&name)
-                {
-                    r.actions.push(name);
-                }
+            Call::RegisterAction { id, name, key: default_key } => {
+                let action = RegisteredAction::parse(id, name, default_key)?;
+                let Some(running) = self.pl.running.get_mut(&key.id) else {
+                    return Err("plugin is not running".into());
+                };
+                upsert_action(&mut running.actions, action);
+                self.apply_plugin_keys();
                 Ok(Reply::Unit)
             }
             Call::LoadImage(id, px) => {
@@ -918,7 +987,7 @@ impl App {
 
     // --- surfaces --------------------------------------------------------------
 
-    fn open_surface(&mut self, key: &Key, o: types::SurfaceOptions) -> Result<u32, String> {
+    pub(super) fn open_surface(&mut self, key: &Key, o: types::SurfaceOptions) -> Result<u32, String> {
         if self.pl.surfaces.values().filter(|s| s.owner == *key).count() >= MAX_SURFACES {
             return Err(format!("at most {MAX_SURFACES} surfaces"));
         }
@@ -970,18 +1039,22 @@ impl App {
     fn new_surface(&mut self, owner: Key, kind: SurfaceKind, title: String, want: (u32, u32)) -> u32 {
         self.pl.next_surface += 1;
         let id = self.pl.next_surface;
+        let mut term = surface_term(1, 1);
+        term.set_palette(self.cfg.theme.palette());
         let s = Surface {
             owner,
             win: self.w.id,
             kind,
             title,
             want,
-            term: surface_term(1, 1),
+            term,
             pane: None,
             anchor: None,
             size: (0, 0),
             sent: HashSet::new(),
             frame: None,
+            accessibility_ids: HashMap::new(),
+            next_accessibility_id: 4,
         };
         self.pl.surfaces.insert(id, s);
         id
@@ -992,6 +1065,7 @@ impl App {
         let pid = self.next_id;
         self.next_id += 1;
         let mut term = surface_term(cols.max(2) as usize, rows.max(1) as usize);
+        term.set_palette(self.cfg.theme.palette());
         term.set_cell_pixel_size(self.cell().0, self.cell().1);
         self.panes.insert(pid, super::pane::Pane::plugin(term, id, title.to_string()));
         if let Some(s) = self.pl.surfaces.get_mut(&id) {
@@ -1009,7 +1083,7 @@ impl App {
             Some(r) if r.started => r.handle.key.clone(),
             _ => Key { id: plugin.to_string(), instance: 0 },
         };
-        let title = self.pl.installed.iter().find(|e| e.id == plugin).map_or(plugin.to_string(), |e| e.name.clone());
+        let title = self.pl.resolved.iter().find(|e| e.id == plugin).map_or(plugin.to_string(), |e| e.name.clone());
         let id = self.new_surface(owner.clone(), SurfaceKind::Tab, title.clone(), (0, 0));
         let pid = self.surface_pane(id, &title, cols, rows);
         if let Some(p) = self.panes.get_mut(&pid) {
@@ -1026,12 +1100,27 @@ impl App {
     }
 
     /// Show `frame` on surface `id` (with its images).
-    fn show_frame(&mut self, id: u32, frame: Frame) {
-        let Some(s) = self.pl.surfaces.get_mut(&id) else { return };
+    pub(super) fn show_frame(&mut self, id: u32, frame: Frame) -> Result<(), String> {
+        proteus_wasm::accessibility::validate(&frame.accessibility)?;
+        let Some(s) = self.pl.surfaces.get_mut(&id) else {
+            return Err(format!("no surface {id}"));
+        };
+        let added = frame.accessibility.iter().filter(|n| !s.accessibility_ids.contains_key(&n.id)).count();
+        s.next_accessibility_id
+            .checked_add((added as u32).saturating_mul(4))
+            .ok_or("accessibility node IDs exhausted")?;
+        let keys: HashSet<_> = frame.accessibility.iter().map(|n| n.id.as_str()).collect();
+        s.accessibility_ids.retain(|id, _| keys.contains(id.as_str()));
+        for node in &frame.accessibility {
+            if !s.accessibility_ids.contains_key(&node.id) {
+                s.accessibility_ids.insert(node.id.clone(), s.next_accessibility_id);
+                s.next_accessibility_id += 4;
+            }
+        }
         let term = match s.pane {
             Some(p) => match self.panes.get_mut(&p) {
                 Some(p) => &mut p.term,
-                None => return,
+                None => return Err("surface pane was closed".into()),
             },
             None => &mut s.term,
         };
@@ -1065,11 +1154,12 @@ impl App {
         s.frame = Some(frame);
         let win = s.win;
         self.dirty_win(win);
+        Ok(())
     }
 
     /// Remove a surface without telling its plugin (a pane surface closes
     /// its pane).
-    fn drop_surface(&mut self, id: u32) {
+    pub(super) fn drop_surface(&mut self, id: u32) {
         let Some(s) = self.pl.surfaces.remove(&id) else { return };
         if let Some(p) = s.pane {
             if self.panes.contains_key(&p) {
@@ -1090,15 +1180,6 @@ impl App {
         self.activate_kbd();
     }
 
-    /// The user closed a surface: tell its plugin.
-    pub(super) fn close_surface(&mut self, id: u32) {
-        let owner = self.pl.surfaces.get(&id).map(|s| s.owner.clone());
-        self.drop_surface(id);
-        if let Some(r) = owner.and_then(|o| self.pl.running.get(&o.id).filter(|r| r.handle.key == o)) {
-            r.handle.ui(id, UiEvent::Closed);
-        }
-    }
-
     /// A pane was closed: if it showed a surface, the plugin hears of it.
     pub(super) fn surface_pane_gone(&mut self, surface: Option<u32>) {
         let Some(id) = surface else { return };
@@ -1111,69 +1192,12 @@ impl App {
 
     pub(super) fn surface_ui(&mut self, id: u32, e: UiEvent) {
         let Some(s) = self.pl.surfaces.get(&id) else { return };
-        if s.owner.id == LUA {
+        if s.owner.id == CONFIG {
             self.sc.queue.push_back(super::scripting::ScriptCall::Ui(id, e));
             return;
         }
         if let Some(r) = self.pl.running.get(&s.owner.id).filter(|r| r.handle.key == s.owner) {
             r.handle.ui(id, e);
-        }
-    }
-
-    // --- surfaces of Lua scripts (`p.ui`) ------------------------------------------
-
-    fn lua_key(&self) -> Key {
-        Key { id: LUA.into(), instance: self.sc.generation as u64 }
-    }
-
-    fn lua_surface(&self, id: u32) -> Result<(), String> {
-        let k = self.lua_key();
-        if self.pl.surfaces.get(&id).is_some_and(|s| s.owner == k) { Ok(()) } else { Err(format!("no surface {id}")) }
-    }
-
-    pub(super) fn lua_surface_open(&mut self, o: types::SurfaceOptions) -> Result<u32, String> {
-        let k = self.lua_key();
-        let r = self.open_surface(&k, o);
-        // Lua draws on its first `resize` (sidebars and floats got theirs
-        // in the layout).
-        if let Ok(id) = r
-            && self.pl.surfaces.get(&id).is_some_and(|s| s.pane.is_some())
-        {
-            let size = self.pl.surfaces.get(&id).map(|s| s.size).unwrap_or_default();
-            self.sc
-                .queue
-                .push_back(super::scripting::ScriptCall::Ui(id, UiEvent::Resize((size.0 as u32, size.1 as u32))));
-        }
-        r
-    }
-
-    pub(super) fn lua_surface_draw(&mut self, id: u32, frame: Frame) -> Result<(), String> {
-        self.lua_surface(id)?;
-        self.show_frame(id, frame);
-        Ok(())
-    }
-
-    pub(super) fn lua_surface_close(&mut self, id: u32) {
-        if self.lua_surface(id).is_ok() {
-            self.drop_surface(id);
-        }
-    }
-
-    pub(super) fn lua_surface_focus(&mut self, id: u32) -> Result<(), String> {
-        self.lua_surface(id)?;
-        self.plugin_call(&self.lua_key(), Call::FocusSurface(id)).map(|_| ())
-    }
-
-    pub(super) fn lua_surface_size(&self, id: u32) -> Option<(u32, u32)> {
-        self.lua_surface(id).ok()?;
-        self.pl.surfaces.get(&id).map(|s| (s.size.0 as u32, s.size.1 as u32))
-    }
-
-    /// The script was reloaded: its surfaces go.
-    pub(super) fn drop_lua_surfaces(&mut self) {
-        let gone: Vec<u32> = self.pl.surfaces.iter().filter(|(_, s)| s.owner.id == LUA).map(|(id, _)| *id).collect();
-        for id in gone {
-            self.drop_surface(id);
         }
     }
 
@@ -1195,19 +1219,6 @@ impl App {
         if let Some(old) = self.w.surface_focus.take() {
             self.surface_ui(old, UiEvent::Focus(false));
             self.w.dirty = true;
-        }
-    }
-
-    /// `sidebar.focus`: the next surface of this window, then the panes.
-    pub(super) fn cycle_surface_focus(&mut self) {
-        let mine: Vec<u32> = self.surfaces_here().iter().map(|p| p.id).collect();
-        let next = match self.w.surface_focus {
-            None => mine.first().copied(),
-            Some(cur) => mine.iter().position(|&s| s == cur).and_then(|i| mine.get(i + 1)).copied(),
-        };
-        match next {
-            Some(s) => self.focus_surface(s),
-            None => self.unfocus_surface(),
         }
     }
 
@@ -1234,13 +1245,14 @@ impl App {
         let (pw, ph) = self.physical();
         let p = self.pad() as i32;
         let (cw, ch) = (self.cell().0 as i32, self.cell().1 as i32);
-        let mut top = p;
+        let py = self.pad_y() as i32;
+        let mut top = py;
         if self.tab_bar_visible() {
-            top += ch + p;
+            top += ch + py;
         }
-        let mut bottom = ph as i32 - p;
+        let mut bottom = ph as i32 - py;
         if self.cfg.hint_bar == crate::config::HintBar::Always {
-            bottom -= ch + p;
+            bottom -= ch + py;
         }
         let h = (bottom - top).max(2 * ch);
         let max = (pw as i32 / 2 / cw).max(4) as u32;
@@ -1310,7 +1322,7 @@ impl App {
             s.size = size;
             s.sent.clear();
             if let Some(f) = s.frame.take() {
-                self.show_frame(id, f);
+                let _ = self.show_frame(id, f);
             }
             self.surface_ui(id, UiEvent::Resize((size.0 as u32, size.1 as u32)));
         }
@@ -1322,11 +1334,12 @@ impl App {
                 continue;
             }
             s.term = surface_term(cols, rows);
+            s.term.set_palette(self.cfg.theme.palette());
             s.term.set_cell_pixel_size(cw as u32, ch as u32);
             s.sent.clear();
             s.size = (cols, rows);
             if let Some(f) = s.frame.take() {
-                self.show_frame(p.id, f);
+                let _ = self.show_frame(p.id, f);
             }
             self.surface_ui(p.id, UiEvent::Resize((cols as u32, rows as u32)));
         }
@@ -1484,7 +1497,7 @@ impl App {
     pub(super) fn surface_parts(&self, theme: &render::Theme) -> SurfaceParts {
         let (mut tiled, mut floats, mut rects, mut labels) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let cw = self.cell().0 as f32;
-        let thick = (self.w.scale.round() as f32).max(1.0);
+        let thick = (self.cfg.border_width * self.w.scale) as f32;
         for p in self.surfaces_here() {
             let Some(s) = self.pl.surfaces.get(&p.id) else { continue };
             let on = self.w.surface_focus == Some(p.id) && self.w.focused;
@@ -1597,6 +1610,30 @@ mod tests {
     }
 
     #[test]
+    fn action_ids_are_stable_and_reregistration_replaces_defaults_and_labels() {
+        let mut actions = Vec::new();
+        upsert_action(
+            &mut actions,
+            RegisteredAction::parse("sidebar.toggle".into(), "Files: sidebar".into(), Some("alt+e".into())).unwrap(),
+        );
+        let identity = modes::plugin_action("proteus.files", &actions[0].id).unwrap();
+        upsert_action(
+            &mut actions,
+            RegisteredAction::parse("sidebar.toggle".into(), "Browse files".into(), Some("pane:E".into())).unwrap(),
+        );
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].name, "Browse files");
+        assert_eq!(actions[0].default, Some((modes::Mode::Pane, modes::Chord::parse("E").unwrap())));
+        assert_eq!(modes::plugin_action("proteus.files", &actions[0].id), Some(identity));
+        upsert_action(
+            &mut actions,
+            RegisteredAction::parse("sidebar.toggle".into(), "Browse files".into(), None).unwrap(),
+        );
+        assert!(actions[0].default.is_none());
+        assert!(RegisteredAction::parse("id".into(), "label".into(), Some("nope:e".into())).is_err());
+    }
+
+    #[test]
     fn suggested_keys() {
         use modes::Mode;
         let c = |s| modes::Chord::parse(s).unwrap();
@@ -1620,6 +1657,7 @@ mod tests {
             cursor: Some((1, 0)),
             background: None,
             images: Vec::new(),
+            accessibility: Vec::new(),
         };
         let mut t = surface_term(6, 3);
         t.advance(paint(&frame, 6, 3).as_bytes());

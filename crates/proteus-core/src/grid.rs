@@ -71,6 +71,7 @@ impl Grid {
     pub fn set_max_scrollback(&mut self, n: usize) {
         self.max_scrollback = n;
         self.trim_history();
+        self.display_offset = self.display_offset.min(self.history_len());
     }
     /// Absolute line number of the oldest row still stored.
     pub fn first_line(&self) -> Line {
@@ -386,6 +387,21 @@ mod tests {
         assert_eq!(g.history_len(), 3);
         assert_eq!(g.first_line(), 3);
         assert_eq!(g.abs_row(4).unwrap().text(0..4).trim_end(), "3");
+    }
+
+    #[test]
+    fn shrinking_history_clamps_viewport() {
+        let mut g = Grid::new(5, 2, 100);
+        for _ in 0..20 {
+            g.scroll_up(0, 1, 1, StyleId::DEFAULT, true);
+        }
+        g.scroll_display(20);
+        g.set_max_scrollback(1);
+        assert_eq!(g.display_offset(), 1);
+        assert_eq!(g.viewport_row(0).len(), 5);
+        g.set_max_scrollback(0);
+        assert_eq!(g.display_offset(), 0);
+        assert_eq!(g.viewport_row(0).len(), 5);
     }
 
     #[test]

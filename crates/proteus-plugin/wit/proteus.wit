@@ -82,7 +82,8 @@ interface types {
         command-started(tuple<pane-id, option<string>>),
         command-finished(command-finished),
         bell(pane-id),
-        /// A palette entry of this plugin (`register-action`) was chosen.
+        /// A registered action was invoked. Payload is its stable local action ID
+        /// (legacy registrations use the old name as their ID).
         action(string),
         timer(timer-id),
         /// The terminal's colors changed (also sent once after `init`).
@@ -205,6 +206,37 @@ interface types {
     /// One row of a surface. Rows wider than the surface are cut off.
     type line = list<span>;
 
+    enum accessibility-role { group, text, button, text-input, %list, list-item, image, status, dialog }
+    enum accessibility-action { focus, activate, set-value, select, scroll-up, scroll-down }
+
+    /// Semantic nodes use stable plugin-owned IDs and surface-local cell bounds.
+    /// Parents must precede children. Omit semantics to expose the surface as text.
+    record accessible-node {
+        id: string,
+        parent: option<string>,
+        role: accessibility-role,
+        label: string,
+        description: option<string>,
+        value: option<string>,
+        col: u32,
+        row: u32,
+        cols: u32,
+        rows: u32,
+        selected: option<bool>,
+        expanded: option<bool>,
+        disabled: bool,
+        focused: bool,
+        actions: list<accessibility-action>,
+        position: option<u32>,
+        set-size: option<u32>,
+    }
+
+    record accessibility-event {
+        node: string,
+        action: accessibility-action,
+        value: option<string>,
+    }
+
     /// A whole surface: rows from the top; missing rows are blank.
     record frame {
         lines: list<line>,
@@ -214,6 +246,7 @@ interface types {
         background: option<color>,
         /// Images over the text (from `load-image`).
         images: list<image-place>,
+        accessibility: list<accessible-node>,
     }
 
     /// An image scaled into `cols` × `rows` cells at (`col`, `row`).
@@ -287,6 +320,7 @@ interface types {
 
     /// Events of one surface.
     variant ui-event {
+        accessibility(accessibility-event),
         key(key-event),
         /// Text from the input method, or pasted.
         text(string),
@@ -318,6 +352,10 @@ interface types {
 }
 
 interface host {
+    /// JSON-encoded plugin-owned settings from load_plugin.config. No permission required.
+    plugin-config: func() -> result<string, string>;
+    /// Effective configured locale, normalized (e.g. zh-hans-cn). No permission required.
+    locale: func() -> result<string, string>;
     use types.{pane-id, pane-info, block-info, surface-id, surface-options, frame, status-side, timer-id, spawn, placement,
         process-id, request-id, watch-id, task-id, image-id, command, output, http-request, http-response, dir-entry};
 
@@ -346,6 +384,8 @@ interface host {
 
     // --- ui (permission `ui`) -----------------------------------------------
     open-surface: func(options: surface-options) -> result<surface-id, string>;
+    /// Update a surface title without reopening it (only surfaces owned by this instance).
+    set-surface-title: func(surface: surface-id, title: string) -> result<_, string>;
     /// Replace what a surface shows.
     draw: func(surface: surface-id, frame: frame) -> result<_, string>;
     close-surface: func(surface: surface-id);
@@ -359,12 +399,15 @@ interface host {
     surface-size: func(surface: surface-id) -> result<tuple<u32, u32>, string>;
     /// A tab-bar segment; empty text removes it.
     set-status: func(side: status-side, text: string) -> result<_, string>;
-    /// A command palette entry; choosing it sends `event::action(name)`.
-    /// `key` suggests a key for it in Normal mode (`alt+g`), or in another
-    /// mode as `MODE:KEY` (`pane:e`); it is bound
-    /// only if the user has not bound that key. The user can bind the
-    /// action to any key as `plugin:ID:NAME`.
+    /// Legacy name-based registration, retained for prebuilt v1 components.
     register-action: func(name: string, key: option<string>) -> result<_, string>;
+    /// Register a stable local action ID separately from its palette label.
+    /// Invocation sends event::action(id). IDs use ASCII letters, digits,
+    /// dots, underscores or hyphens. Re-registering an ID updates its label
+    /// and default key. A default is KEY (Normal) or MODE:KEY (e.g. pane:E).
+    /// User keymaps reference plugin:PLUGIN-ID:ACTION-ID; explicit user binds
+    /// and unbindings override defaults. None means palette-only by default.
+    register-action-id: func(id: string, name: string, default-key: option<string>) -> result<_, string>;
     /// Decode a PNG, JPEG, GIF or WebP image for frames (at most 64 MiB of
     /// pixels per plugin).
     load-image: func(data: list<u8>) -> result<image-id, string>;
@@ -431,6 +474,16 @@ interface host {
     /// The entries of a directory with their metadata, in one call (much
     /// faster than WASI for big directories). At most 200,000 entries.
     list-dir: func(path: string) -> result<list<dir-entry>, string>;
+
+    /// Unix access mode (permission bits only), including executable bits.
+    file-mode: func(path: string) -> result<u32, string>;
+    /// Change Unix access mode inside an rw grant (no setuid/setgid bits).
+    set-file-mode: func(path: string, mode: u32) -> result<_, string>;
+    /// Create a new empty file (0600) or directory (0700), never replacing.
+    create-private: func(path: string, directory: bool) -> result<_, string>;
+    /// Atomically rename a staged file inside rw grants. With replace=false,
+    /// fail if the destination exists, including a symlink.
+    publish-file: func(staged: string, destination: string, replace: bool) -> result<_, string>;
 
     // --- time -----------------------------------------------------------------
     /// `event::timer(id)` after `ms` milliseconds (every `ms` with `repeat`).

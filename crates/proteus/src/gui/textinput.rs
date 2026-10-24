@@ -14,6 +14,7 @@ pub enum Purpose {
     RenameTab(PaneId),
     RenamePane(PaneId),
     SaveLayout,
+    ExportScrollback(PaneId),
     LoadLayout,
     /// Run an action by name.
     Palette,
@@ -24,13 +25,14 @@ pub enum Purpose {
 impl Purpose {
     pub fn badge(self) -> &'static str {
         match self {
-            Purpose::Search => "SEARCH",
-            Purpose::RenameTab(_) => "RENAME TAB",
-            Purpose::RenamePane(_) => "RENAME PANE",
-            Purpose::SaveLayout => "SAVE LAYOUT",
-            Purpose::LoadLayout => "LOAD LAYOUT",
-            Purpose::Palette => "ACTION",
-            Purpose::PluginPrompt(_) => "PLUGIN",
+            Purpose::Search => "badge-search",
+            Purpose::RenameTab(_) => "badge-rename-tab",
+            Purpose::RenamePane(_) => "badge-rename-pane",
+            Purpose::SaveLayout => "badge-save-layout",
+            Purpose::ExportScrollback(_) => "badge-export-scrollback",
+            Purpose::LoadLayout => "badge-load-layout",
+            Purpose::Palette => "badge-action",
+            Purpose::PluginPrompt(_) => "badge-plugin",
         }
     }
 }
@@ -142,7 +144,8 @@ impl Input {
             Key::Char('w') if ctrl => {
                 let before = &self.text[..self.cursor];
                 let trimmed = before.trim_end();
-                let start = trimmed.rfind(char::is_whitespace).map_or(0, |i| i + 1);
+                let start =
+                    trimmed.char_indices().rfind(|(_, c)| c.is_whitespace()).map_or(0, |(i, c)| i + c.len_utf8());
                 self.text.replace_range(start..self.cursor, "");
                 self.cursor = start;
                 Edit::Changed
@@ -229,6 +232,16 @@ mod tests {
         r.key(Key::Left, n, "");
         r.key(Key::Delete, n, "");
         assert_eq!(r.text, "ab");
+    }
+
+    #[test]
+    fn delete_word_after_unicode_whitespace() {
+        for space in [" ", "\u{3000}", "\u{a0}"] {
+            let mut input = Input::new(Purpose::Search, &format!("hello{space}world"));
+            input.key(Key::Char('w'), Mods::CTRL, "");
+            assert_eq!(input.text, format!("hello{space}"));
+            assert_eq!(input.cursor, input.text.len());
+        }
     }
 
     #[test]

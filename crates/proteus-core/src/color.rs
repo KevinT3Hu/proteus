@@ -21,6 +21,9 @@ impl Rgb {
     /// Parse `#rgb`, `#rrggbb`, `#rrrgggbbb`, `#rrrrggggbbbb` or `rgb:r/g/b` (1–4 hex digits per channel).
     pub fn parse(spec: &str) -> Option<Rgb> {
         let spec = spec.trim();
+        if !spec.is_ascii() {
+            return None;
+        }
         if let Some(rest) = spec.strip_prefix("rgb:") {
             let mut parts = rest.split('/');
             let r = parse_scaled(parts.next()?)?;
@@ -108,6 +111,19 @@ impl Palette {
             bg: None,
             cursor: None,
         }
+    }
+
+    /// Change a configured indexed color, leaving application overrides intact.
+    pub fn set_base_indexed(&mut self, i: u8, c: Rgb) {
+        self.base[i as usize] = c;
+    }
+
+    /// Install new configured defaults while preserving application OSC overrides.
+    pub fn rebase(&mut self, theme: &Self) {
+        self.base = theme.base;
+        self.base_fg = theme.base_fg;
+        self.base_bg = theme.base_bg;
+        self.base_cursor = theme.base_cursor;
     }
 
     pub fn indexed(&self, i: u8) -> Rgb {
@@ -198,6 +214,29 @@ fn default_ansi16() -> [Rgb; 16] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reload_preserves_overrides_and_reset_uses_new_defaults() {
+        let mut p = Palette::default();
+        let override_color = Rgb::new(1, 2, 3);
+        p.set_indexed(4, override_color);
+        p.set_special(Special::Background, Some(override_color));
+        let fg = Rgb::new(20, 30, 40);
+        let bg = Rgb::new(200, 210, 220);
+        let mut theme = Palette::new(default_ansi16(), fg, bg, Some(fg));
+        theme.set_base_indexed(4, bg);
+        theme.set_base_indexed(255, fg);
+        p.rebase(&theme);
+        assert_eq!(p.foreground(), fg);
+        assert_eq!(p.background(), override_color);
+        assert_eq!(p.indexed(4), override_color);
+        assert_eq!(p.indexed(255), fg);
+        p.reset_all();
+        assert_eq!(p.background(), bg);
+        assert_eq!(p.indexed(4), bg);
+        assert_eq!(p.cursor(), Some(fg));
+        assert!(Rgb::parse("#ééé").is_none());
+    }
 
     #[test]
     fn parse_specs() {

@@ -7,8 +7,10 @@
 
 mod fsys;
 mod git;
+mod i18n;
 mod ops;
 mod preview;
+mod render;
 mod view;
 
 use std::cell::RefCell;
@@ -17,19 +19,23 @@ use std::path::{Path, PathBuf};
 
 use proteus_plugin::types::ProcessId;
 use proteus_plugin::types::{
-    Attrs, BlockState, Color, Command, Event, Frame, ImageId, ImagePlace, Line, MouseAction, MouseButton, PaneId,
-    RequestId, Span, Style, SurfaceId, SurfaceKind, SurfaceOptions, Theme, TimerId, UiEvent, WatchId,
+    Attrs, BlockState, Color, Command, Event, ImageId, Line, MouseAction, MouseButton, PaneId, RequestId, Span, Style,
+    SurfaceId, SurfaceKind, SurfaceOptions, Theme, TimerId, UiEvent, WatchId,
 };
-use proteus_plugin::{Edit, Guest, TextInput, fit, host, pad, widgets::clip, width};
+use proteus_plugin::{Edit, Guest, TextInput, fit, host};
 
 use fsys::{Sort, SortKey};
+use i18n::tr;
 use ops::{Choice, OpKind, Step, Transfer};
 use proteus_plugin::types::{Placement, Spawn, TaskId};
+use proteus_plugin::ui::Rect;
+use render::preview_component;
 use view::{Kind, Layout, View};
 
-const SIDEBAR: &str = "Files: sidebar";
-const PANE: &str = "Files: pane";
-const PICKER: &str = "Files: pick a path";
+// Retain the registered action ID so existing user keymaps keep working.
+const SIDEBAR: &str = "sidebar.toggle";
+const PANE: &str = "pane.open";
+const PICKER: &str = "picker.open";
 const SIDEBAR_COLS: u32 = 32;
 
 /// A pending two-key command.
@@ -45,6 +51,8 @@ enum Prefix {
 struct Ui {
     view: View,
     size: (u32, u32),
+    /// Emitted by the declarative renderer, used for keys and hit testing.
+    list_area: Rect,
     prefix: Option<Prefix>,
     /// Editing the filter.
     input: Option<TextInput>,
@@ -59,8 +67,40 @@ struct Ui {
     dragging: bool,
 }
 
+/// Settings owned and validated by this plugin, independent of host load options.
+#[derive(proteus_plugin::serde::Deserialize)]
+#[serde(crate = "proteus_plugin::serde", default, deny_unknown_fields)]
+struct Settings {
+    position: Position,
+    width: u32,
+}
+
+#[derive(Default, proteus_plugin::serde::Deserialize)]
+#[serde(crate = "proteus_plugin::serde", rename_all = "lowercase")]
+enum Position {
+    #[default]
+    Left,
+    Right,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self { position: Position::Left, width: SIDEBAR_COLS }
+    }
+}
+
+impl Settings {
+    fn validate(self) -> Result<Self, String> {
+        if !(1..=4096).contains(&self.width) {
+            return Err("file manager config.width must be between 1 and 4096 columns".into());
+        }
+        Ok(self)
+    }
+}
+
 #[derive(Default)]
 struct State {
+    settings: Settings,
     uis: HashMap<SurfaceId, Ui>,
     theme: Option<Theme>,
     sidebar: Option<SurfaceId>,
@@ -253,6 +293,7 @@ thread_local! {
 
 // --- colors -------------------------------------------------------------------
 
+#[derive(Clone, Copy)]
 struct Colors {
     fg: Color,
     bg: Color,
@@ -288,87 +329,6 @@ fn span(text: impl Into<String>, style: Style) -> Span {
     Span { text: text.into(), style, link: None }
 }
 
-// --- drawing ------------------------------------------------------------------
-
-/// How a row is drawn.
-#[derive(Clone, Copy)]
-struct RowLook {
-    cursor: bool,
-    marked: bool,
-    /// The miller parent column's current directory.
-    here: bool,
-    git: Option<git::Mark>,
-    tree: bool,
-    size: bool,
-}
-
-fn row_line(r: &view::Row, look: RowLook, cols: usize, c: &Colors) -> Line {
-    let e = &r.entry;
-    let mut st = if e.dir {
-        style(Some(c.accent), None, Attrs::BOLD)
-    } else if e.link {
-        style(Some(Color::Indexed(6)), None, Attrs::empty())
-    } else {
-        Style::PLAIN
-    };
-    if e.hidden() {
-        st.attrs |= Attrs::DIM;
-    }
-    let fill = if look.cursor {
-        st = style(Some(c.bg), Some(c.accent), st.attrs & !Attrs::DIM);
-        st
-    } else if look.here {
-        st.bg = Some(c.bar);
-        st
-    } else {
-        Style::PLAIN
-    };
-    let mut line = Vec::new();
-    let mark = if look.marked { "●" } else { " " };
-    line.push(span(mark, style(Some(c.accent), fill.bg, Attrs::BOLD)));
-    let (gc, gcol) = match look.git {
-        Some(git::Mark::Modified) => ('M', Color::Indexed(3)),
-        Some(git::Mark::Staged) => ('+', Color::Indexed(2)),
-        Some(git::Mark::Untracked) => ('?', Color::Indexed(1)),
-        Some(git::Mark::Ignored) => ('!', c.dim),
-        None => (' ', c.dim),
-    };
-    let gst = if look.cursor { fill } else { style(Some(gcol), fill.bg, Attrs::empty()) };
-    line.push(span(gc.to_string(), gst));
-    let mut name = String::from(" ");
-    if look.tree {
-        name.push_str(&"  ".repeat(r.depth));
-        name.push_str(if !e.dir {
-            "  "
-        } else if r.open {
-            "▾ "
-        } else {
-            "▸ "
-        });
-    }
-    name.push_str(&e.name);
-    if e.dir {
-        name.push('/');
-    }
-    if e.link {
-        name.push('@');
-    }
-    let size = if look.size && !e.dir { format!(" {} ", fsys::human(e.size)) } else { " ".into() };
-    let room = cols.saturating_sub(2 + width(&size));
-    let name = fit(&name, room);
-    let gap = room.saturating_sub(width(&name));
-    line.push(span(name, st));
-    line.push(span(" ".repeat(gap), fill));
-    if cols > 2 + width(&size) {
-        let mut sz = fill;
-        if !look.cursor {
-            sz.fg = Some(c.dim);
-        }
-        line.push(span(size, sz));
-    }
-    line
-}
-
 /// `YYYY-MM-DD HH:MM` (UTC) of seconds since the epoch.
 fn date(secs: i64) -> String {
     let days = secs.div_euclid(86_400);
@@ -384,273 +344,6 @@ fn date(secs: i64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = yoe + era * 400 + i64::from(m <= 2);
     format!("{y:04}-{m:02}-{d:02} {:02}:{:02}", rem / 3600, rem % 3600 / 60)
-}
-
-impl State {
-    fn draw(&mut self, id: SurfaceId) {
-        let c = colors(self.theme);
-        let Some(ui) = self.uis.get_mut(&id) else { return };
-        let (cols, rows) = (ui.size.0 as usize, ui.size.1 as usize);
-        if cols == 0 || rows == 0 {
-            return;
-        }
-        let home = fsys::home();
-        let mut lines: Vec<Line> = Vec::new();
-        let mut cursor = None;
-        let mut images = Vec::new();
-
-        // Header: the directory and the sidebar's follow state.
-        let flag = match (ui.view.kind, ui.follow) {
-            _ if ui.remote.is_some() => " remote",
-            (Kind::Sidebar, true) => "",
-            (Kind::Sidebar, false) => " pinned",
-            _ => "",
-        };
-        let path = fit(&fsys::tilde(&ui.view.dir, home.as_deref()), cols.saturating_sub(width(flag)));
-        let gap = cols.saturating_sub(width(&path) + width(flag));
-        lines.push(vec![
-            span(path, style(Some(c.accent), None, Attrs::BOLD)),
-            span(" ".repeat(gap), Style::PLAIN),
-            span(flag, style(Some(c.dim), None, Attrs::empty())),
-        ]);
-
-        let body = rows.saturating_sub(2);
-        if let Some(host) = &ui.remote {
-            lines.push(vec![span(
-                fit(&format!("{host}: remote: not available in v1"), cols),
-                style(Some(c.dim), None, Attrs::ITALIC),
-            )]);
-        } else if let Some(e) = ui.view.error() {
-            lines.push(vec![span(fit(e, cols), style(Some(Color::Indexed(1)), None, Attrs::empty()))]);
-        } else {
-            let status = self.git.status(&ui.view.dir).cloned();
-            let mark = |p: &Path| status.as_ref().and_then(|s| s.mark(p));
-            let miller = ui.view.layout == Layout::Miller && cols >= 30;
-            let tree = ui.view.layout == Layout::Tree;
-            // Column widths: parent | current | preview.
-            let (pw, cw) = if !miller {
-                (0, cols)
-            } else if cols >= 60 {
-                (cols / 5, cols * 2 / 5)
-            } else {
-                (0, cols / 2)
-            };
-            let vw = cols.saturating_sub(pw + cw + if pw > 0 { 2 } else { 1 });
-            let size = !miller && ui.view.kind != Kind::Sidebar || cw >= 40;
-            let shown: Vec<(usize, bool)> = ui.view.list.visible(body).collect();
-            let mut current: Vec<Line> = shown
-                .iter()
-                .map(|&(i, sel)| {
-                    let r = &ui.view.rows[i];
-                    let look = RowLook {
-                        cursor: sel,
-                        marked: ui.view.selected.contains(&r.path),
-                        here: false,
-                        git: mark(&r.path),
-                        tree,
-                        size,
-                    };
-                    row_line(r, look, cw, &c)
-                })
-                .collect();
-            if ui.view.rows.is_empty() {
-                let what = if ui.view.filter.is_empty() { "empty" } else { "no match" };
-                current.push(vec![span(what, style(Some(c.dim), None, Attrs::ITALIC))]);
-            }
-            if miller {
-                let parent = if pw > 0 { column_parent(&mut ui.view, pw, body, &mark, &c) } else { Vec::new() };
-                let (preview, img) = column_preview(&mut ui.view, self.preview.as_ref(), vw, body, &mark, &c);
-                if let Some(mut i) = img {
-                    i.col += (pw + if pw > 0 { 1 } else { 0 } + cw + 1) as u32;
-                    i.row += 1;
-                    images.push(i);
-                }
-                let sep = span("│", style(Some(c.dim), None, Attrs::empty()));
-                for i in 0..body {
-                    let mut l = Vec::new();
-                    if pw > 0 {
-                        l.extend(pad(parent.get(i).cloned().unwrap_or_default(), pw, Style::PLAIN));
-                        l.push(sep.clone());
-                    }
-                    l.extend(pad(current.get(i).cloned().unwrap_or_default(), cw, Style::PLAIN));
-                    l.push(sep.clone());
-                    l.extend(preview.get(i).cloned().unwrap_or_default());
-                    lines.push(l);
-                }
-            } else {
-                lines.extend(current);
-            }
-        }
-        lines.resize(rows - 1, Vec::new());
-
-        // Footer: the filter being typed, a message, or the state.
-        let dim = style(Some(c.dim), None, Attrs::empty());
-        let conflict = self.op.as_ref().filter(|o| o.surface == id).and_then(|o| o.conflict.clone());
-        let footer = if let Some(p) = conflict {
-            let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            let q = format!("{name} exists: o(verwrite) s(kip) r(ename), O/S/R for all, Esc stops");
-            vec![span(fit(&q, cols), style(Some(Color::Indexed(3)), None, Attrs::BOLD))]
-        } else if let Some(input) = &ui.input {
-            let (field, col) = input.render(cols.saturating_sub(1), Style::PLAIN);
-            cursor = Some((col + 1, rows as u32 - 1));
-            let mut l = vec![span("/", style(Some(c.accent), None, Attrs::BOLD))];
-            l.extend(field);
-            l
-        } else if let Some((m, err)) = &ui.message {
-            let st = if *err {
-                style(Some(Color::Indexed(1)), None, Attrs::empty())
-            } else {
-                style(Some(c.fg), None, Attrs::empty())
-            };
-            vec![span(fit(m, cols), st)]
-        } else {
-            let v = &ui.view;
-            let pos =
-                if v.rows.is_empty() { "0/0".into() } else { format!("{}/{}", v.list.selected + 1, v.rows.len()) };
-            let mut s = format!("{pos}  {}{}", v.sort.key.label(), if v.sort.reverse { "↓" } else { "" });
-            if v.hidden {
-                s.push_str("  .*");
-            }
-            if !v.filter.is_empty() {
-                s.push_str(&format!("  /{}", v.filter));
-            }
-            if !v.selected.is_empty() {
-                s.push_str(&format!("  {} marked", v.selected.len()));
-            }
-            if ui.view.visual.is_some() {
-                s.push_str("  VISUAL");
-            }
-            if let Some((k, c)) = &self.clip {
-                let what = if *k == OpKind::Copy { "to copy" } else { "to move" };
-                s.push_str(&format!("  {} {what} (P)", c.len()));
-            }
-            if let Some(p) = ui.prefix {
-                s.push_str(match p {
-                    Prefix::G => "  g-",
-                    Prefix::Mark => "  mark-",
-                    Prefix::Jump => "  jump-",
-                    Prefix::Sort => "  sort: n m s e d(irs) r(everse)",
-                });
-            }
-            if ui.view.kind == Kind::Picker && cols > 40 {
-                s.push_str("  ⏎ insert");
-            }
-            vec![span(fit(&s, cols), dim)]
-        };
-        lines.push(footer);
-        let _ = host::draw(id, &Frame { lines, cursor, background: None, images });
-        if self.sidebar == Some(id) {
-            self.draw_float();
-        }
-    }
-
-    fn draw_all(&mut self) {
-        let ids: Vec<SurfaceId> = self.uis.keys().copied().collect();
-        for id in ids {
-            self.draw(id);
-        }
-    }
-}
-
-type MarkOf<'a> = dyn Fn(&Path) -> Option<git::Mark> + 'a;
-
-/// Miller: the parent directory, with the current one highlighted.
-fn column_parent(v: &mut View, cols: usize, rows: usize, mark: &MarkOf, c: &Colors) -> Vec<Line> {
-    let Some(parent) = v.dir.parent().map(Path::to_path_buf) else { return Vec::new() };
-    let hidden = v.hidden;
-    let entries: Vec<_> = match v.listing(&parent) {
-        Ok(e) => e.iter().filter(|e| hidden || !e.hidden()).cloned().collect(),
-        Err(_) => return Vec::new(),
-    };
-    let here = entries.iter().position(|e| parent.join(&e.name) == v.dir).unwrap_or(0);
-    let start = here.saturating_sub(rows / 2).min(entries.len().saturating_sub(rows));
-    entries
-        .into_iter()
-        .enumerate()
-        .skip(start)
-        .take(rows)
-        .map(|(i, e)| {
-            let path = parent.join(&e.name);
-            let r = view::Row { path, depth: 0, entry: e, open: false };
-            let look =
-                RowLook { cursor: false, marked: false, here: i == here, git: mark(&r.path), tree: false, size: false };
-            row_line(&r, look, cols, c)
-        })
-        .collect()
-}
-
-/// Miller: the directory under the cursor, or facts about the file.
-fn column_preview(
-    v: &mut View,
-    shown: Option<&Shown>,
-    cols: usize,
-    rows: usize,
-    mark: &MarkOf,
-    c: &Colors,
-) -> (Vec<Line>, Option<ImagePlace>) {
-    let Some(r) = v.current().cloned() else { return (Vec::new(), None) };
-    if r.entry.dir {
-        let hidden = v.hidden;
-        let lines = match v.listing(&r.path) {
-            Ok(e) if e.is_empty() => vec![vec![span("empty", style(Some(c.dim), None, Attrs::ITALIC))]],
-            Ok(e) => e
-                .iter()
-                .filter(|e| hidden || !e.hidden())
-                .take(rows)
-                .map(|e| {
-                    let row = view::Row { path: r.path.join(&e.name), depth: 0, entry: e.clone(), open: false };
-                    let look = RowLook {
-                        cursor: false,
-                        marked: false,
-                        here: false,
-                        git: mark(&row.path),
-                        tree: false,
-                        size: false,
-                    };
-                    row_line(&row, look, cols, c)
-                })
-                .collect::<Vec<_>>(),
-            Err(e) => vec![vec![span(fit(e, cols), style(Some(Color::Indexed(1)), None, Attrs::empty()))]],
-        };
-        return (lines, None);
-    }
-    let shown = shown.filter(|s| s.path == r.path && s.mtime == r.entry.mtime);
-    render_preview(shown, &r.entry.name, cols, rows, c)
-}
-
-/// A file's preview in `cols`×`rows` cells; an image is at (0, 0).
-fn render_preview(
-    shown: Option<&Shown>,
-    name: &str,
-    cols: usize,
-    rows: usize,
-    c: &Colors,
-) -> (Vec<Line>, Option<ImagePlace>) {
-    let dim = style(Some(c.dim), None, Attrs::empty());
-    let Some(sh) = shown else {
-        return (vec![vec![span(fit(name, cols), style(None, None, Attrs::BOLD))], vec![span("…", dim)]], None);
-    };
-    let info = |n: usize| sh.info.iter().take(n).map(|l| clip(l, cols)).collect::<Vec<_>>();
-    match &sh.body {
-        Body::Loading => {
-            let mut l = info(rows);
-            l.push(vec![span("…", dim)]);
-            (l, None)
-        }
-        Body::Lines(lines) => {
-            if lines.is_empty() {
-                return (info(rows), None);
-            }
-            (lines.iter().take(rows).map(|l| clip(l, cols)).collect(), None)
-        }
-        Body::Image(id, px) => {
-            let room = rows.saturating_sub(sh.info.len() + 1).max(1);
-            let (w, h) = preview::fit_cells(*px, cols, room, 8);
-            let mut l = vec![Vec::new(); h as usize];
-            l.extend(info(rows.saturating_sub(h as usize)));
-            (l, Some(ImagePlace { image: *id, col: 0, row: 0, cols: w, rows: h }))
-        }
-    }
 }
 
 // --- actions ------------------------------------------------------------------
@@ -686,7 +379,7 @@ impl State {
         let id = match host::open_surface(&opts) {
             Ok(id) => id,
             Err(e) => {
-                host::notify(&format!("files: {e}"), true);
+                host::notify(&tr!("plugin-error", error = e), true);
                 return None;
             }
         };
@@ -700,6 +393,7 @@ impl State {
         let ui = Ui {
             view: View::new(kind, start),
             size,
+            list_area: Rect::default(),
             prefix: None,
             input: None,
             message: None,
@@ -741,15 +435,18 @@ impl State {
         self.stale.remove(&id);
     }
 
-    fn toggle_sidebar(&mut self) {
+    fn open_sidebar(&mut self) {
         if let Some(id) = self.sidebar {
-            host::close_surface(id);
-            return self.close_ui(id);
+            let _ = host::focus_surface(id);
+            return;
         }
         let opts = SurfaceOptions {
-            kind: SurfaceKind::SidebarLeft,
-            title: "Files".into(),
-            cols: SIDEBAR_COLS,
+            kind: match self.settings.position {
+                Position::Left => SurfaceKind::SidebarLeft,
+                Position::Right => SurfaceKind::SidebarRight,
+            },
+            title: tr!("title-files"),
+            cols: self.settings.width,
             rows: 0,
             focus: true,
             pane: None,
@@ -764,7 +461,7 @@ impl State {
         }
         let opts = SurfaceOptions {
             kind: SurfaceKind::Float,
-            title: "Pick a path".into(),
+            title: tr!("title-picker"),
             cols: 90,
             rows: 26,
             focus: true,
@@ -776,7 +473,7 @@ impl State {
     fn open_pane(&mut self) {
         let opts = SurfaceOptions {
             kind: SurfaceKind::PaneRight,
-            title: "Files".into(),
+            title: tr!("title-files"),
             cols: 0,
             rows: 0,
             focus: true,
@@ -845,7 +542,7 @@ impl State {
     /// `i`: paste the paths into the pane.
     fn insert(&mut self, id: SurfaceId) {
         let Some(paths) = self.uis.get(&id).map(|u| u.view.targets()).filter(|p| !p.is_empty()) else { return };
-        let Some(pane) = self.target_pane(id) else { return self.say(id, "no pane to insert into", true) };
+        let Some(pane) = self.target_pane(id) else { return self.say(id, tr!("no-insert-pane"), true) };
         let text: Vec<String> = paths.iter().map(|p| fsys::shell_quote(&p.display().to_string())).collect();
         match host::send_text(pane, &format!("{} ", text.join(" ")), true) {
             Ok(()) if self.uis.get(&id).is_some_and(|u| u.view.kind == Kind::Picker) => {
@@ -857,11 +554,7 @@ impl State {
                 if let Some(ui) = self.ui(id) {
                     ui.view.selected.clear();
                 }
-                self.say(
-                    id,
-                    format!("inserted {} path{}", paths.len(), if paths.len() == 1 { "" } else { "s" }),
-                    false,
-                );
+                self.say(id, tr!("inserted-paths", count = paths.len()), false);
             }
             Err(e) => self.say(id, e, true),
         }
@@ -874,13 +567,13 @@ impl State {
             Some(r) if r.entry.dir && ui.view.layout == Layout::Tree => r.path.clone(),
             _ => ui.view.dir.clone(),
         };
-        let Some(pane) = self.target_pane(id) else { return self.say(id, "no pane", true) };
+        let Some(pane) = self.target_pane(id) else { return self.say(id, tr!("no-pane"), true) };
         if self.blocks.get(&pane) != Some(&BlockState::Prompt) {
-            return self.say(id, "the pane is not at a prompt", true);
+            return self.say(id, tr!("not-at-prompt"), true);
         }
         let cmd = format!("cd -- {}\r", fsys::shell_quote(&dir.display().to_string()));
         match host::send_text(pane, &cmd, false) {
-            Ok(()) => self.say(id, format!("cd {}", fsys::tilde(&dir, fsys::home().as_deref())), false),
+            Ok(()) => self.say(id, tr!("changed-directory", path = fsys::tilde(&dir, fsys::home().as_deref())), false),
             Err(e) => self.say(id, e, true),
         }
     }
@@ -889,7 +582,7 @@ impl State {
         let Some(paths) = self.uis.get(&id).map(|u| u.view.targets()).filter(|p| !p.is_empty()) else { return };
         let text: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
         match host::clipboard_write(&text.join("\n")) {
-            Ok(()) => self.say(id, format!("copied {}", fit(&text.join(" "), 60)), false),
+            Ok(()) => self.say(id, tr!("copied-paths", paths = fit(&text.join(" "), 60)), false),
             Err(e) => self.say(id, e, true),
         }
     }
@@ -897,7 +590,9 @@ impl State {
     fn bookmark(&mut self, id: SurfaceId, key: &str) {
         let Some(dir) = self.uis.get(&id).map(|u| u.view.dir.clone()) else { return };
         match host::storage_set(&format!("mark:{key}"), &dir.display().to_string()) {
-            Ok(()) => self.say(id, format!("'{key} → {}", fsys::tilde(&dir, fsys::home().as_deref())), false),
+            Ok(()) => {
+                self.say(id, tr!("mark-set", key = key, path = fsys::tilde(&dir, fsys::home().as_deref())), false)
+            }
             Err(e) => self.say(id, e, true),
         }
     }
@@ -905,8 +600,8 @@ impl State {
     fn jump(&mut self, id: SurfaceId, key: &str) {
         match host::storage_get(&format!("mark:{key}")).map(PathBuf::from) {
             Some(d) if d.is_dir() => self.go(id, d),
-            Some(d) => self.say(id, format!("{}: gone", d.display()), true),
-            None => self.say(id, format!("no mark '{key}"), true),
+            Some(d) => self.say(id, tr!("path-gone", path = d.display().to_string()), true),
+            None => self.say(id, tr!("no-mark", key = key), true),
         }
     }
 
@@ -919,7 +614,7 @@ impl State {
     }
 
     fn zoxide(&mut self, id: SurfaceId) {
-        match host::prompt("zoxide:", "") {
+        match host::prompt(&tr!("zoxide-prompt"), "") {
             Ok(r) => {
                 self.asks.insert(r, (id, Ask::Zoxide));
             }
@@ -936,8 +631,8 @@ impl State {
                 let d = PathBuf::from(String::from_utf8_lossy(&o.stdout).trim_end().to_string());
                 self.go(id, d);
             }
-            Ok(_) => self.say(id, format!("zoxide: no match for {query}"), true),
-            Err(e) => self.say(id, format!("zoxide: {e}"), true),
+            Ok(_) => self.say(id, tr!("zoxide-no-match", query = query), true),
+            Err(e) => self.say(id, tr!("zoxide-error", error = e), true),
         }
     }
 
@@ -968,7 +663,7 @@ impl State {
     }
 
     fn key(&mut self, id: SurfaceId, key: &str, text: &str, ctrl: bool) {
-        let rows = self.uis.get(&id).map_or(1, |u| u.size.1.saturating_sub(2) as usize);
+        let rows = self.uis.get(&id).map_or(0, |u| u.list_area.height);
         if self.op.as_ref().is_some_and(|o| o.surface == id && o.conflict.is_some()) {
             let choice = match text {
                 "o" | "O" => Some(Choice::Overwrite),
@@ -1066,7 +761,7 @@ impl State {
                 let l = ui.view.layout.next();
                 ui.view.set_layout(l);
                 let label = l.label();
-                self.say(id, format!("view: {label}"), false);
+                self.say(id, tr!("view-changed", layout = tr!(label)), false);
             }
             (_, " ") => ui.view.toggle_selected(),
             (_, "v") => ui.view.toggle_visual(),
@@ -1092,7 +787,7 @@ impl State {
             (_, "F") if ui.view.kind == Kind::Sidebar => {
                 ui.follow = !ui.follow;
                 let f = ui.follow;
-                self.say(id, if f { "following the focused pane" } else { "pinned" }, false);
+                self.say(id, tr!(if f { "following" } else { "pinned" }), false);
                 if f {
                     self.follow();
                 }
@@ -1129,29 +824,21 @@ impl State {
 
     fn mouse(&mut self, id: SurfaceId, m: proteus_plugin::types::MouseEvent) {
         let Some(ui) = self.ui(id) else { return };
-        let body = ui.size.1.saturating_sub(2) as usize;
+        let area = ui.list_area;
+        let inside = area.contains(m.col as usize, m.row as usize);
         match (m.button, m.action) {
-            (MouseButton::WheelUp, _) => ui.view.list.offset = ui.view.list.offset.saturating_sub(3),
-            (MouseButton::WheelDown, _) => {
-                ui.view.list.offset = (ui.view.list.offset + 3).min(ui.view.list.len.saturating_sub(body));
-                // Keep the cursor in view so `visible` does not scroll back.
-                let o = ui.view.list.offset;
-                ui.view.list.selected = ui.view.list.selected.max(o);
-            }
+            (MouseButton::WheelUp, _) if inside => ui.view.list.scroll(-3, area.height),
+            (MouseButton::WheelDown, _) if inside => ui.view.list.scroll(3, area.height),
             (MouseButton::Left, MouseAction::Press) => {
                 ui.dragging = false;
-                let row = m.row as usize;
-                if row == 0 || row > body {
-                    return;
-                }
-                let Some(i) = ui.view.list.at_row(row - 1) else { return };
+                let Some(i) = ui.view.list.at_point(area, m.col as usize, m.row as usize) else { return };
                 if ui.view.list.selected == i {
                     self.activate(id);
                 } else {
                     ui.view.list.selected = i;
                 }
             }
-            (MouseButton::Left, MouseAction::Drag) if !ui.dragging => {
+            (MouseButton::Left, MouseAction::Drag) if !ui.dragging && inside => {
                 ui.dragging = true;
                 let paths: Vec<String> = ui.view.targets().iter().map(|p| p.display().to_string()).collect();
                 let _ = host::start_drag(id, &paths);
@@ -1242,8 +929,8 @@ impl State {
         let mime = host::mime_type(&ps).unwrap_or_default();
         let mut info = vec![
             vec![span(name.clone(), style(None, None, Attrs::BOLD))],
-            line(format!("{} ({size} bytes)", fsys::human(size))),
-            line(format!("modified {}", date(mtime))),
+            line(tr!("preview-size", size = fsys::human(size), count = size)),
+            line(tr!("preview-modified", date = date(mtime))),
         ];
         if !mime.is_empty() {
             info.push(line(mime.clone()));
@@ -1266,11 +953,11 @@ impl State {
                 sh.body = Body::Lines(preview::highlight(&name, &text, 200, 500, dark, c.dim));
             }
             preview::What::Image | preview::What::Svg if size > preview::IMAGE_BYTES => {
-                fail(&mut sh, "too big to preview".into());
+                fail(&mut sh, tr!("preview-too-big"));
             }
             preview::What::Image => match load_image_file(&path) {
                 Ok((id, px)) => {
-                    sh.info.push(line(format!("{} × {} px", px.0, px.1)));
+                    sh.info.push(line(tr!("preview-pixels", width = px.0, height = px.1)));
                     sh.body = Body::Image(id, px);
                 }
                 Err(e) => fail(&mut sh, e),
@@ -1308,7 +995,7 @@ impl State {
                     let prog = argv[0].clone();
                     match self.spawn(argv, &path, JobKind::Thumb(thumb)) {
                         Ok(()) => sh.body = Body::Loading,
-                        Err(e) => fail(&mut sh, format!("no preview ({prog}: {e})")),
+                        Err(e) => fail(&mut sh, tr!("preview-helper-error", program = prog, error = e)),
                     }
                 }
             }
@@ -1323,7 +1010,7 @@ impl State {
                 });
                 match r {
                     Ok(()) => sh.body = Body::Loading,
-                    Err(e) => fail(&mut sh, format!("no listing (bsdtar: {e})")),
+                    Err(e) => fail(&mut sh, tr!("preview-listing-error", error = e)),
                 }
             }
             preview::What::Binary => {
@@ -1360,13 +1047,14 @@ impl State {
         let Some(sh) = self.preview.as_mut().filter(|s| s.path == j.path) else { return };
         let c = colors(self.theme);
         let dim = style(Some(c.dim), None, Attrs::empty());
-        let first_err = || String::from_utf8_lossy(&j.err).lines().next().unwrap_or("failed").to_string();
+        let first_err =
+            || String::from_utf8_lossy(&j.err).lines().next().map(str::to_owned).unwrap_or_else(|| tr!("failed"));
         sh.body = Body::Lines(Vec::new());
         match j.kind {
             JobKind::Archive if j.out.is_empty() => sh.info.push(vec![span(fit(&first_err(), 200), dim)]),
             JobKind::Archive => {
                 let (names, total) = preview::archive_lines(&j.out, 300);
-                let mut l = vec![vec![span(format!("{total} entries"), dim)]];
+                let mut l = vec![vec![span(tr!("archive-entries", count = total), dim)]];
                 l.extend(names.into_iter().map(|n| vec![span(n, Style::PLAIN)]));
                 sh.body = Body::Lines(l);
             }
@@ -1381,7 +1069,7 @@ impl State {
                     Ok((id, px)) => sh.body = Body::Image(id, px),
                     Err(e) => sh.info.push(vec![span(e, dim)]),
                 },
-                _ => sh.info.push(vec![span(fit(&format!("no preview: {}", first_err()), 200), dim)]),
+                _ => sh.info.push(vec![span(fit(&tr!("preview-failed", error = first_err()), 200), dim)]),
             },
         }
         self.redraw_preview();
@@ -1395,7 +1083,7 @@ impl State {
         }
         let opts = SurfaceOptions {
             kind: SurfaceKind::Float,
-            title: "Preview".into(),
+            title: tr!("title-preview"),
             cols: 84,
             rows: 30,
             focus: false,
@@ -1407,7 +1095,7 @@ impl State {
                 self.float_size = host::surface_size(f).unwrap_or((84, 30));
                 self.draw_float();
             }
-            Err(e) => host::notify(&format!("files: {e}"), true),
+            Err(e) => host::notify(&tr!("plugin-error", error = e), true),
         }
     }
 
@@ -1416,8 +1104,8 @@ impl State {
         let c = colors(self.theme);
         let Some(ui) = self.uis.get_mut(&sid) else { return };
         let (cols, rows) = (self.float_size.0 as usize, self.float_size.1 as usize);
-        let (lines, img) = column_preview(&mut ui.view, self.preview.as_ref(), cols, rows, &|_| None, &c);
-        let _ = host::draw(f, &Frame { lines, cursor: None, background: None, images: img.into_iter().collect() });
+        let rendered = preview_component(&mut ui.view, self.preview.as_ref(), None, c).render(cols, rows);
+        let _ = host::draw(f, &rendered.frame);
     }
 }
 
@@ -1429,10 +1117,6 @@ fn load_image_file(path: &Path) -> Result<(ImageId, (u32, u32)), String> {
 }
 
 // --- operations ---------------------------------------------------------------
-
-fn plural(n: usize, what: &str) -> String {
-    format!("{n} {what}{}", if n == 1 { "" } else { "s" })
-}
 
 fn name_of(p: &Path) -> String {
     p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.display().to_string())
@@ -1465,8 +1149,7 @@ impl State {
         if t.is_empty() {
             return;
         }
-        let verb = if kind == OpKind::Copy { "copy" } else { "move" };
-        self.say(id, format!("{} to {verb}: P pastes", plural(t.len(), "file")), false);
+        self.say(id, tr!(if kind == OpKind::Copy { "yank-copy" } else { "yank-move" }, count = t.len()), false);
         self.clip = Some((kind, t));
         if let Some(ui) = self.ui(id) {
             ui.view.selected.clear();
@@ -1487,7 +1170,7 @@ impl State {
     fn paste(&mut self, id: SurfaceId) {
         let Some(dir) = self.here(id) else { return };
         let Some((kind, paths)) = self.clip.clone() else {
-            return self.say(id, "nothing to paste (C or x first)", true);
+            return self.say(id, tr!("nothing-to-paste"), true);
         };
         let pairs = paths.iter().map(|p| (p.clone(), dir.join(name_of(p)))).collect();
         if kind == OpKind::Move {
@@ -1498,14 +1181,14 @@ impl State {
 
     fn start_op(&mut self, id: SurfaceId, t: Transfer, undoing: bool) {
         if self.op.is_some() {
-            return self.say(id, "another copy or move is running", true);
+            return self.say(id, tr!("operation-busy"), true);
         }
         let title = match (t.kind, undoing) {
-            (_, true) => "Undoing a move".to_string(),
-            (OpKind::Copy, _) => "Copying".into(),
-            (OpKind::Move, _) => "Moving".into(),
+            (_, true) => tr!("task-undo"),
+            (OpKind::Copy, _) => tr!("task-copy"),
+            (OpKind::Move, _) => tr!("task-move"),
         };
-        let task = host::task_start(&format!("files: {title}")).ok();
+        let task = host::task_start(&title).ok();
         self.op = Some(Running { t, task, timer: None, surface: id, conflict: None, undoing });
         self.op_tick();
     }
@@ -1516,7 +1199,7 @@ impl State {
         match op.t.step(std::time::Duration::from_millis(40)) {
             Step::Working => {
                 if let Some(task) = op.task {
-                    let msg = format!("{} of {}", fsys::human(op.t.done), fsys::human(op.t.total));
+                    let msg = tr!("progress", done = fsys::human(op.t.done), total = fsys::human(op.t.total));
                     host::task_update(task, op.t.progress(), &msg);
                 }
                 op.timer = Some(host::set_timer(1, false));
@@ -1547,13 +1230,29 @@ impl State {
             host::task_end(t);
         }
         let n = op.t.finished.len();
-        let verb = if op.t.kind == OpKind::Copy { "copied" } else { "moved" };
-        if op.t.kind == OpKind::Move && !op.undoing && n > 0 {
-            self.undo = Some(Undo::Moved(op.t.finished.clone()));
+        if op.t.kind == OpKind::Move && !op.undoing {
+            self.undo = (op.t.undoable && n > 0).then(|| Undo::Moved(op.t.finished.clone()));
         }
         match op.t.errors.first() {
-            Some(e) => self.say(op.surface, format!("{} {verb}; {} failed: {e}", n, op.t.errors.len()), true),
-            None => self.say(op.surface, format!("{} {verb}", plural(n, "file")), false),
+            Some(e) => self.say(
+                op.surface,
+                tr!(
+                    if op.t.kind == OpKind::Copy { "copy-errors" } else { "move-errors" },
+                    count = n,
+                    failed = op.t.errors.len(),
+                    error = e
+                ),
+                true,
+            ),
+            None => {
+                let mut message =
+                    tr!(if op.t.kind == OpKind::Copy { "copied-files" } else { "moved-files" }, count = n);
+                if op.t.kind == OpKind::Move && !op.t.undoable {
+                    message.push_str("; ");
+                    message.push_str(&tr!("undo-unavailable"));
+                }
+                self.say(op.surface, message, false)
+            }
         }
         self.changed();
     }
@@ -1569,18 +1268,18 @@ impl State {
 
     fn ask_rename(&mut self, id: SurfaceId) {
         let Some(p) = self.uis.get(&id).and_then(|u| u.view.current()).map(|r| r.path.clone()) else { return };
-        self.ask(id, "Rename to:", &name_of(&p), Ask::Rename(p));
+        self.ask(id, &tr!("rename-prompt"), &name_of(&p), Ask::Rename(p));
     }
 
     fn ask_new(&mut self, id: SurfaceId) {
         let Some(dir) = self.here(id) else { return };
-        self.ask(id, "New file (end with / for a directory):", "", Ask::New(dir));
+        self.ask(id, &tr!("new-prompt"), "", Ask::New(dir));
     }
 
     fn ask_chmod(&mut self, id: SurfaceId) {
         let t = self.targets(id);
         if !t.is_empty() {
-            let q = format!("chmod {} (e.g. 644, u+x):", plural(t.len(), "file"));
+            let q = tr!("chmod-prompt", count = t.len());
             self.ask(id, &q, "", Ask::Chmod(t));
         }
     }
@@ -1588,7 +1287,7 @@ impl State {
     fn ask_delete(&mut self, id: SurfaceId) {
         let t = self.targets(id);
         if !t.is_empty() {
-            let q = format!("Delete {} for good? Type yes:", plural(t.len(), "file"));
+            let q = tr!("delete-prompt", count = t.len());
             self.ask(id, &q, "", Ask::Delete(t));
         }
     }
@@ -1600,11 +1299,11 @@ impl State {
             Ask::Zoxide if !a.is_empty() => self.zoxide_answer(id, &a),
             Ask::Rename(from) if !a.is_empty() && a != name_of(&from) => {
                 if a.contains('/') {
-                    return self.say(id, "a name cannot hold /", true);
+                    return self.say(id, tr!("name-slash"), true);
                 }
                 let to = from.with_file_name(&a);
                 if std::fs::symlink_metadata(&to).is_ok() {
-                    return self.say(id, format!("{a} exists"), true);
+                    return self.say(id, tr!("name-exists", name = a), true);
                 }
                 match std::fs::rename(&from, &to) {
                     Ok(()) => {
@@ -1621,7 +1320,7 @@ impl State {
                 let dirwise = a.ends_with('/');
                 let path = dir.join(a.trim_end_matches('/'));
                 if !path.starts_with(&dir) || a.split('/').any(|c| c == "..") {
-                    return self.say(id, "stay inside this directory", true);
+                    return self.say(id, tr!("stay-inside"), true);
                 }
                 let r = if dirwise {
                     std::fs::create_dir_all(&path)
@@ -1641,7 +1340,7 @@ impl State {
             }
             Ask::Chmod(paths) if !a.is_empty() => {
                 if !a.chars().all(|c| c.is_ascii_alphanumeric() || "+-=,".contains(c)) {
-                    return self.say(id, format!("bad mode `{a}`"), true);
+                    return self.say(id, tr!("bad-mode", mode = a), true);
                 }
                 let mut argv = vec!["chmod".to_string(), a, "--".into()];
                 argv.extend(paths.iter().map(|p| p.display().to_string()));
@@ -1661,14 +1360,14 @@ impl State {
                 }
                 self.changed();
                 match failed.first() {
-                    Some(e) => self.say(id, format!("{} not deleted: {e}", failed.len()), true),
-                    None => self.say(id, format!("deleted {}", plural(paths.len(), "file")), false),
+                    Some(e) => self.say(id, tr!("delete-errors", count = failed.len(), error = e), true),
+                    None => self.say(id, tr!("deleted-files", count = paths.len()), false),
                 }
             }
-            Ask::Delete(_) => self.say(id, "not deleted", false),
+            Ask::Delete(_) => self.say(id, tr!("not-deleted"), false),
             Ask::Bulk(pairs) => match ops::rename_all(&pairs) {
                 Ok(done) => {
-                    self.say(id, format!("renamed {}", plural(done.len(), "file")), false);
+                    self.say(id, tr!("renamed-files", count = done.len()), false);
                     self.undo = Some(Undo::Renamed(done));
                     self.changed();
                 }
@@ -1684,7 +1383,11 @@ impl State {
         match host::run(&Command { argv, cwd: None, env: vec![] }, &[], 10_000) {
             Ok(o) if o.exit_code == Some(0) => self.changed(),
             Ok(o) => {
-                let e = String::from_utf8_lossy(&o.stderr).lines().next().unwrap_or("failed").to_string();
+                let e = String::from_utf8_lossy(&o.stderr)
+                    .lines()
+                    .next()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| tr!("failed"));
                 self.say(id, format!("{prog}: {e}"), true);
                 self.changed();
             }
@@ -1695,7 +1398,7 @@ impl State {
     /// `L`: links here to the yanked files.
     fn link(&mut self, id: SurfaceId) {
         let Some(dir) = self.here(id) else { return };
-        let Some((_, paths)) = self.clip.take() else { return self.say(id, "nothing to link (C first)", true) };
+        let Some((_, paths)) = self.clip.take() else { return self.say(id, tr!("nothing-to-link"), true) };
         let mut argv = vec!["ln".to_string(), "-s".into(), "--".into()];
         argv.extend(paths.iter().map(|p| p.display().to_string()));
         argv.push(format!("{}/", dir.display()));
@@ -1720,17 +1423,17 @@ impl State {
         self.changed();
         match err {
             Some(e) => self.say(id, e, true),
-            None => self.say(id, format!("trashed {} (u: undo)", plural(done.len(), "file")), false),
+            None => self.say(id, tr!("trashed-files", count = done.len()), false),
         }
     }
 
     fn undo(&mut self, id: SurfaceId) {
-        let Some(u) = self.undo.take() else { return self.say(id, "nothing to undo", true) };
+        let Some(u) = self.undo.take() else { return self.say(id, tr!("nothing-to-undo"), true) };
         match u {
             Undo::Renamed(pairs) => {
                 let back: Vec<_> = pairs.into_iter().map(|(a, b)| (b, a)).collect();
                 match ops::rename_all(&back) {
-                    Ok(d) => self.say(id, format!("undid {}", plural(d.len(), "rename")), false),
+                    Ok(d) => self.say(id, tr!("undid-renames", count = d.len()), false),
                     Err(e) => self.say(id, e, true),
                 }
                 self.changed();
@@ -1745,7 +1448,7 @@ impl State {
                 self.changed();
                 match errs.first() {
                     Some(e) => self.say(id, e.clone(), true),
-                    None => self.say(id, format!("restored {}", plural(paths.len(), "file")), false),
+                    None => self.say(id, tr!("restored-files", count = paths.len()), false),
                 }
             }
         }
@@ -1769,11 +1472,11 @@ impl State {
         let t = self.targets(id);
         let Some(dir) = t.first().and_then(|p| p.parent()).map(Path::to_path_buf) else { return };
         if t.iter().any(|p| p.parent() != Some(&dir)) {
-            return self.say(id, "bulk rename: files of one directory", true);
+            return self.say(id, tr!("bulk-one-directory"), true);
         }
         let names: Vec<String> = t.iter().map(|p| name_of(p)).collect();
         if names.iter().any(|n| n.contains('\n')) {
-            return self.say(id, "bulk rename: a name holds a newline", true);
+            return self.say(id, tr!("bulk-newline"), true);
         }
         let cache = fsys::home().unwrap_or_default().join(".cache/proteus-files");
         let file = cache.join(format!("rename-{}.txt", std::process::id()));
@@ -1793,8 +1496,8 @@ impl State {
         let text = std::fs::read_to_string(&b.file).unwrap_or_default();
         let _ = std::fs::remove_file(&b.file);
         match ops::rename_plan(&b.dir, &b.names, &text) {
-            Ok(p) if p.is_empty() => self.say(b.surface, "no names changed", false),
-            Ok(p) => match host::confirm(&format!("Rename {}?", plural(p.len(), "file"))) {
+            Ok(p) if p.is_empty() => self.say(b.surface, tr!("bulk-no-change"), false),
+            Ok(p) => match host::confirm(&tr!("bulk-confirm", count = p.len())) {
                 Ok(r) => {
                     self.asks.insert(r, (b.surface, Ask::Bulk(p)));
                 }
@@ -1808,11 +1511,18 @@ impl State {
 
 struct Files;
 
+fn register_actions() -> Result<(), String> {
+    host::register_action(SIDEBAR, &tr!("action-sidebar"), Some("alt+e"))?;
+    host::register_action(PANE, &tr!("action-pane"), Some("pane:E"))?;
+    host::register_action(PICKER, &tr!("action-picker"), Some("alt+p"))
+}
+
 impl Guest for Files {
     fn init() -> Result<(), String> {
-        host::register_action(SIDEBAR, Some("alt+e"))?;
-        host::register_action(PANE, Some("pane:E"))?;
-        host::register_action(PICKER, Some("alt+p"))?;
+        i18n::set_locale(&host::locale()?)?;
+        let settings = host::config::<Settings>()?.validate()?;
+        STATE.with_borrow_mut(|s| s.settings = settings);
+        register_actions()?;
         STATE.with_borrow_mut(|s| s.last_pane = host::focused_pane().ok().flatten());
         Ok(())
     }
@@ -1836,14 +1546,33 @@ impl State {
     fn event(&mut self, event: Event) {
         let s = self;
         match event {
-            Event::Action(a) if a == SIDEBAR => s.toggle_sidebar(),
+            Event::Action(a) if a == SIDEBAR => s.open_sidebar(),
             Event::Action(a) if a == PANE => s.open_pane(),
             Event::Action(a) if a == PICKER => s.open_picker(),
+            Event::ConfigChanged => match host::locale().and_then(|locale| i18n::set_locale(&locale)) {
+                Ok(true) => {
+                    let _ = register_actions();
+                    for (&id, ui) in &mut s.uis {
+                        ui.message = None;
+                        let title = tr!(if ui.view.kind == Kind::Picker { "title-picker" } else { "title-files" });
+                        let _ = host::set_surface_title(id, &title);
+                    }
+                    if let Some(id) = s.float {
+                        let _ = host::set_surface_title(id, &tr!("title-preview"));
+                    }
+                    s.clear_preview();
+                    s.pending = None;
+                    s.draw_all();
+                }
+                Ok(false) => {}
+                Err(e) => host::notify(&tr!("plugin-error", error = e), true),
+            },
             Event::ThemeChanged(t) => {
                 s.theme = Some(t);
                 s.draw_all();
             }
             Event::SurfaceOpened((id, args)) => {
+                let _ = host::set_surface_title(id, &tr!("title-files"));
                 let dir = Some(args.trim()).filter(|a| !a.is_empty()).map(|a| match a.strip_prefix("~/") {
                     Some(rest) => fsys::home().unwrap_or_default().join(rest),
                     None => PathBuf::from(a),
@@ -1852,6 +1581,7 @@ impl State {
                 let ui = Ui {
                     view: View::new(Kind::Pane, dir.or_else(fsys::home).unwrap_or_else(|| PathBuf::from("/"))),
                     size,
+                    list_area: Rect::default(),
                     prefix: None,
                     input: None,
                     message: None,
@@ -1919,6 +1649,56 @@ impl State {
         }
     }
 
+    fn accessibility(&mut self, surface: SurfaceId, event: proteus_plugin::types::AccessibilityEvent) {
+        use proteus_plugin::types::AccessibilityAction as A;
+        if self.op.as_ref().is_some_and(|o| o.surface == surface && o.conflict.is_some()) {
+            return;
+        }
+        let Some(ui) = self.ui(surface) else {
+            return;
+        };
+        if event.node == "filter" {
+            match event.action {
+                A::SetValue => {
+                    let value = event.value.unwrap_or_default();
+                    if value.len() > 16384 || value.chars().any(char::is_control) {
+                        return;
+                    }
+                    ui.input = Some(TextInput::new(&value));
+                    ui.view.set_filter(&value);
+                }
+                A::Focus => {
+                    if ui.input.is_none() {
+                        ui.input = Some(TextInput::new(&ui.view.filter));
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+        if event.node == "files" {
+            ui.input = None;
+            let rows = ui.list_area.height;
+            match event.action {
+                A::ScrollUp => ui.view.list.scroll(-(rows.max(1) as isize), rows),
+                A::ScrollDown => ui.view.list.scroll(rows.max(1) as isize, rows),
+                _ => {}
+            }
+            return;
+        }
+        let Some(index) = ui.view.rows.iter().position(|r| render::file_node_id(&r.path) == event.node) else {
+            return;
+        };
+        if matches!(event.action, A::Focus | A::Select | A::Activate) {
+            ui.input = None;
+            ui.view.list.selected = index;
+            ui.view.update_visual();
+            if event.action == A::Activate {
+                self.activate(surface);
+            }
+        }
+    }
+
     fn ui_event(&mut self, surface: SurfaceId, event: UiEvent) {
         let s = self;
         {
@@ -1936,7 +1716,7 @@ impl State {
             if !s.uis.contains_key(&surface) {
                 return;
             }
-            if matches!(event, UiEvent::Key(_) | UiEvent::Mouse(_)) {
+            if matches!(event, UiEvent::Key(_) | UiEvent::Mouse(_) | UiEvent::Accessibility(_)) {
                 s.active = Some(surface);
             }
             match event {
@@ -1951,6 +1731,7 @@ impl State {
                         ui.view.set_filter(&f);
                     }
                 }
+                UiEvent::Accessibility(event) => s.accessibility(surface, event),
                 UiEvent::Mouse(m) => s.mouse(surface, m),
                 UiEvent::Resize(size) => {
                     if let Some(ui) = s.ui(surface) {
@@ -1973,5 +1754,22 @@ mod tests {
     fn dates() {
         assert_eq!(super::date(0), "1970-01-01 00:00");
         assert_eq!(super::date(1_700_000_000), "2023-11-14 22:13");
+    }
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+    #[test]
+    fn plugin_validates_its_own_settings() {
+        let settings: Settings = proteus_plugin::serde_json::from_str(r#"{"position":"right","width":48}"#).unwrap();
+        assert!(matches!(settings.position, Position::Right));
+        assert_eq!(settings.validate().unwrap().width, 48);
+        let defaults: Settings = proteus_plugin::serde_json::from_str("{}").unwrap();
+        assert_eq!(defaults.width, 32);
+        for bad in [r#"{"position":"top"}"#, r#"{"width":"large"}"#, r#"{"unknown":true}"#] {
+            assert!(proteus_plugin::serde_json::from_str::<Settings>(bad).is_err());
+        }
+        assert!(Settings { width: 0, ..Default::default() }.validate().is_err());
     }
 }

@@ -277,6 +277,12 @@ impl Terminal {
     pub fn palette(&self) -> &Palette {
         &self.palette
     }
+    /// Reload configured colors without discarding application OSC overrides.
+    pub fn rebase_palette(&mut self, palette: &Palette) {
+        self.palette.rebase(palette);
+        self.damage_all();
+    }
+
     /// Replace the theme palette (keeps nothing of the old OSC overrides).
     pub fn set_palette(&mut self, palette: Palette) {
         self.palette = palette;
@@ -407,6 +413,20 @@ impl Terminal {
             lines.pop();
         }
         lines.join("\n")
+    }
+
+    /// Primary screen and its retained history, without escape sequences.
+    /// Soft-wrapped rows are joined; an alternate-screen application is excluded.
+    pub fn scrollback_text(&self) -> String {
+        let grid = self.primary_grid();
+        text::extract(
+            grid,
+            Point::new(grid.first_line(), 0),
+            Point::new(grid.end_line().saturating_sub(1), grid.cols() - 1),
+            false,
+        )
+        .trim_end_matches('\n')
+        .to_owned()
     }
 
     pub fn row_text(&self, y: usize) -> String {
@@ -969,7 +989,11 @@ impl Terminal {
     fn insert_blank(&mut self, n: usize) {
         let (x, y, cols) = (self.cursor.x, self.cursor.y, self.cols());
         let n = n.min(cols - x);
-        self.clear_wide(x, y);
+        // Inserting before a lead cell moves the entire character. Only
+        // insertion inside its spacer splits the pair.
+        if self.grid.row(y).cells[x].flags.contains(CellFlags::WIDE_SPACER) {
+            self.clear_wide(x, y);
+        }
         let erase = self.erase_id;
         let cells = &mut self.grid.row_mut(y).cells;
         cells[x..].rotate_right(n);

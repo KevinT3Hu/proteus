@@ -293,7 +293,7 @@ impl App {
 
     pub(super) fn block_copy(&mut self, part: Part) {
         let Some((id, bid)) = self.target_block() else {
-            return self.notice("no command block here".into());
+            return self.notice(self.cfg.i18n.t("ui-no-command-block-here", &[]));
         };
         let t = &self.panes[&id].term;
         let p = match part {
@@ -334,7 +334,7 @@ impl App {
             }
             Part::Output => match b.output_start {
                 Some(o) if o < end => (SelectionKind::Semantic, Point::new(o, 0), Point::new(o, 0)),
-                _ => return self.notice("this block has no output".into()),
+                _ => return self.notice(self.cfg.i18n.t("ui-this-block-has-no-output", &[])),
             },
             Part::All => (SelectionKind::Line, Point::new(b.prompt_line, 0), Point::new(end - 1, 0)),
         };
@@ -413,7 +413,7 @@ impl App {
         let Some(cmd) =
             self.panes[&id].term.blocks().get(bid).and_then(|b| b.command.clone()).filter(|c| !c.trim().is_empty())
         else {
-            return self.notice("no command to run again".into());
+            return self.notice(self.cfg.i18n.t("ui-no-command-to-run-again", &[]));
         };
         if let Some(name) = self.panes[&id].busy(&[]) {
             return self.notice(format!("{name} is running in this pane"));
@@ -435,7 +435,7 @@ impl App {
 
     pub(super) fn block_info(&mut self) {
         let Some((id, bid)) = self.target_block() else {
-            return self.notice("no command block here".into());
+            return self.notice(self.cfg.i18n.t("ui-no-command-block-here", &[]));
         };
         let t = &self.panes[&id].term;
         let Some(b) = t.blocks().get(bid) else { return };

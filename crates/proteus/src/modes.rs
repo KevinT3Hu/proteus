@@ -160,6 +160,21 @@ impl Mode {
         }
     }
 
+    /// Fluent ID for this mode's hint label.
+    pub fn hint_id(self) -> &'static str {
+        match self {
+            Mode::Normal => "ui-normal",
+            Mode::Locked => "ui-locked",
+            Mode::Menu => "ui-menu",
+            Mode::Pane => "ui-pane",
+            Mode::Tab => "ui-tab",
+            Mode::Resize => "ui-resize",
+            Mode::Move => "ui-move",
+            Mode::Scroll => "ui-scroll",
+            Mode::Session => "ui-session",
+        }
+    }
+
     pub fn from_key(s: &str) -> Option<Mode> {
         MODES.into_iter().find(|m| m.key() == s)
     }
@@ -336,6 +351,8 @@ pub enum Action {
     RenameTab,
     RenamePane,
     SaveLayout,
+    ExportScrollback,
+    ResetRenderer,
     LoadLayout,
     /// Next pane in order (tmux `o`).
     FocusNext,
@@ -371,21 +388,17 @@ pub enum Action {
     ViewImage,
     /// Run a Lua function registered by the config (`p.keymap`).
     Lua(crate::script::FnId),
-    /// Give the keyboard to the next plugin surface (sidebar), then back.
-    FocusSurface,
-    /// Close the plugin surface that has the keyboard.
-    CloseSurface,
     /// Hide the pane from plugins that read screens, or show it again.
     TogglePrivate,
-    /// A plugin's palette action, `plugin:ID:NAME` (see [`plugin_action`]).
+    /// A plugin action, `plugin:PLUGIN-ID:ACTION-ID` (see [`plugin_action`]).
     Plugin(u16),
 }
 
-/// Names of plugin actions (`ID:NAME`) seen so far; [`Action::Plugin`]
+/// Namespaced plugin action IDs (`PLUGIN-ID:ACTION-ID`) seen so far; [`Action::Plugin`]
 /// indexes this. Entries are never removed, so indices stay valid.
 static PLUGIN_ACTIONS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
-/// The action for plugin `id`'s palette entry `name`.
+/// The action for plugin `id`'s stable local action ID `name`.
 pub fn plugin_action(id: &str, name: &str) -> Option<Action> {
     let full = format!("{id}:{name}");
     let mut v = PLUGIN_ACTIONS.lock().ok()?;
@@ -399,7 +412,7 @@ pub fn plugin_action(id: &str, name: &str) -> Option<Action> {
     u16::try_from(i).ok().map(Action::Plugin)
 }
 
-/// (plugin id, action name) of a plugin action.
+/// (plugin ID, local action ID) of a plugin action.
 pub fn plugin_action_name(i: u16) -> Option<(String, String)> {
     let v = PLUGIN_ACTIONS.lock().ok()?;
     let (id, name) = v.get(i as usize)?.split_once(':')?;
@@ -476,6 +489,8 @@ impl Action {
             Action::RenameTab => "tab.rename".into(),
             Action::RenamePane => "pane.rename".into(),
             Action::SaveLayout => "layout.save".into(),
+            Action::ExportScrollback => "scrollback.export".into(),
+            Action::ResetRenderer => "renderer.reset".into(),
             Action::LoadLayout => "layout.load".into(),
             Action::FocusNext => "pane.focus_next".into(),
             Action::ToggleFloating => "pane.toggle_floating".into(),
@@ -497,8 +512,6 @@ impl Action {
             Action::Hints(h) => format!("hints.{}", h.key()),
             Action::ViewImage => "image.view".into(),
             Action::Lua(n) => format!("lua.{n}"),
-            Action::FocusSurface => "sidebar.focus".into(),
-            Action::CloseSurface => "sidebar.close".into(),
             Action::TogglePrivate => "pane.toggle_private".into(),
             Action::Plugin(i) => match plugin_action_name(i) {
                 Some((id, name)) => format!("plugin:{id}:{name}"),
@@ -542,7 +555,14 @@ impl Action {
         v.extend(MOTIONS.map(|m| Action::CopyMove(m.0)));
         v.extend([Select::Char, Select::Line, Select::Block].map(Action::CopySelect));
         v.extend([Action::CopyYank, Action::CopyEscape, Action::SearchStart, Action::SearchUp, Action::SearchDown]);
-        v.extend([Action::RenameTab, Action::RenamePane, Action::SaveLayout, Action::LoadLayout]);
+        v.extend([
+            Action::RenameTab,
+            Action::RenamePane,
+            Action::SaveLayout,
+            Action::LoadLayout,
+            Action::ExportScrollback,
+            Action::ResetRenderer,
+        ]);
         v.extend([
             Action::FocusNext,
             Action::ToggleFloating,
@@ -561,7 +581,7 @@ impl Action {
         v.extend(PARTS.map(Action::BlockSelect));
         v.extend([Action::BlockFold, Action::BlockUnfoldAll, Action::BlockRerun, Action::BlockInfo]);
         v.extend([HintAction::Open, HintAction::Copy, HintAction::Insert].map(Action::Hints));
-        v.extend([Action::ViewImage, Action::FocusSurface, Action::CloseSurface, Action::TogglePrivate]);
+        v.extend([Action::ViewImage, Action::TogglePrivate]);
         v
     }
 
@@ -579,75 +599,77 @@ impl Action {
     fn hint(&self, mode: Mode) -> Option<&'static str> {
         let in_menu = matches!(mode, Mode::Normal | Mode::Locked | Mode::Menu);
         Some(match *self {
-            Action::Mode(Mode::Normal) if mode == Mode::Locked => "unlock",
+            Action::Mode(Mode::Normal) if mode == Mode::Locked => "ui-unlock",
             Action::Mode(Mode::Normal) if mode == Mode::Normal => return None,
-            Action::Mode(Mode::Normal) => "back",
+            Action::Mode(Mode::Normal) => "ui-back",
             // Inside a mode, switching to another one is not advertised.
             Action::Mode(_) if !in_menu => return None,
-            Action::Mode(Mode::Locked) => "lock",
-            Action::Mode(m) => m.key(),
-            Action::Passthrough => "send key",
-            Action::Focus(_) | Action::FocusOrTab(_) => "focus",
-            Action::Split(Axis::X) => "split right",
-            Action::Split(Axis::Y) => "split down",
-            Action::NewPane => "new pane",
-            Action::ClosePane => "close",
-            Action::Zoom => "zoom",
-            Action::PaneToNewTab => "to new tab",
-            Action::Resize(_, n) if n >= 0 => "grow",
-            Action::Resize(..) => "shrink",
-            Action::Equalize => "equalize",
-            Action::Swap(_) => "move",
-            Action::NewTab => "new tab",
-            Action::GotoTab(_) => "go to tab",
-            Action::PrevTab | Action::NextTab => "prev/next tab",
-            Action::CloseTab => "close tab",
+            Action::Mode(Mode::Locked) => "ui-lock",
+            Action::Mode(m) => m.hint_id(),
+            Action::Passthrough => "ui-send-key",
+            Action::Focus(_) | Action::FocusOrTab(_) => "ui-focus",
+            Action::Split(Axis::X) => "ui-split-right",
+            Action::Split(Axis::Y) => "ui-split-down",
+            Action::NewPane => "ui-new-pane",
+            Action::ClosePane => "ui-close",
+            Action::Zoom => "ui-zoom",
+            Action::PaneToNewTab => "ui-to-new-tab",
+            Action::Resize(_, n) if n >= 0 => "ui-grow",
+            Action::Resize(..) => "ui-shrink",
+            Action::Equalize => "ui-equalize",
+            Action::Swap(_) => "ui-move",
+            Action::NewTab => "ui-new-tab",
+            Action::GotoTab(_) => "ui-go-to-tab",
+            Action::PrevTab | Action::NextTab => "ui-prev-next-tab",
+            Action::CloseTab => "ui-close-tab",
             // Terminal keys (copy, font, Shift+PgUp) are not advertised.
             Action::Scroll(_) if mode.passes_keys() => return None,
             Action::Scroll(Scroll::Lines(_)) => return None,
-            Action::Scroll(Scroll::HalfPages(_)) => "half page",
-            Action::Scroll(Scroll::Pages(_)) => "page",
-            Action::Scroll(Scroll::Top | Scroll::Bottom) => "top/bottom",
-            Action::Scroll(Scroll::Prompt(_)) => "prompt",
+            Action::Scroll(Scroll::HalfPages(_)) => "ui-half-page",
+            Action::Scroll(Scroll::Pages(_)) => "ui-page",
+            Action::Scroll(Scroll::Top | Scroll::Bottom) => "ui-top-bottom",
+            Action::Scroll(Scroll::Prompt(_)) => "ui-prompt",
             Action::Copy | Action::Paste | Action::PastePrimary | Action::Font(_) => return None,
-            Action::Quit => "quit",
-            Action::CopyMove(Motion::Left | Motion::Right | Motion::Up | Motion::Down) => "move",
-            Action::CopyMove(Motion::WordNext | Motion::WordPrev | Motion::WordEnd) => "word",
-            Action::CopyMove(Motion::Top | Motion::Bottom) => "top/bottom",
-            Action::CopyMove(Motion::HalfPageUp | Motion::HalfPageDown) => "half page",
-            Action::CopyMove(Motion::PrevPrompt | Motion::NextPrompt) => "prompt",
+            Action::Quit => "ui-quit",
+            Action::CopyMove(Motion::Left | Motion::Right | Motion::Up | Motion::Down) => "ui-move",
+            Action::CopyMove(Motion::WordNext | Motion::WordPrev | Motion::WordEnd) => "ui-word",
+            Action::CopyMove(Motion::Top | Motion::Bottom) => "ui-top-bottom",
+            Action::CopyMove(Motion::HalfPageUp | Motion::HalfPageDown) => "ui-half-page",
+            Action::CopyMove(Motion::PrevPrompt | Motion::NextPrompt) => "ui-prompt",
             Action::CopyMove(_) => return None,
-            Action::CopySelect(_) => "select",
-            Action::CopyYank => "copy",
-            Action::CopyEscape => "back",
-            Action::SearchStart => "search",
-            Action::SearchUp | Action::SearchDown => "match",
-            Action::RenameTab | Action::RenamePane => "rename",
-            Action::SaveLayout => "save layout",
-            Action::LoadLayout => "load layout",
-            Action::FocusNext => "next pane",
-            Action::ToggleFloating => "floating",
-            Action::ToggleEmbed => "float/embed",
-            Action::NewFloating => "new floating",
-            Action::ToggleStack => "stack",
-            Action::TogglePaneTitles => "titles",
-            Action::NewWindow => "new window",
-            Action::TabToNewWindow | Action::PaneToNewWindow => "to new window",
-            Action::TabToNextWindow => "to next window",
+            Action::CopySelect(_) => "ui-select",
+            Action::CopyYank => "action-copy",
+            Action::CopyEscape => "ui-back",
+            Action::SearchStart => "ui-search",
+            Action::SearchUp | Action::SearchDown => "ui-match",
+            Action::RenameTab | Action::RenamePane => "ui-rename",
+            Action::SaveLayout => "ui-save-layout",
+            Action::ExportScrollback => "ui-export-scrollback",
+            Action::ResetRenderer => "ui-reset-renderer",
+            Action::LoadLayout => "ui-load-layout",
+            Action::FocusNext => "ui-next-pane",
+            Action::ToggleFloating => "ui-floating",
+            Action::ToggleEmbed => "ui-float-embed",
+            Action::NewFloating => "ui-new-floating",
+            Action::ToggleStack => "ui-stack",
+            Action::TogglePaneTitles => "ui-titles",
+            Action::NewWindow => "ui-new-window",
+            Action::TabToNewWindow | Action::PaneToNewWindow => "ui-to-new-window",
+            Action::TabToNextWindow => "ui-to-next-window",
             Action::Palette if mode.passes_keys() => return None,
-            Action::Palette => "palette",
-            Action::BlockCopy(_) => "copy block",
-            Action::BlockSelect(_) => "select block",
-            Action::BlockFold => "fold",
+            Action::Palette => "action-palette",
+            Action::BlockCopy(_) => "ui-copy-block",
+            Action::BlockSelect(_) => "ui-select-block",
+            Action::BlockFold => "ui-fold",
             Action::BlockUnfoldAll => return None,
-            Action::BlockRerun => "rerun",
-            Action::BlockInfo => "info",
+            Action::BlockRerun => "ui-rerun",
+            Action::BlockInfo => "ui-info",
             Action::Hints(_) if mode.passes_keys() => return None,
-            Action::Hints(_) => "hints",
-            Action::ViewImage | Action::Lua(_) | Action::FocusSurface | Action::CloseSurface | Action::Plugin(_) => {
+            Action::Hints(_) => "ui-hints",
+            Action::ViewImage | Action::Lua(_) | Action::Plugin(_) => {
                 return None;
             }
-            Action::TogglePrivate => "private",
+            Action::TogglePrivate => "ui-private",
         })
     }
 }
@@ -768,8 +790,6 @@ fn window_keys(t: &mut Table) {
     bind(t, &["ctrl+shift+p"], Action::Palette);
     bind(t, &["ctrl+shift+n"], Action::NewWindow);
     bind(t, &["ctrl+shift+e"], Action::Hints(HintAction::Open));
-    // Plugin sidebars and floats: the keyboard to the next one, then back.
-    bind(t, &["ctrl+shift+b"], Action::FocusSurface);
 }
 
 /// tmux's prefix table (in the Menu mode; one key, then back to Normal).
@@ -984,6 +1004,20 @@ impl Keymap {
         km
     }
 
+    /// Plugin defaults fill free preset keys, while every explicit user entry
+    /// (including `None`) wins. Rebuilding also removes changed/stopped defaults.
+    pub fn with_plugin_defaults(cfg: &KeyConfig, defaults: &[(Mode, Chord, Action)]) -> Self {
+        let mut map = Self::new(cfg);
+        for &(mode, chord, action) in defaults {
+            let explicit = cfg.binds.iter().any(|(m, c, _)| (*m, *c) == (mode, chord));
+            let occupied = map.bindings(mode).iter().any(|(c, _)| *c == chord);
+            if !explicit && !occupied {
+                map.set(mode, chord, Some(action));
+            }
+        }
+        map
+    }
+
     /// Bind (or with `None` unbind) a chord, keeping its place in the table.
     pub fn set(&mut self, mode: Mode, chord: Chord, action: Option<Action>) {
         let Some((_, t)) = self.tables.iter_mut().find(|t| t.0 == mode) else { return };
@@ -1054,7 +1088,7 @@ impl Keymap {
         MODES.into_iter().filter(|m| !m.passes_keys()).find_map(|m| Some(format!("{} {}", entry(m)?, find(m, a)?)))
     }
 
-    /// Hint bar entries for `mode`: (keys, label). Bindings with the same
+    /// Hint bar entries for `mode`: (keys, Fluent message ID). Bindings with the same
     /// label are merged; each action shows its first key only.
     pub fn hints(&self, mode: Mode) -> Vec<(String, &'static str)> {
         let mut groups: Vec<(&'static str, Vec<(Chord, Action)>)> = Vec::new();
@@ -1128,11 +1162,13 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_focus_in_every_preset() {
+    fn plugin_focus_keys_are_not_reserved_by_builtin_presets() {
+        assert!(Action::from_name("sidebar.focus").is_none());
+        assert!(Action::from_name("sidebar.close").is_none());
         for preset in [Preset::Zellij, Preset::Leader, Preset::Tmux] {
             let k = km(preset);
             let l = k.lookup(Mode::Normal, Key::Char('b'), Mods::CTRL | Mods::SHIFT);
-            assert_eq!(l, Lookup::Do(Action::FocusSurface), "{preset:?}");
+            assert_eq!(l, Lookup::Pass, "{preset:?}");
         }
     }
 
@@ -1202,7 +1238,7 @@ mod tests {
         assert_eq!(k.lookup(Mode::Menu, b, ctrl), Lookup::Do(Action::Passthrough));
         assert_eq!(k.lookup(Mode::Menu, Key::Char('['), NONE), Lookup::Do(Action::Mode(Mode::Scroll)));
         assert_eq!(k.lookup(Mode::Tab, b, ctrl), Lookup::Do(Action::Mode(Mode::Normal)));
-        assert_eq!(k.hints(Mode::Normal)[0], ("ctrl+b".to_string(), "menu"));
+        assert_eq!(k.hints(Mode::Normal)[0], ("ctrl+b".to_string(), "ui-menu"));
     }
 
     #[test]
@@ -1239,21 +1275,53 @@ mod tests {
     fn hints_follow_bindings() {
         let k = km(Preset::Zellij);
         let h = k.hints(Mode::Pane);
-        assert_eq!(h[0], ("hjkl".to_string(), "focus"));
-        assert!(h.contains(&("d".to_string(), "split down")));
-        assert!(h.contains(&("f".to_string(), "zoom")));
-        assert_eq!(h.last().unwrap(), &("esc".to_string(), "back"));
-        assert_eq!(k.hints(Mode::Resize)[1], ("HJKL".to_string(), "shrink"));
-        assert_eq!(k.hints(Mode::Tab)[1], ("1-9".to_string(), "go to tab"));
-        assert_eq!(k.hints(Mode::Locked), vec![("ctrl+g".to_string(), "unlock")]);
+        assert_eq!(h[0], ("hjkl".to_string(), "ui-focus"));
+        assert!(h.contains(&("d".to_string(), "ui-split-down")));
+        assert!(h.contains(&("f".to_string(), "ui-zoom")));
+        assert_eq!(h.last().unwrap(), &("esc".to_string(), "ui-back"));
+        assert_eq!(k.hints(Mode::Resize)[1], ("HJKL".to_string(), "ui-shrink"));
+        assert_eq!(k.hints(Mode::Tab)[1], ("1-9".to_string(), "ui-go-to-tab"));
+        assert_eq!(k.hints(Mode::Locked), vec![("ctrl+g".to_string(), "ui-unlock")]);
         let n = k.hints(Mode::Normal);
-        assert_eq!(n[0], ("ctrl+g".to_string(), "lock"));
-        assert_eq!(n[1], ("ctrl+p".to_string(), "pane"));
-        assert!(n.contains(&("alt+hjkl".to_string(), "focus")));
-        assert!(n.contains(&("alt+[]".to_string(), "prev/next tab")));
-        assert!(n.contains(&("alt+1-9".to_string(), "go to tab")));
-        assert!(!n.iter().any(|h| h.1 == "page"));
-        assert_eq!(km(Preset::Leader).hints(Mode::Normal)[0], ("ctrl+g".to_string(), "menu"));
+        assert_eq!(n[0], ("ctrl+g".to_string(), "ui-lock"));
+        assert_eq!(n[1], ("ctrl+p".to_string(), "ui-pane"));
+        assert!(n.contains(&("alt+hjkl".to_string(), "ui-focus")));
+        assert!(n.contains(&("alt+[]".to_string(), "ui-prev-next-tab")));
+        assert!(n.contains(&("alt+1-9".to_string(), "ui-go-to-tab")));
+        assert!(!n.iter().any(|h| h.1 == "ui-page"));
+        assert_eq!(km(Preset::Leader).hints(Mode::Normal)[0], ("ctrl+g".to_string(), "ui-menu"));
+    }
+
+    #[test]
+    fn plugin_defaults_respect_user_rebinding_unbinding_and_builtin_keys() {
+        let action = plugin_action("test.actions", "sidebar.toggle").unwrap();
+        let other = plugin_action("test.other", "toggle").unwrap();
+        let key = |s| Chord::parse(s).unwrap();
+        let defaults = [(Mode::Normal, key("alt+e"), action), (Mode::Normal, key("ctrl+shift+c"), action)];
+        let map = Keymap::with_plugin_defaults(&KeyConfig::default(), &defaults);
+        assert!(map.bindings(Mode::Normal).contains(&(key("alt+e"), action)));
+        assert!(map.bindings(Mode::Normal).contains(&(key("ctrl+shift+c"), Action::Copy)));
+        let cfg = KeyConfig {
+            binds: vec![(Mode::Normal, key("alt+e"), None), (Mode::Normal, key("ctrl+alt+e"), Some(action))],
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            // Registration/reload must not resurrect an explicit unbinding.
+            let map = Keymap::with_plugin_defaults(&cfg, &defaults);
+            assert!(!map.bindings(Mode::Normal).iter().any(|(c, _)| *c == key("alt+e")));
+            assert!(map.bindings(Mode::Normal).contains(&(key("ctrl+alt+e"), action)));
+        }
+        let changed = Keymap::with_plugin_defaults(&KeyConfig::default(), &[(Mode::Normal, key("alt+f"), action)]);
+        assert!(!changed.bindings(Mode::Normal).iter().any(|(c, _)| *c == key("alt+e")));
+        let stopped = Keymap::with_plugin_defaults(&KeyConfig::default(), &[]);
+        assert!(!stopped.bindings(Mode::Normal).iter().any(|(_, a)| *a == action));
+        let conflict = Keymap::with_plugin_defaults(
+            &KeyConfig::default(),
+            &[(Mode::Normal, key("alt+e"), action), (Mode::Normal, key("alt+e"), other)],
+        );
+        assert!(conflict.bindings(Mode::Normal).contains(&(key("alt+e"), action)));
+        let modes = Keymap::with_plugin_defaults(&cfg, &[(Mode::Pane, key("alt+e"), action)]);
+        assert!(modes.bindings(Mode::Pane).contains(&(key("alt+e"), action)));
     }
 
     #[test]

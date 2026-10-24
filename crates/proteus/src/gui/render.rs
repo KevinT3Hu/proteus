@@ -2,6 +2,10 @@
 //! a coverage atlas and a color (emoji) atlas, and curly underlines.
 
 use std::collections::HashMap;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use bytemuck::{Pod, Zeroable};
 use proteus_core::cell::CellFlags;
@@ -151,9 +155,11 @@ pub struct Label {
     pub bold: bool,
 }
 
-/// Chrome colors, taken from the focused pane's palette.
+/// Chrome colors: configured overrides with focused-pane palette defaults.
 #[derive(Debug, Clone, Copy)]
 pub struct Theme {
+    pub colors: crate::theme::Ui,
+    pub cursor_shape: Option<CursorShape>,
     pub fg: Rgb,
     pub bg: Rgb,
     pub accent: Rgb,
@@ -168,6 +174,7 @@ pub struct FrameInfo<'a> {
     pub panes: Vec<PaneFrame<'a>>,
     /// Window padding in physical pixels (indent of the overlay text).
     pub pad: f32,
+    pub pad_y: f32,
     pub theme: Theme,
     pub cursor_blink_off: bool,
     /// Shape runs of text so fonts can apply ligatures.
@@ -203,8 +210,9 @@ pub fn preedit_start(x: usize, width: usize, cols: usize) -> usize {
 
 pub struct Renderer {
     pub device: wgpu::Device,
+    pub lost: Arc<AtomicBool>,
     queue: wgpu::Queue,
-    surface: wgpu::Surface<'static>,
+    surface: Arc<wgpu::Surface<'static>>,
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
@@ -235,7 +243,7 @@ fn rgba(c: Rgb, a: f32) -> [f32; 4] {
 impl Renderer {
     pub fn new(
         instance: &wgpu::Instance,
-        surface: wgpu::Surface<'static>,
+        surface: Arc<wgpu::Surface<'static>>,
         size: (u32, u32),
     ) -> Result<Renderer, String> {
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -395,6 +403,7 @@ impl Renderer {
         let capacity = 4096;
         let instances = Self::instance_buffer(&device, capacity);
         Ok(Renderer {
+            lost: Arc::new(AtomicBool::new(false)),
             device,
             queue,
             surface,
@@ -419,6 +428,12 @@ impl Renderer {
         })
     }
 
+    /// Reconfigure the existing native surface with a fresh device. Creating a
+    /// second native surface for the same wl_surface duplicates explicit-sync objects.
+    pub fn recover(&self, instance: &wgpu::Instance, size: (u32, u32)) -> Result<Self, String> {
+        Self::new(instance, self.surface.clone(), size)
+    }
+
     fn instance_buffer(device: &wgpu::Device, n: usize) -> wgpu::Buffer {
         device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("instances"),
@@ -433,7 +448,9 @@ impl Renderer {
         if (w, h) != (self.config.width, self.config.height) {
             self.config.width = w;
             self.config.height = h;
-            self.surface.configure(&self.device, &self.config);
+            if !self.lost.load(Ordering::Acquire) {
+                self.surface.configure(&self.device, &self.config);
+            }
         }
     }
 
@@ -490,6 +507,9 @@ impl Renderer {
     /// Render one frame. Returns false if the surface was not available
     /// (the caller should retry on the next frame).
     pub fn draw(&mut self, fonts: &mut Fonts, info: &FrameInfo) -> bool {
+        if self.lost.load(Ordering::Acquire) {
+            return false;
+        }
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
@@ -706,9 +726,13 @@ impl Renderer {
         let skip = p.skip.min(t.lines() - 1);
         let (px, py) = (p.x, p.y - skip as f32 * ch);
         let default_bg = pal.background();
+        // Each pane owns its background, independently of chrome and other panes' OSC colors.
+        // Paint it before images so default cells can omit redundant background runs.
+        self.rect(p.x, p.y, t.cols() as f32 * cw, (t.lines() - skip) as f32 * ch, rgba(default_bg, 1.0));
         let reverse = t.mode().contains(TermMode::REVERSE_VIDEO);
         let selection = t.selection_range();
         let cursor = t.cursor();
+        let cursor_shape = info.theme.cursor_shape.unwrap_or_else(|| t.cursor_shape());
         let blink_off = info.cursor_blink_off && p.focused;
         let show_cursor = t.cursor_visible() && !blink_off && p.preedit.is_none() && p.copy_cursor.is_none();
         let grid = t.grid();
@@ -763,11 +787,19 @@ impl Renderer {
                 if style.attrs.contains(Attrs::INVERSE) ^ reverse ^ selected {
                     std::mem::swap(&mut fg, &mut bg);
                 }
+                if selected {
+                    fg = info.theme.colors.selection_foreground.unwrap_or(fg);
+                    bg = info.theme.colors.selection_background.unwrap_or(bg);
+                }
                 if let Some(m) = marks.iter().find(|m| m.contains(Point::new(line, x))) {
                     match m.kind {
                         MarkKind::Match | MarkKind::Current => {
-                            bg = pal.indexed(if m.kind == MarkKind::Current { 208 } else { 3 });
-                            fg = pal.indexed(0);
+                            bg = if m.kind == MarkKind::Current {
+                                info.theme.colors.search_current_background.unwrap_or_else(|| pal.indexed(208))
+                            } else {
+                                info.theme.colors.search_background.unwrap_or_else(|| pal.indexed(3))
+                            };
+                            fg = info.theme.colors.search_foreground.unwrap_or_else(|| pal.indexed(0));
                         }
                         MarkKind::Hint => fg = info.theme.accent,
                     }
@@ -777,10 +809,10 @@ impl Renderer {
                     fg = info.theme.bg;
                 }
                 let is_cursor = show_cursor && is_cursor_row && x == cursor.x && p.focused;
-                let is_cursor_block = is_cursor && t.cursor_shape() == CursorShape::Block;
+                let is_cursor_block = is_cursor && cursor_shape == CursorShape::Block;
                 if is_cursor_block {
                     let cc = pal.cursor().unwrap_or(fg);
-                    fg = bg;
+                    fg = info.theme.colors.cursor_text.unwrap_or(bg);
                     bg = cc;
                 }
                 let alpha = if style.attrs.contains(Attrs::DIM) { 0.6 } else { 1.0 };
@@ -906,7 +938,7 @@ impl Renderer {
                         self.fg.push(solid(left, top + ch - thick, w, thick, c));
                         self.fg.push(solid(left, top, thick, ch, c));
                         self.fg.push(solid(left + w - thick, top, thick, ch, c));
-                    } else if t.cursor_shape() == CursorShape::Bar {
+                    } else if cursor_shape == CursorShape::Bar {
                         self.fg.push(solid(left, top, thick, ch, c));
                     } else {
                         self.fg.push(solid(left, top + ch - thick, w, thick, c));
@@ -926,7 +958,7 @@ impl Renderer {
         if p.flash {
             // Premultiplied: a light veil of the foreground color.
             let a = 0.18;
-            let c = rgba(pal.foreground(), 1.0);
+            let c = rgba(info.theme.colors.bell.unwrap_or_else(|| pal.foreground()), 1.0);
             let veil = [c[0] * a, c[1] * a, c[2] * a, a];
             self.fg.push(solid(px, p.y, cols as f32 * cw, (t.lines() - skip) as f32 * ch, veil));
         }
@@ -996,7 +1028,7 @@ impl Renderer {
         }
         lines.push((o.keys.as_str(), 0.85));
         let rows = lines.len().min(max_rows);
-        let top = (height - px - rows as f32 * ch).max(0.0);
+        let top = (height - info.pad_y - rows as f32 * ch).max(0.0);
         // Cover the padding too so the bar reaches the window edges.
         self.fg.push(solid(0.0, top, width, height - top, rgba(bg, 1.0)));
         self.fg.push(solid(0.0, top, width, (m.underline_h as f32).max(1.0), rgba(info.theme.accent, 1.0)));
@@ -1134,7 +1166,7 @@ impl Renderer {
     ) {
         let Some(a) = self.glyph(fonts, g) else { return };
         let (mut w, mut h) = (a.w as f32, a.h as f32);
-        let mut x = (left + dx).round() + a.left as f32;
+        let mut x = (left + dx + m.offset_x).round() + a.left as f32;
         let mut y = (top + m.baseline as f32 - dy).round() - a.top as f32;
         if a.color {
             // Fit color glyphs (emoji bitmaps) into their cell box.
@@ -1144,7 +1176,7 @@ impl Renderer {
                 w *= s;
                 h *= s;
             }
-            x = left + (box_w - w) / 2.0;
+            x = left + (box_w - w) / 2.0 + m.offset_x;
             y = y.clamp(top, top + ch - h);
         }
         self.fg.push(Instance {

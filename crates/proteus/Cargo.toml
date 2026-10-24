@@ -12,12 +12,18 @@ name = "proteus"
 path = "src/main.rs"
 
 [dependencies]
+accesskit = "=0.25.1"
+accesskit_unix = "=0.24.0"
+proteus-i18n = { path = "../proteus-i18n" }
 proteus-core.workspace = true
 proteus-pty.workspace = true
 proteus-wasm.workspace = true
 rustix.workspace = true
 clap.workspace = true
 mlua.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+toml.workspace = true
 wgpu.workspace = true
 smithay-client-toolkit.workspace = true
 wayland-client.workspace = true

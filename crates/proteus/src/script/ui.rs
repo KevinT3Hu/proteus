@@ -1,4 +1,4 @@
-//! `p.ui`: plugin-style surfaces for Lua (doc 05). Lua builds frames from
+//! `p.ui`: surfaces created directly by Lua config code. Lua builds frames from
 //! strings and span tables; events reach the surface's `on_event`.
 //! Rows and columns are 1-based on the Lua side.
 
@@ -113,7 +113,7 @@ fn line(v: Value) -> mlua::Result<Line> {
 /// `surface:draw(lines, { cursor = { col, row }, background = color })`.
 pub fn frame(lines: Table, opts: Option<Table>) -> mlua::Result<Frame> {
     let lines = lines.sequence_values::<Value>().take(1000).map(|v| line(v?)).collect::<mlua::Result<_>>()?;
-    let mut f = Frame { lines, cursor: None, background: None, images: Vec::new() };
+    let mut f = Frame { lines, cursor: None, background: None, images: Vec::new(), accessibility: Vec::new() };
     if let Some(o) = opts {
         for pair in o.pairs::<String, Value>() {
             let (k, v) = pair?;
@@ -144,6 +144,22 @@ fn mods(lua: &Lua, m: Modifiers) -> mlua::Result<Table> {
 pub fn event(lua: &Lua, e: &UiEvent) -> mlua::Result<Table> {
     let t = lua.create_table()?;
     match e {
+        UiEvent::Accessibility(event) => {
+            t.set("type", "accessibility")?;
+            t.set("node", event.node.as_str())?;
+            t.set(
+                "action",
+                match event.action {
+                    proteus_wasm::types::AccessibilityAction::Focus => "focus",
+                    proteus_wasm::types::AccessibilityAction::Activate => "activate",
+                    proteus_wasm::types::AccessibilityAction::Select => "select",
+                    proteus_wasm::types::AccessibilityAction::SetValue => "set_value",
+                    proteus_wasm::types::AccessibilityAction::ScrollUp => "scroll_up",
+                    proteus_wasm::types::AccessibilityAction::ScrollDown => "scroll_down",
+                },
+            )?;
+            t.set("value", event.value.as_deref())?;
+        }
         UiEvent::Key(k) => {
             t.set("type", "key")?;
             t.set("key", k.key.as_str())?;

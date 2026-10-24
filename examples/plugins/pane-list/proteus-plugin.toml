@@ -4,7 +4,7 @@ name = "Pane list"
 version = "0.1.0"
 api = "1"
 description = "A sidebar listing every pane; a status segment with the pane count."
-# Relative to this file; `proteus +plugin install` copies it.
+# Prebuilt package path; source declarations with Cargo.toml are compiled into the cache.
 wasm = "target/wasm32-wasip2/release/pane_list.wasm"
 
 [permissions]

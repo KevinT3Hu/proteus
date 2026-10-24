@@ -94,11 +94,11 @@ impl ImageBudget {
     }
     fn try_reserve(&self, n: usize) -> bool {
         self.used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |u| u.checked_add(n).filter(|&t| t <= self.limit))
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |u| u.checked_add(n).filter(|&t| t <= self.limit))
             .is_ok()
     }
     fn release(&self, n: usize) {
-        let _ = self.used.fetch_update(Ordering::AcqRel, Ordering::Acquire, |u| Some(u.saturating_sub(n)));
+        let _ = self.used.try_update(Ordering::AcqRel, Ordering::Acquire, |u| Some(u.saturating_sub(n)));
     }
 }
 

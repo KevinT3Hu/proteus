@@ -2,13 +2,16 @@
 //! that forwards output to the event loop; or a plugin's pane surface,
 //! whose terminal the plugin's frames are painted into.
 
-use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::PathBuf;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use proteus_core::Terminal;
-use proteus_pty::{Pty, WindowSize};
+use proteus_pty::{InputWriter, Pty, WindowSize};
 use smithay_client_toolkit::reexports::calloop::channel::Sender;
 
 use super::Msg;
@@ -29,7 +32,8 @@ pub struct Pane {
     pending_run: Option<(String, Instant)>,
     /// None for a plugin's pane.
     pub pty: Option<Pty>,
-    writer: Option<File>,
+    writer: Option<InputWriter>,
+    reader_stop: Arc<AtomicBool>,
     /// Size last sent to the PTY.
     size: WindowSize,
     /// Foreground process name and cwd, used when the app sets no title.
@@ -58,11 +62,16 @@ impl Pane {
         let (pty, _shell) = session::spawn_pty(opts)?;
         let mut term = Terminal::new(opts.cols as usize, opts.rows as usize, core);
         term.set_cell_pixel_size(cell.0, cell.1);
-        let writer = pty.try_clone_master()?;
+        let writer = InputWriter::new(pty.try_clone_master()?)?;
         let mut reader = pty.try_clone_master()?;
+        let reader_stop = Arc::new(AtomicBool::new(false));
+        let stop = reader_stop.clone();
         std::thread::Builder::new().name(format!("pty-reader-{id}")).spawn(move || {
             let mut buf = vec![0u8; 64 * 1024];
             loop {
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
@@ -71,6 +80,18 @@ impl Pane {
                         }
                     }
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        // Readiness wakes immediately on output; the bounded
+                        // timeout only exists to notice a closed pane.
+                        let mut polls = [rustix::event::PollFd::new(&reader, rustix::event::PollFlags::IN)];
+                        let wait = rustix::event::Timespec::try_from(Duration::from_millis(50)).expect("small timeout");
+                        if let Err(e) = rustix::event::poll(&mut polls, Some(&wait))
+                            && e != rustix::io::Errno::INTR
+                        {
+                            break;
+                        }
+                        continue;
+                    }
                     Err(_) => break,
                 }
             }
@@ -84,6 +105,7 @@ impl Pane {
             pending_run: None,
             pty: Some(pty),
             writer: Some(writer),
+            reader_stop,
             size,
             proc_title: String::new(),
             proc_checked: None,
@@ -106,6 +128,7 @@ impl Pane {
             pending_run: None,
             pty: None,
             writer: None,
+            reader_stop: Arc::default(),
             size: WindowSize::default(),
             proc_title: String::new(),
             proc_checked: None,
@@ -137,11 +160,13 @@ impl Pane {
         false
     }
 
+    pub fn try_write(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.writer.as_ref().map_or(Ok(()), |w| w.write(bytes))
+    }
+
     pub fn write(&mut self, bytes: &[u8]) {
-        if let Some(w) = &mut self.writer
-            && let Err(e) = w.write_all(bytes)
-        {
-            eprintln!("proteus: write to pty: {e}");
+        if let Err(e) = self.try_write(bytes) {
+            eprintln!("proteus: queue input to pty: {e}");
         }
     }
 
@@ -247,6 +272,12 @@ impl Pane {
     /// The foreground program's name.
     pub fn process(&self) -> Option<String> {
         self.pty.as_ref()?.foreground_process().map(|f| f.name)
+    }
+}
+
+impl Drop for Pane {
+    fn drop(&mut self) {
+        self.reader_stop.store(true, Ordering::Relaxed);
     }
 }
 

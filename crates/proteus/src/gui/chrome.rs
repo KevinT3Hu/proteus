@@ -59,6 +59,7 @@ pub fn tab_at(labels: &[Label], x: f32, cw: f32) -> Option<usize> {
 }
 
 /// Mode badge followed by `keys label` pairs, cut off at `cols`.
+#[allow(clippy::too_many_arguments)]
 pub fn hint_bar(
     mode: &str,
     hints: &[(String, &str)],
@@ -67,6 +68,7 @@ pub fn hint_bar(
     cols: usize,
     cw: f32,
     theme: &Theme,
+    catalog: &crate::i18n::Catalog,
 ) -> Vec<Label> {
     let mut out = Vec::new();
     let badge = format!(" {mode} ");
@@ -74,7 +76,8 @@ pub fn hint_bar(
     out.push(Label { x: x0, y, cols: col, text: badge, fg: theme.bg, bg: Some(theme.accent), bold: true });
     col += 1;
     for (keys, label) in hints {
-        let (kw, lw) = (width(keys), width(label));
+        let label = catalog.t(label, &[]);
+        let (kw, lw) = (width(keys), width(&label));
         if col + kw + 1 + lw > cols {
             break;
         }
@@ -115,7 +118,9 @@ pub fn input_bar(
     cols: usize,
     cw: f32,
     theme: &Theme,
+    catalog: &crate::i18n::Catalog,
 ) -> (Vec<Label>, f32) {
+    let badge = catalog.t(badge, &[]);
     let badge = format!(" {badge} ");
     let bw = width(&badge).min(cols);
     let mut out = vec![Label { x: x0, y, cols: bw, text: badge, fg: theme.bg, bg: Some(theme.accent), bold: true }];
@@ -167,7 +172,36 @@ mod tests {
 
     fn theme() -> Theme {
         let c = |v| Rgb { r: v, g: v, b: v };
-        Theme { fg: c(200), bg: c(0), accent: c(100), bar: c(30), dim: c(150) }
+        Theme {
+            cursor_shape: None,
+            colors: Default::default(),
+            fg: c(200),
+            bg: c(0),
+            accent: c(100),
+            bar: c(30),
+            dim: c(150),
+        }
+    }
+
+    #[test]
+    fn translated_hint_geometry_uses_display_width() {
+        let mut catalog = crate::i18n::defaults();
+        catalog.set_locale("zh-CN").unwrap();
+        let labels = hint_bar(
+            &catalog.t("badge-pane", &[]),
+            &[("x".into(), "ui-close")],
+            0.0,
+            0.0,
+            80,
+            10.0,
+            &theme(),
+            &catalog,
+        );
+        assert_eq!(labels[0].text, " 窗格 ");
+        assert_eq!(labels[0].cols, 6);
+        assert_eq!(labels[1].x, 70.0);
+        assert_eq!(labels[2].text, "关闭");
+        assert_eq!(labels[2].cols, 4);
     }
 
     #[test]
@@ -189,17 +223,39 @@ mod tests {
 
     #[test]
     fn hints_truncate() {
-        let hints = vec![("hjkl".to_string(), "focus"), ("x".to_string(), "close")];
-        let l = hint_bar("PANE", &hints, 0.0, 0.0, 80, 10.0, &theme());
+        let hints = vec![("hjkl".to_string(), "ui-focus"), ("x".to_string(), "ui-close")];
+        let l = hint_bar("PANE", &hints, 0.0, 0.0, 80, 10.0, &theme(), &crate::i18n::Catalog::new("en").unwrap());
         assert_eq!(l.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(), [" PANE ", "hjkl", "focus", "x", "close"]);
         assert_eq!(l[1].x, 70.0);
-        let l = hint_bar("PANE", &hints, 0.0, 0.0, 18, 10.0, &theme());
+        let l = hint_bar("PANE", &hints, 0.0, 0.0, 18, 10.0, &theme(), &crate::i18n::Catalog::new("en").unwrap());
         assert_eq!(l.len(), 3);
-        let (l, caret) = input_bar("SEARCH", "foo", 3, "1/2", 0.0, 0.0, 40, 10.0, &theme());
+        let (l, caret) = input_bar(
+            "badge-search",
+            "foo",
+            3,
+            "1/2",
+            0.0,
+            0.0,
+            40,
+            10.0,
+            &theme(),
+            &crate::i18n::Catalog::new("en").unwrap(),
+        );
         assert_eq!(l.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(), [" SEARCH ", "foo", "1/2"]);
         assert_eq!(caret, 120.0);
         // Long text scrolls so the caret stays visible.
-        let (l, caret) = input_bar("S", "abcdefghij", 10, "", 0.0, 0.0, 10, 10.0, &theme());
+        let (l, caret) = input_bar(
+            "S",
+            "abcdefghij",
+            10,
+            "",
+            0.0,
+            0.0,
+            10,
+            10.0,
+            &theme(),
+            &crate::i18n::Catalog::new("en").unwrap(),
+        );
         assert_eq!((l[1].text.as_str(), caret), ("fghij", 90.0));
         assert_eq!(mix(Rgb { r: 0, g: 0, b: 0 }, Rgb { r: 200, g: 100, b: 0 }, 0.5), Rgb { r: 100, g: 50, b: 0 });
     }

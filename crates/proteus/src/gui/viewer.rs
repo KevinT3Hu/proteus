@@ -124,9 +124,12 @@ impl Viewer {
     }
 
     /// Bar text: size and zoom, plus the last status.
-    pub fn title(&self, area: (f32, f32)) -> String {
+    pub fn title(&self, area: (f32, f32), catalog: &crate::i18n::Catalog) -> String {
         let pct = (self.scale(area) * 100.0).round();
-        let mut s = format!("IMAGE {}×{} {pct}%", self.width, self.height);
+        let mut s = catalog.t(
+            "ui-image-width-height-percent",
+            &[("width", &self.width.to_string()), ("height", &self.height.to_string()), ("percent", &pct.to_string())],
+        );
         if let Some(st) = &self.status {
             s.push_str("  ");
             s.push_str(st);
@@ -178,7 +181,7 @@ impl App {
     /// The view area of the viewer: the window minus the bottom bar.
     pub(crate) fn viewer_area(&self) -> (f32, f32) {
         let (pw, ph) = self.physical();
-        let bar = self.cell().1 as f32 + 1.5 * self.pad() as f32;
+        let bar = self.cell().1 as f32 + 1.5 * self.pad_y() as f32;
         (pw as f32, (ph as f32 - bar).max(1.0))
     }
 
@@ -231,7 +234,7 @@ impl App {
             .map(|v| (v.width, v.height, v.pixels.unwrap_or_default().to_vec()));
         match found {
             Some((w, h, px)) => self.open_viewer(Viewer::new(w, h, px)),
-            None => self.notice("No image on screen".into()),
+            None => self.notice(self.cfg.i18n.t("ui-no-image-on-screen", &[])),
         }
     }
 
@@ -298,9 +301,9 @@ impl App {
         let status = match v.png() {
             Ok(png) => {
                 self.set_clipboard_image(png);
-                "copied".to_string()
+                self.cfg.i18n.t("ui-copied", &[])
             }
-            Err(e) => format!("copy failed: {e}"),
+            Err(e) => self.cfg.i18n.t("ui-copy-failed-error", &[("error", &e.to_string())]),
         };
         if let Some(v) = self.w.viewer.as_mut() {
             v.status = Some(status);
@@ -311,7 +314,7 @@ impl App {
         let Some(v) = self.w.viewer.as_ref() else { return };
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
         let status = match pictures_dir() {
-            None => "save failed: no home directory".to_string(),
+            None => self.cfg.i18n.t("ui-save-failed-no-home-directory", &[]),
             Some(dir) => {
                 let path = free_name(&dir, stamp);
                 let r = std::fs::create_dir_all(&dir)
@@ -319,8 +322,8 @@ impl App {
                     .and_then(|()| v.png())
                     .and_then(|png| std::fs::write(&path, png).map_err(|e| e.to_string()));
                 match r {
-                    Ok(()) => format!("saved {}", path.display()),
-                    Err(e) => format!("save failed: {e}"),
+                    Ok(()) => self.cfg.i18n.t("ui-saved-path", &[("path", &path.display().to_string())]),
+                    Err(e) => self.cfg.i18n.t("ui-save-failed-error", &[("error", &e.to_string())]),
                 }
             }
         };

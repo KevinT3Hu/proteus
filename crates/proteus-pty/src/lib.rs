@@ -2,6 +2,8 @@
 //! automatic shell-integration injection for bash, zsh and fish.
 
 mod pty;
+mod writer;
+pub use writer::{InputWriter, MAX_PENDING_INPUT};
 pub mod shell;
 
 pub use pty::{CommandSpec, ForegroundProcess, Pty, WindowSize, is_eof};

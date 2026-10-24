@@ -1,6 +1,6 @@
-//! File operations that run in steps (so one plugin call stays short):
-//! copies and moves with conflicts, bulk rename plans, trash restore.
-//! Plain `std::fs`, no host calls (testable).
+//! File operations that run in steps (so one plugin call stays short).
+
+use crate::i18n::tr;
 
 use std::collections::{HashSet, VecDeque};
 use std::fs::File;
@@ -13,19 +13,15 @@ pub enum OpKind {
     Copy,
     Move,
 }
-
-/// What to do when the destination exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Choice {
     Overwrite,
     Skip,
     Rename,
 }
-
 #[derive(Debug, PartialEq, Eq)]
 pub enum Step {
     Working,
-    /// Waiting for `resolve`: this destination exists.
     Conflict(PathBuf),
     Done,
 }
@@ -33,37 +29,47 @@ pub enum Step {
 struct Item {
     src: PathBuf,
     dst: PathBuf,
-    /// Given by the user (not found inside a copied directory).
     top: bool,
 }
-
+enum Task {
+    Item(Item),
+    Directory { item: Item, mode: u32, created: bool, failures: usize },
+}
 struct Open {
     from: File,
     to: File,
-    dst: PathBuf,
+    item: Item,
+    temp: PathBuf,
+    mode: u32,
+    replacing: bool,
 }
-
+impl Drop for Open {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.temp);
+    }
+}
 const CHUNK: usize = 1 << 20;
 
-/// A copy or move of (source, destination) pairs.
+/// A copy or move. Files are staged privately and committed by rename.
+/// Source files are removed only after their copies commit; source directories
+/// use remove_dir, never recursive deletion, so failures and new files survive.
 pub struct Transfer {
     pub kind: OpKind,
-    queue: VecDeque<Item>,
+    queue: VecDeque<Task>,
     open: Option<Open>,
-    /// The choice for all later conflicts.
     all: Option<Choice>,
-    /// The choice for the conflict now waiting.
     once: Option<Choice>,
     pub total: u64,
     pub done: u64,
     pub errors: Vec<String>,
-    /// Top-level pairs that were carried out (for undo).
+    /// Successfully completed top-level pairs.
     pub finished: Vec<(PathBuf, PathBuf)>,
-    /// Moves that had to copy: sources removed at the end.
-    remove: Vec<PathBuf>,
+    /// Merges/replacements and partial operations cannot be reversed as one
+    /// directory rename. The UI must not offer that destructive approximation.
+    pub undoable: bool,
+    failures: usize,
 }
 
-/// Bytes below `p` (not following links), stopping at a large count.
 fn size_of(p: &Path, budget: &mut usize) -> u64 {
     let Ok(m) = std::fs::symlink_metadata(p) else { return 0 };
     if !m.is_dir() {
@@ -80,7 +86,6 @@ fn size_of(p: &Path, budget: &mut usize) -> u64 {
     n
 }
 
-/// `dst` or the first free `name (n).ext` next to it.
 pub fn unique(dst: &Path) -> PathBuf {
     if std::fs::symlink_metadata(dst).is_err() {
         return dst.to_path_buf();
@@ -95,7 +100,6 @@ pub fn unique(dst: &Path) -> PathBuf {
         .find(|p| std::fs::symlink_metadata(p).is_err())
         .expect("a free name")
 }
-
 fn remove_any(p: &Path) -> std::io::Result<()> {
     match std::fs::symlink_metadata(p) {
         Ok(m) if m.is_dir() => std::fs::remove_dir_all(p),
@@ -104,13 +108,98 @@ fn remove_any(p: &Path) -> std::io::Result<()> {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn file_mode(path: &Path) -> std::io::Result<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    Ok(std::fs::metadata(path)?.permissions().mode() & 0o777)
+}
+#[cfg(target_arch = "wasm32")]
+fn file_mode(path: &Path) -> std::io::Result<u32> {
+    proteus_plugin::host::file_mode(&path.display().to_string()).map_err(std::io::Error::other)
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::PermissionsExt;
+    File::options()
+        .read(true)
+        .custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32)
+        .open(path)?
+        .set_permissions(std::fs::Permissions::from_mode(mode & 0o777))
+}
+#[cfg(target_arch = "wasm32")]
+fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+    proteus_plugin::host::set_file_mode(&path.display().to_string(), mode).map_err(std::io::Error::other)
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn create_private(path: &Path, directory: bool) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    if directory {
+        std::fs::DirBuilder::new().mode(0o700).create(path)
+    } else {
+        File::options().write(true).create_new(true).mode(0o600).open(path).map(|_| ())
+    }
+}
+#[cfg(target_arch = "wasm32")]
+fn create_private(path: &Path, directory: bool) -> std::io::Result<()> {
+    proteus_plugin::host::create_private(&path.display().to_string(), directory).map_err(|e| {
+        if std::fs::symlink_metadata(path).is_ok() {
+            std::io::Error::new(std::io::ErrorKind::AlreadyExists, e)
+        } else {
+            std::io::Error::other(e)
+        }
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn create_staging(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    // Keep the original O_EXCL descriptor: never reopen a predictable staging
+    // pathname, which another process could have replaced with a symlink.
+    File::options().write(true).create_new(true).mode(0o600).open(path)
+}
+#[cfg(target_arch = "wasm32")]
+fn create_staging(path: &Path) -> std::io::Result<File> {
+    let file = File::options().write(true).create_new(true).open(path)?;
+    // WASI does not expose creation modes. The file is still empty here;
+    // restrict its mode through the host before writing any source bytes.
+    if let Err(e) = set_mode(path, 0o600) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(e);
+    }
+    Ok(file)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn publish_file(temp: &Path, dst: &Path, replacing: bool) -> std::io::Result<()> {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+    let flags = if replacing { RenameFlags::empty() } else { RenameFlags::NOREPLACE };
+    renameat_with(CWD, temp, CWD, dst, flags).map_err(Into::into)
+}
+#[cfg(target_arch = "wasm32")]
+fn publish_file(temp: &Path, dst: &Path, replacing: bool) -> std::io::Result<()> {
+    proteus_plugin::host::publish_file(&temp.display().to_string(), &dst.display().to_string(), replacing)
+        .map_err(std::io::Error::other)
+}
+
+/// Resolve existing ancestors too, so a symlink alias cannot turn a copy
+/// into an unbounded recursive copy into its own source.
+fn destination_path(path: &Path) -> std::io::Result<PathBuf> {
+    if let Ok(p) = path.canonicalize() {
+        return Ok(p);
+    }
+    let parent = path.parent().ok_or_else(|| std::io::Error::other(tr!("no-parent")))?;
+    Ok(destination_path(parent)?.join(path.file_name().ok_or_else(|| std::io::Error::other(tr!("no-file-name")))?))
+}
+
 impl Transfer {
     pub fn new(kind: OpKind, pairs: Vec<(PathBuf, PathBuf)>) -> Transfer {
         let mut budget = 200_000;
-        let total = if kind == OpKind::Copy { pairs.iter().map(|(s, _)| size_of(s, &mut budget)).sum() } else { 0 };
+        let total = pairs.iter().map(|(s, _)| size_of(s, &mut budget)).sum();
         Transfer {
             kind,
-            queue: pairs.into_iter().map(|(src, dst)| Item { src, dst, top: true }).collect(),
+            queue: pairs.into_iter().map(|(src, dst)| Task::Item(Item { src, dst, top: true })).collect(),
             open: None,
             all: None,
             once: None,
@@ -118,157 +207,227 @@ impl Transfer {
             done: 0,
             errors: Vec::new(),
             finished: Vec::new(),
-            remove: Vec::new(),
+            undoable: true,
+            failures: 0,
         }
     }
-
-    /// Answer the waiting conflict, for it or for all.
+    fn error(&mut self, path: &Path, e: impl std::fmt::Display) {
+        self.errors.push(format!("{}: {e}", path.display()));
+        self.failures += 1;
+        self.undoable = false;
+    }
     pub fn resolve(&mut self, c: Choice, all: bool) {
         if all {
             self.all = Some(c);
         }
         self.once = Some(c);
     }
-
-    /// Stop: the file being written is removed.
     pub fn cancel(&mut self) {
-        if let Some(o) = self.open.take() {
-            drop(o.to);
-            let _ = std::fs::remove_file(&o.dst);
-        }
+        self.open = None;
         self.queue.clear();
-        self.remove.clear();
+        self.undoable = false;
     }
-
-    /// Work for about `budget`.
+    fn completed(&mut self, item: Item) {
+        if item.top {
+            self.finished.push((item.src, item.dst));
+        }
+    }
     pub fn step(&mut self, budget: Duration) -> Step {
         let start = Instant::now();
         while start.elapsed() < budget {
-            if let Some(o) = self.open.as_mut() {
+            if let Some(mut o) = self.open.take() {
                 let mut buf = vec![0; CHUNK];
                 match o.from.read(&mut buf) {
-                    Ok(0) => self.open = None,
-                    Ok(n) => {
-                        if let Err(e) = o.to.write_all(&buf[..n]) {
-                            self.errors.push(format!("{}: {e}", o.dst.display()));
-                            let dst = o.dst.clone();
-                            self.open = None;
-                            let _ = std::fs::remove_file(dst);
-                        } else {
-                            self.done += n as u64;
+                    Ok(0) => {
+                        // Flush staging writes before publishing the file.
+                        let result =
+                            o.to.flush()
+                                .and_then(|_| set_mode(&o.temp, o.mode))
+                                .and_then(|_| publish_file(&o.temp, &o.item.dst, o.replacing));
+                        if let Err(e) = result {
+                            self.error(&o.item.dst, e);
+                            continue;
                         }
+                        if self.kind == OpKind::Move
+                            && let Err(e) = std::fs::remove_file(&o.item.src)
+                        {
+                            self.error(&o.item.src, e);
+                            continue;
+                        }
+                        let item = Item { src: o.item.src.clone(), dst: o.item.dst.clone(), top: o.item.top };
+                        self.completed(item);
                     }
-                    Err(e) => {
-                        self.errors.push(format!("{}: {e}", o.dst.display()));
-                        self.open = None;
-                    }
+                    Ok(n) => match o.to.write_all(&buf[..n]) {
+                        Ok(()) => {
+                            self.done += n as u64;
+                            self.open = Some(o);
+                        }
+                        Err(e) => self.error(&o.item.dst, e),
+                    },
+                    Err(e) => self.error(&o.item.src, e),
                 }
                 continue;
             }
-            let Some(item) = self.queue.pop_front() else {
-                for p in std::mem::take(&mut self.remove).into_iter().rev() {
-                    if let Err(e) = remove_any(&p) {
-                        self.errors.push(format!("{}: {e}", p.display()));
+            match self.queue.pop_front() {
+                None => return Step::Done,
+                Some(Task::Item(item)) => {
+                    if let Some(s) = self.item(item) {
+                        return s;
                     }
                 }
-                return Step::Done;
-            };
-            if let Some(s) = self.item(item) {
-                return s;
+                Some(Task::Directory { item, mode, created, failures }) => {
+                    if created && let Err(e) = set_mode(&item.dst, mode) {
+                        self.error(&item.dst, e);
+                    }
+                    if failures != self.failures {
+                        continue;
+                    }
+                    if self.kind == OpKind::Move
+                        && let Err(e) = std::fs::remove_dir(&item.src)
+                    {
+                        self.error(&item.src, e);
+                        continue;
+                    }
+                    self.completed(item);
+                }
             }
         }
         Step::Working
     }
-
-    /// Start one item; `Some` to stop stepping.
     fn item(&mut self, mut it: Item) -> Option<Step> {
-        let err = |e: std::io::Error, p: &Path| format!("{}: {e}", p.display());
-        let Ok(meta) = std::fs::symlink_metadata(&it.src) else {
-            self.errors.push(format!("{}: gone", it.src.display()));
-            return None;
-        };
-        if it.top {
-            if meta.is_dir() && it.dst.starts_with(&it.src) {
-                self.errors.push(format!("{}: cannot go into itself", it.src.display()));
+        let meta = match std::fs::symlink_metadata(&it.src) {
+            Ok(m) => m,
+            Err(e) => {
+                self.error(&it.src, e);
                 return None;
             }
-            if it.src == it.dst {
-                // Copying into its own directory: a new name.
-                if self.kind == OpKind::Move {
-                    return None;
-                }
-                it.dst = unique(&it.dst);
-            } else if let Ok(dm) = std::fs::symlink_metadata(&it.dst) {
-                let Some(c) = self.once.take().or(self.all) else {
-                    let dst = it.dst.clone();
-                    self.queue.push_front(it);
-                    return Some(Step::Conflict(dst));
-                };
-                match c {
-                    Choice::Skip => return None,
-                    Choice::Rename => it.dst = unique(&it.dst),
-                    // Directories merge; anything else is replaced.
-                    Choice::Overwrite if dm.is_dir() && meta.is_dir() => {}
-                    Choice::Overwrite => {
-                        if let Err(e) = remove_any(&it.dst) {
-                            self.errors.push(err(e, &it.dst));
-                            return None;
-                        }
-                    }
-                }
+        };
+        if it.src == it.dst {
+            if self.kind == OpKind::Move {
+                return None;
             }
-            if self.kind == OpKind::Move && std::fs::symlink_metadata(&it.dst).is_err() {
-                match std::fs::rename(&it.src, &it.dst) {
-                    Ok(()) => {
-                        self.finished.push((it.src, it.dst));
-                        return None;
-                    }
-                    // Another file system: copy, then remove.
-                    Err(_) => {
-                        self.total += size_of(&it.src, &mut 200_000);
-                        self.remove.push(it.src.clone());
-                    }
-                }
-            } else if self.kind == OpKind::Move {
-                self.remove.push(it.src.clone());
-                self.total += size_of(&it.src, &mut 200_000);
-            }
-            self.finished.push((it.src.clone(), it.dst.clone()));
+            it.dst = unique(&it.dst);
         }
         if meta.is_dir() {
-            if let Err(e) = std::fs::create_dir(&it.dst)
-                && e.kind() != std::io::ErrorKind::AlreadyExists
-            {
-                self.errors.push(err(e, &it.dst));
+            match (it.src.canonicalize(), destination_path(&it.dst)) {
+                (Ok(src), Ok(dst)) if dst.starts_with(&src) => {
+                    self.error(&it.src, tr!("copy-self"));
+                    return None;
+                }
+                (Err(e), _) | (_, Err(e)) => {
+                    self.error(&it.dst, e);
+                    return None;
+                }
+                _ => {}
+            }
+        }
+        let existing = match std::fs::symlink_metadata(&it.dst) {
+            Ok(m) => Some(m),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                self.error(&it.dst, e);
                 return None;
             }
-            let mut kids: Vec<_> = std::fs::read_dir(&it.src).into_iter().flatten().flatten().collect();
-            kids.sort_by_key(|e| e.file_name());
-            for k in kids.into_iter().rev() {
-                let n = k.file_name();
-                self.queue.push_front(Item { src: it.src.join(&n), dst: it.dst.join(&n), top: false });
+        };
+        let mut replacing = existing.is_some();
+        if existing.is_some() {
+            let Some(c) = self.once.take().or(self.all) else {
+                let dst = it.dst.clone();
+                self.queue.push_front(Task::Item(it));
+                return Some(Step::Conflict(dst));
+            };
+            match c {
+                Choice::Skip => {
+                    self.failures += 1;
+                    self.undoable = false;
+                    return None;
+                }
+                Choice::Rename => {
+                    it.dst = unique(&it.dst);
+                    replacing = false;
+                }
+                Choice::Overwrite => self.undoable = false,
             }
-        } else if meta.file_type().is_symlink() {
-            self.errors.push(format!("{}: links are not copied", it.src.display()));
-            // A move must not remove what it could not copy.
-            self.remove.retain(|r| !it.src.starts_with(r));
+        }
+        let merging = replacing && meta.is_dir() && existing.as_ref().is_some_and(|m| m.is_dir());
+        if replacing && existing.as_ref().is_some_and(|m| !m.file_type().is_symlink() && m.is_dir() != meta.is_dir()) {
+            self.error(&it.dst, tr!("copy-type-conflict"));
+            return None;
+        }
+        if self.kind == OpKind::Move && !merging && publish_file(&it.src, &it.dst, replacing).is_ok() {
+            self.completed(it);
+            return None;
+        }
+        // Cross-device moves (and directory replacements of symlinks) copy
+        // through private staging instead.
+        if meta.file_type().is_symlink() || !(meta.is_dir() || meta.is_file()) {
+            self.error(&it.src, tr!("copy-unsupported"));
+            return None;
+        }
+        let mode = match file_mode(&it.src) {
+            Ok(m) => m,
+            Err(e) => {
+                self.error(&it.src, e);
+                return None;
+            }
+        };
+        if meta.is_dir() {
+            let kids: std::io::Result<Vec<_>> = std::fs::read_dir(&it.src).and_then(|r| r.collect());
+            let mut kids = match kids {
+                Ok(k) => k,
+                Err(e) => {
+                    self.error(&it.src, e);
+                    return None;
+                }
+            };
+            if replacing
+                && !merging
+                && let Err(e) = remove_any(&it.dst)
+            {
+                self.error(&it.dst, e);
+                return None;
+            }
+            if !merging && let Err(e) = create_private(&it.dst, true) {
+                self.error(&it.dst, e);
+                return None;
+            }
+            kids.sort_by_key(|e| e.file_name());
+            for k in kids.iter().rev() {
+                let n = k.file_name();
+                self.queue.push_front(Task::Item(Item { src: it.src.join(&n), dst: it.dst.join(&n), top: false }));
+            }
+            // The completion marker must run after this subtree.
+            self.queue
+                .insert(kids.len(), Task::Directory { item: it, mode, created: !merging, failures: self.failures });
         } else {
             let from = match File::open(&it.src) {
                 Ok(f) => f,
                 Err(e) => {
-                    self.errors.push(err(e, &it.src));
+                    self.error(&it.src, e);
                     return None;
                 }
             };
-            match File::create(&it.dst) {
-                Ok(to) => self.open = Some(Open { from, to, dst: it.dst }),
-                Err(e) => self.errors.push(err(e, &it.dst)),
-            }
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let (temp, to) = loop {
+                let p = it.dst.with_file_name(format!(
+                    ".proteus-copy-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                match create_staging(&p) {
+                    Ok(to) => break (p, to),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => {
+                        self.error(&it.dst, e);
+                        return None;
+                    }
+                }
+            };
+            self.open = Some(Open { from, to, item: it, temp, mode, replacing });
         }
         None
     }
-
-    /// 0..1, if the size is known.
     pub fn progress(&self) -> Option<f32> {
         (self.total > 0).then(|| (self.done as f64 / self.total as f64).min(1.0) as f32)
     }
@@ -280,16 +439,16 @@ pub fn rename_plan(dir: &Path, names: &[String], edited: &str) -> Result<Vec<(Pa
     let lines: Vec<&str> = edited.lines().collect();
     let lines: Vec<&str> = if lines.last() == Some(&"") { lines[..lines.len() - 1].to_vec() } else { lines };
     if lines.len() != names.len() {
-        return Err(format!("{} names for {} files; nothing renamed", lines.len(), names.len()));
+        return Err(tr!("rename-count-mismatch", names = lines.len(), count = names.len()));
     }
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for (old, new) in names.iter().zip(lines) {
         if new.is_empty() || new.contains('/') || new == "." || new == ".." || new.chars().any(char::is_control) {
-            return Err(format!("bad name `{new}`; nothing renamed"));
+            return Err(tr!("rename-bad-name", name = new));
         }
         if !seen.insert(new) {
-            return Err(format!("`{new}` twice; nothing renamed"));
+            return Err(tr!("rename-duplicate", name = new));
         }
         if new != old {
             out.push((dir.join(old), dir.join(new)));
@@ -298,7 +457,7 @@ pub fn rename_plan(dir: &Path, names: &[String], edited: &str) -> Result<Vec<(Pa
     let sources: HashSet<&PathBuf> = out.iter().map(|p| &p.0).collect();
     for (_, to) in &out {
         if !sources.contains(to) && std::fs::symlink_metadata(to).is_ok() {
-            return Err(format!("{} exists; nothing renamed", to.display()));
+            return Err(tr!("rename-exists", path = to.display().to_string()));
         }
     }
     Ok(out)
@@ -357,9 +516,9 @@ pub fn trashed(trash: &Path, path: &Path) -> Option<(PathBuf, PathBuf)> {
 
 /// Put a trashed file back.
 pub fn restore(trash: &Path, path: &Path) -> Result<(), String> {
-    let (file, info) = trashed(trash, path).ok_or_else(|| format!("{}: not in the trash", path.display()))?;
+    let (file, info) = trashed(trash, path).ok_or_else(|| tr!("not-in-trash", path = path.display().to_string()))?;
     if std::fs::symlink_metadata(path).is_ok() {
-        return Err(format!("{} exists again", path.display()));
+        return Err(tr!("restore-exists", path = path.display().to_string()));
     }
     std::fs::rename(&file, path).map_err(|e| format!("{}: {e}", path.display()))?;
     let _ = std::fs::remove_file(info);
@@ -432,6 +591,148 @@ mod tests {
         assert!(!d.join("b/x.txt").exists());
         assert_eq!(t.step(Duration::from_millis(5)), Step::Done);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    fn finish(t: &mut Transfer) {
+        loop {
+            match run(t) {
+                Step::Done => return,
+                Step::Conflict(_) => t.resolve(Choice::Overwrite, true),
+                Step::Working => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn failed_staged_move_preserves_source_and_replaced_destination() {
+        let d = tmp("failure");
+        let src = d.join("a/x.txt");
+        let dst = d.join("b/x.txt");
+        std::fs::write(&dst, "previous destination").unwrap();
+        for read_error in [false, true] {
+            let mut t = Transfer::new(OpKind::Copy, vec![]);
+            t.resolve(Choice::Overwrite, true);
+            assert_eq!(t.item(Item { src: src.clone(), dst: dst.clone(), top: true }), None);
+            t.kind = OpKind::Move; // Exercise the copy fallback of a move.
+            let o = t.open.as_mut().unwrap();
+            let stage = o.temp.clone();
+            if read_error {
+                o.from = File::open(d.join("a")).unwrap();
+            } else {
+                o.to = File::options().write(true).open("/dev/full").unwrap();
+            }
+            finish(&mut t);
+            assert!(!t.errors.is_empty());
+            assert!(src.exists());
+            assert_eq!(std::fs::read_to_string(&dst).unwrap(), "previous destination");
+            assert!(!stage.exists());
+            assert!(t.finished.is_empty());
+            assert!(!t.undoable);
+        }
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn merges_replace_links_without_following_them() {
+        let d = tmp("links");
+        let outside = d.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("file"), "unrelated").unwrap();
+        std::os::unix::fs::symlink(outside.join("file"), d.join("b/x.txt")).unwrap();
+        std::os::unix::fs::symlink(&outside, d.join("b/sub")).unwrap();
+        let mut t = Transfer::new(OpKind::Copy, vec![(d.join("a"), d.join("b"))]);
+        finish(&mut t);
+        assert!(t.errors.is_empty(), "{:?}", t.errors);
+        assert_eq!(std::fs::read_to_string(outside.join("file")).unwrap(), "unrelated");
+        assert!(!outside.join("y").exists());
+        assert!(!std::fs::symlink_metadata(d.join("b/x.txt")).unwrap().file_type().is_symlink());
+        assert!(!std::fs::symlink_metadata(d.join("b/sub")).unwrap().file_type().is_symlink());
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn partial_directory_moves_keep_uncopied_files() {
+        let d = tmp("partial");
+        std::fs::write(d.join("b/x.txt"), "keep").unwrap();
+        let mut t = Transfer::new(OpKind::Move, vec![(d.join("a"), d.join("b"))]);
+        assert!(matches!(run(&mut t), Step::Conflict(_)));
+        t.resolve(Choice::Overwrite, false);
+        // A directory merge does not authorize overwriting its children.
+        assert_eq!(run(&mut t), Step::Conflict(d.join("b/x.txt")));
+        t.resolve(Choice::Skip, false);
+        finish(&mut t);
+        assert!(d.join("a/x.txt").exists());
+        assert_eq!(std::fs::read_to_string(d.join("b/x.txt")).unwrap(), "keep");
+        assert!(!t.undoable);
+        assert!(t.finished.is_empty());
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn merged_moves_do_not_offer_whole_directory_undo() {
+        let d = tmp("undo-merge");
+        std::fs::write(d.join("b/existing"), "unrelated").unwrap();
+        let mut t = Transfer::new(OpKind::Move, vec![(d.join("a"), d.join("b"))]);
+        finish(&mut t);
+        assert!(t.errors.is_empty());
+        assert_eq!(t.finished.len(), 1);
+        assert!(!t.undoable);
+        assert_eq!(std::fs::read_to_string(d.join("b/existing")).unwrap(), "unrelated");
+        assert!(!d.join("a").exists());
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn staged_copies_preserve_private_modes_and_executable_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tmp("modes");
+        std::fs::set_permissions(d.join("a"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(d.join("a/x.txt"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(d.join("a/sub/y"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut t = Transfer::new(OpKind::Copy, vec![(d.join("a"), d.join("b/a"))]);
+        finish(&mut t);
+        assert!(t.errors.is_empty(), "{:?}", t.errors);
+        assert_eq!(file_mode(&d.join("b/a")).unwrap(), 0o700);
+        assert_eq!(file_mode(&d.join("b/a/x.txt")).unwrap(), 0o600);
+        assert_eq!(file_mode(&d.join("b/a/sub/y")).unwrap(), 0o700);
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn rejects_copy_into_source_via_symlink_alias() {
+        let d = tmp("alias");
+        std::os::unix::fs::symlink(d.join("a"), d.join("alias")).unwrap();
+        let mut t = Transfer::new(OpKind::Copy, vec![(d.join("a"), d.join("alias/new"))]);
+        finish(&mut t);
+        assert_eq!(t.errors.len(), 1);
+        assert!(!d.join("a/new").exists());
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn new_destinations_are_not_overwritten_if_created_during_copy() {
+        let d = tmp("new-destination");
+        let src = d.join("a/x.txt");
+        let dst = d.join("b/new.txt");
+        let mut t = Transfer::new(OpKind::Copy, vec![]);
+        t.item(Item { src: src.clone(), dst: dst.clone(), top: true });
+        std::fs::write(&dst, "created concurrently").unwrap();
+        finish(&mut t);
+        assert!(!t.errors.is_empty());
+        assert!(src.exists());
+        assert_eq!(std::fs::read_to_string(dst).unwrap(), "created concurrently");
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn type_conflicts_do_not_delete_either_tree() {
+        let d = tmp("type-conflict");
+        let mut t = Transfer::new(OpKind::Move, vec![(d.join("a/x.txt"), d.join("a/sub"))]);
+        finish(&mut t);
+        assert!(!t.errors.is_empty());
+        assert!(d.join("a/x.txt").exists());
+        assert_eq!(std::fs::read(d.join("a/sub/y")).unwrap(), b"y");
+        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]

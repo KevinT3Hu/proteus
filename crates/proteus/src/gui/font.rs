@@ -33,6 +33,7 @@ pub struct Metrics {
     pub cell_h: u32,
     /// Baseline, from the top of the cell.
     pub baseline: i32,
+    pub offset_x: f32,
     pub underline_y: i32,
     pub underline_h: u32,
     pub strike_y: i32,
@@ -179,6 +180,7 @@ impl Drop for FcConfig {
 pub struct Fonts {
     fc: Option<FcConfig>,
     family: String,
+    settings: crate::appearance::FontSettings,
     /// Font size in points; pixels = points * 96/72 * scale.
     pub size_pt: f32,
     scale: f64,
@@ -236,10 +238,25 @@ pub fn script_tag(text: &str) -> Option<u32> {
 }
 
 impl Fonts {
+    #[cfg(test)]
     pub fn new(family: &str, size_pt: f32, scale: f64) -> Result<Fonts, String> {
+        Self::with_settings(family, size_pt, scale, Default::default())
+    }
+
+    pub fn from_config(cfg: &crate::config::Config, scale: f64) -> Result<Fonts, String> {
+        Self::with_settings(&cfg.font_family, cfg.font_size, scale, cfg.font_settings.clone())
+    }
+
+    fn with_settings(
+        family: &str,
+        size_pt: f32,
+        scale: f64,
+        settings: crate::appearance::FontSettings,
+    ) -> Result<Fonts, String> {
         let mut f = Fonts {
             fc: FcConfig::new(),
             family: family.to_string(),
+            settings,
             size_pt,
             scale,
             px: 0.0,
@@ -253,7 +270,15 @@ impl Fonts {
             shaped: Default::default(),
             clusters: Default::default(),
             emoji: None,
-            metrics: Metrics { cell_w: 1, cell_h: 1, baseline: 0, underline_y: 0, underline_h: 1, strike_y: 0 },
+            metrics: Metrics {
+                cell_w: 1,
+                cell_h: 1,
+                offset_x: 0.0,
+                baseline: 0,
+                underline_y: 0,
+                underline_h: 1,
+                strike_y: 0,
+            },
         };
         f.load_primary()?;
         f.update_metrics();
@@ -282,7 +307,14 @@ impl Fonts {
         for style in 0..STYLES as u8 {
             let w = if style & BOLD != 0 { FC_WEIGHT_BOLD } else { FC_WEIGHT_REGULAR };
             let s = if style & ITALIC != 0 { FC_SLANT_ITALIC } else { FC_SLANT_ROMAN };
-            matches.push(fc.find(&self.family, w, s, &[], false));
+            let family = match style {
+                1 => self.settings.bold_family.as_deref(),
+                2 => self.settings.italic_family.as_deref(),
+                3 => self.settings.bold_italic_family.as_deref(),
+                _ => None,
+            }
+            .unwrap_or(&self.family);
+            matches.push(fc.find(family, w, s, &[], false));
         }
         let regular = matches[0].take().ok_or_else(|| format!("no font found for `{}`", self.family))?;
         self.primary[0] = self
@@ -292,7 +324,13 @@ impl Fonts {
             let want_bold = style as u8 & BOLD != 0;
             let want_italic = style as u8 & ITALIC != 0;
             // Only accept a style variant of the same family; else synthesize.
-            let m = m.filter(|m| m.family == regular.family);
+            let explicit = match style {
+                1 => self.settings.bold_family.is_some(),
+                2 => self.settings.italic_family.is_some(),
+                3 => self.settings.bold_italic_family.is_some(),
+                _ => false,
+            };
+            let m = m.filter(|m| explicit || m.family == regular.family);
             let m = m.unwrap_or(Match {
                 family: regular.family.clone(),
                 file: regular.file.clone(),
@@ -315,9 +353,20 @@ impl Fonts {
         let gm = font.glyph_metrics(&[]).scale(self.px);
         let adv = gm.advance_width(font.charmap().map('M'));
         let adv = if adv > 0.0 { adv } else { m.average_width.max(self.px / 2.0) };
-        let cell_w = adv.round().max(1.0) as u32;
-        let cell_h = (m.ascent + m.descent + m.leading).ceil().max(1.0) as u32;
-        let baseline = (m.ascent + m.leading / 2.0).round() as i32;
+        let natural_h = (m.ascent + m.descent + m.leading).ceil().max(1.0);
+        let cell_w = (self.settings.cell_width.map_or(adv as f64, |n| n * self.scale)
+            + self.settings.letter_spacing * self.scale)
+            .round()
+            .max(1.0) as u32;
+        let cell_h = (self.settings.cell_height.map_or(natural_h as f64, |n| n * self.scale)
+            + self.settings.line_spacing * self.scale)
+            .round()
+            .max(1.0) as u32;
+        let baseline = (m.ascent
+            + m.leading / 2.0
+            + (cell_h as f32 - natural_h) / 2.0
+            + (self.settings.offset_y * self.scale) as f32)
+            .round() as i32;
         let underline_h = m.stroke_size.round().max(1.0) as u32;
         let underline_y = (baseline as f32 - m.underline_offset).round() as i32;
         let strike = if m.strikeout_offset > 0.0 { m.strikeout_offset } else { m.x_height / 2.0 };
@@ -325,6 +374,7 @@ impl Fonts {
         self.metrics = Metrics {
             cell_w,
             cell_h,
+            offset_x: (self.settings.offset_x * self.scale) as f32,
             baseline,
             underline_y: underline_y.min(cell_h as i32 - underline_h as i32),
             underline_h,
@@ -577,6 +627,38 @@ impl Fonts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_cells_spacing_offsets_and_scale() {
+        let mut cfg = crate::config::Config::default();
+        cfg.font_settings.cell_width = Some(12.0);
+        cfg.font_settings.cell_height = Some(28.0);
+        cfg.font_settings.letter_spacing = 2.0;
+        cfg.font_settings.line_spacing = 4.0;
+        cfg.font_settings.offset_x = -1.0;
+        cfg.font_settings.offset_y = 2.0;
+        cfg.font_settings.bold_family = Some("monospace".into());
+        cfg.font_settings.italic_family = Some("monospace".into());
+        cfg.font_settings.bold_italic_family = Some("monospace".into());
+        let Ok(mut f) = Fonts::from_config(&cfg, 1.0) else { return };
+        let m = f.metrics();
+        assert_eq!((m.cell_w, m.cell_h, m.offset_x), (14, 32, -1.0));
+        for style in 0..4 {
+            assert!(f.glyph('A', style).is_some());
+        }
+        assert!(f.set_size(22.0, 1.5));
+        let m = f.metrics();
+        assert_eq!((m.cell_w, m.cell_h, m.offset_x), (21, 48, -1.5));
+        assert!(m.baseline > 0 && m.baseline < m.cell_h as i32);
+        // Automatic metrics remain adjustable without specifying an absolute cell size.
+        let base = Fonts::new("monospace", 11.0, 1.0).unwrap().metrics();
+        cfg.font_settings.cell_width = None;
+        cfg.font_settings.cell_height = None;
+        let f = Fonts::from_config(&cfg, 1.0).unwrap();
+        assert_eq!(f.metrics().cell_w, base.cell_w + 2);
+        assert_eq!(f.metrics().cell_h, base.cell_h + 4);
+        assert_eq!(f.metrics().baseline, base.baseline + 4);
+    }
 
     #[test]
     fn monospace_metrics_and_fallback() {

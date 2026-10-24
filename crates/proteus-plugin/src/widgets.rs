@@ -3,7 +3,7 @@
 
 use crate::types::{Attrs, Line, Span, Style};
 use crate::{fit, pad, text, width};
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
 
 /// A one-line text field with a cursor.
 #[derive(Debug, Clone, Default)]
@@ -97,23 +97,23 @@ impl TextInput {
     /// The field in `cols` cells (scrolled so the cursor shows) and the
     /// cursor's column, for `frame.cursor`.
     pub fn render(&self, cols: usize, style: Style) -> (Line, u32) {
-        let chars: Vec<char> = self.text.chars().collect();
-        let before: usize = chars[..self.cursor].iter().map(|c| c.width().unwrap_or(0)).sum();
-        // Skip characters until the cursor fits.
+        let graphemes: Vec<_> = self.text.grapheme_indices(true).collect();
+        let byte = self.byte(self.cursor);
+        let cursor = graphemes.partition_point(|(start, _)| *start < byte);
+        let mut shown: usize = graphemes[..cursor].iter().map(|(_, g)| width(g)).sum();
         let mut skip = 0;
-        let mut shown = before;
-        while shown + 1 > cols && skip < self.cursor {
-            shown -= chars[skip].width().unwrap_or(0);
+        while shown + 1 > cols && skip < cursor {
+            shown -= width(graphemes[skip].1);
             skip += 1;
         }
         let mut out = String::new();
         let mut w = 0;
-        for c in &chars[skip..] {
-            let cw = c.width().unwrap_or(0);
+        for (_, g) in &graphemes[skip..] {
+            let cw = width(g);
             if w + cw > cols {
                 break;
             }
-            out.push(*c);
+            out.push_str(g);
             w += cw;
         }
         (pad(vec![Span { text: out, style, link: None }], cols, style), shown as u32)
@@ -402,12 +402,12 @@ pub fn clip(line: &Line, cols: usize) -> Line {
         } else {
             let mut t = String::new();
             let mut n = 0;
-            for c in s.text.chars() {
-                let cw = c.width().unwrap_or(0);
+            for c in s.text.graphemes(true) {
+                let cw = width(c);
                 if n + cw > left {
                     break;
                 }
-                t.push(c);
+                t.push_str(c);
                 n += cw;
             }
             out.push(Span { text: t, ..s.clone() });
@@ -439,6 +439,11 @@ mod tests {
         let t = TextInput::new("abcdefgh");
         let (l, cur) = t.render(4, Style::PLAIN);
         assert_eq!((line_text(&l).as_str(), cur), ("fgh ", 3));
+        let t = TextInput::new("👩‍💻a");
+        let (l, cur) = t.render(4, Style::PLAIN);
+        assert_eq!((line_text(&l).as_str(), cur), ("👩‍💻a ", 3));
+        let t = TextInput { text: "a".into(), cursor: 100 };
+        assert_eq!(t.render(3, Style::PLAIN).1, 1);
     }
 
     #[test]

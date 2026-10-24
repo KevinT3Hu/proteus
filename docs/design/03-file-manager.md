@@ -5,12 +5,18 @@
 - yazi-class file manager integrated with panes, the prompt, images and AI.
 - Implemented purely as a WASM plugin (D5). Any capability it needs must be a public plugin API; no private host hooks. It is the acceptance test for doc 05.
 
+The renderer in `plugins/files/src/render.rs` implements SDK `Component` views
+for the browser, directory columns and file preview. Views declare an `Element`
+tree; the SDK lays it out and renders it. The browser stores the resulting named
+`files` region for hit testing and paging, so it has no parallel layout or canvas
+code. Navigation and file operations remain file-manager code.
+
 ## Packaging
 
-- Written in Rust, compiled to `wasm32-wasip2`, embedded in the `proteus` binary and installed as a bundled plugin.
+- Written in Rust and compiled to `wasm32-wasip2` on demand when its source path is declared in Lua config.
 - Bundled plugins have their permissions pre-granted but visible and revocable in the plugin manager like any other plugin.
 - Can be disabled or replaced by a third-party file manager.
-- Build: `crates/proteus/build.rs` builds `plugins/files` for `wasm32-wasip2` (or takes `PROTEUS_FILES_WASM=path`; `PROTEUS_NO_BUNDLE=1` or a missing target builds the terminal without it). Every start installs it if missing and updates it when the embedded build changed (`source = "bundled"` in `plugins.lock`): revoked permissions and the enabled state are kept, permissions a new version adds are granted. `+plugin remove proteus.files` is remembered (it is not installed again; `+plugin install proteus.files` brings it back); a plugin installed from elsewhere with the same id is left alone.
+- Load explicitly with `p.load_plugin { source = "~/code/proteus/plugins/files" }` (use the actual checkout path). Proteus builds and caches the component on demand; it is not embedded or automatically loaded. Cargo and the `wasm32-wasip2` Rust target are required. Removing the load call stops it; capabilities can be restricted with the source's `permissions` table.
 
 ## Surfaces
 
@@ -18,9 +24,20 @@ One plugin, three surfaces (all from the plugin UI API):
 
 | Surface | Open with | Behaviour |
 |---|---|---|
-| Sidebar | `Alt+e` / palette | Docked left or right, toggles, follows focused pane's cwd |
+| Sidebar | `Alt+e` / palette | Docked left or right; opens or focuses the existing browser; follows focused pane's cwd |
 | Pane | `E` in Pane mode / layout | Full pane, like running yazi |
 | Picker | `Alt+p` / palette | Floating popup; Enter inserts the selected path(s) into the focused pane's prompt and closes |
+
+The file manager owns these bindings. `Alt+e` opens or focuses its sidebar;
+Esc clears an active filter/selection first, then returns to the terminal;
+`q` closes the browser. No built-in sidebar focus binding is needed.
+The existing `sidebar.toggle` action ID is retained for user keymap compatibility,
+but invoking it now opens/focuses rather than closing an open sidebar.
+
+Action IDs are `sidebar.toggle`, `pane.open`, and `picker.open` under plugin
+`proteus.files`. For example, bind `plugin:proteus.files:sidebar.toggle` in
+`keys.normal` or `p.keymap`; unbind its default `alt+e` with `false` when moving
+it to another key. Palette labels remain human-readable and independent of IDs.
 
 ## Navigation & view
 
@@ -68,8 +85,8 @@ Shown in the last column (pane) or a floating preview (sidebar, toggle `p`).
 - Delete: to freedesktop Trash (host `fs.trash`); permanent delete (`D`) requires typing confirmation.
 - Selection: `Space` toggle, `v` visual range, `*` invert.
 - All operations run as background tasks with progress in the status bar; conflicts prompt (overwrite / skip / rename / apply to all).
-- Undo: last operation (rename, move, trash) can be undone with `u`.
-- Keys of this build: `C` yank to copy, `x` cut, `P` paste into the current directory, `r` rename, `n` new file (`name/`: directory), `L` link the yanked files here, `M` chmod, `d` trash, `D` delete (type `yes`), `b` bulk rename, `v` visual range. Copies run in 40 ms steps on a timer (one plugin call stays short) as a cancellable task; a conflict waits in the surface's footer (`o`/`s`/`r`, capitals for all). Moves across file systems copy, then remove. Symlinks inside copied directories are skipped with an error (WASI has no `symlink`); `L` and `M` use `ln` and `chmod`. Undo of a trash restores from the home trash only. Enter opens text files in `$EDITOR` in a split.
+- Undo: the last rename, simple move, or trash can be undone with `u`. Merged, replaced, cancelled, and partial moves do not offer undo: reversing the whole destination would move unrelated files.
+- Keys of this build: `C` yank to copy, `x` cut, `P` paste into the current directory, `r` rename, `n` new file (`name/`: directory), `L` link the yanked files here, `M` chmod, `d` trash, `D` delete (type `yes`), `b` bulk rename, `v` visual range. Copies run in 40 ms steps on a timer (one plugin call stays short) as a cancellable task; a conflict waits in the surface's footer (`o`/`s`/`r`, capitals for all). Moves across file systems stage files privately, preserve access modes, and remove each source only after its destination commits. Source directories are removed only when empty; errors leave uncopied files in place. Nested conflicts require a choice too; overwriting a symlink replaces the link itself. File/directory type mismatches fail without deleting either side. Symlinks inside copied directories are skipped with an error (WASI has no `symlink`); `L` and `M` use `ln` and `chmod`. Undo of a trash restores from the home trash only. Enter opens text files in `$EDITOR` in a split.
 
 ## Remote panes
 
@@ -99,3 +116,19 @@ Shown in the last column (pane) or a floating preview (sidebar, toggle `p`).
 
 1. Is `fs:/` read-only by default acceptable, or restrict to `~` and require opt-in for the rest? (Proposed: `~` read-write, `/` read-only.)
 2. Default sidebar side: left or right? (Proposed: left.)
+
+### Localization
+
+The file manager follows `p.config { language = "zh-CN" }` (or the terminal's
+locale environment) through the WASM SDK's Fluent support. English and Simplified
+Chinese resources live in `plugins/files/locales/en.ftl` and `zh.ftl`; other
+locales fall back to English. Resources cover action labels, surface titles,
+footer hints, prompts, operation results/errors, and preview metadata.
+
+Config reload refreshes labels, open surface titles, browser text, and cached
+previews while keeping directories, selection, filters, and in-progress file
+operations. Existing host prompts and task titles retain the text they opened
+with; subsequent prompts/results/progress use the current locale. Literal keys
+(`o/s/r`, `O/S/R`, `Esc`, `P`, etc.) and the permanent-deletion confirmation token
+`yes` stay as shown. Paths, filenames, file contents, and external-tool/OS error
+text are passed through unchanged.

@@ -1,6 +1,7 @@
 //! SDK for Proteus plugins: the generated bindings of `wit/proteus.wit`
-//! plus small helpers that run inside the plugin (styled text and the
-//! widgets: list, text input, tree, table, spinner, scroll view).
+//! plus styled text, widgets and bounded cell-based UI composition.
+//! See [`Component`] and [`ui`] for declarative views, layouts, inputs and images;
+//! [`widgets`] provides lists, text input, trees, tables, spinners and scrolling.
 //!
 //! ```ignore
 //! use proteus_plugin::{Guest, host, types::*};
@@ -19,8 +20,8 @@
 //! proteus_plugin::export!(Hello);
 //! ```
 //!
-//! Build with `cargo build --release --target wasm32-wasip2`; put the
-//! `.wasm` next to a `proteus-plugin.toml` manifest.
+//! Load the source directory with `p.load_plugin { source = "path/to/plugin" }`;
+//! Proteus builds and caches it. Prebuilt components are also supported.
 
 #![allow(clippy::too_many_arguments)]
 
@@ -33,16 +34,49 @@ mod bindings {
     });
 }
 
-pub use bindings::proteus::plugin::{host, types};
+pub use bindings::proteus::plugin::types;
+
+/// Terminal host calls. Actions use stable IDs, independent of palette labels.
+pub use serde;
+pub use serde_json;
+
+pub mod host {
+    /// Deserialize plugin-owned settings. An omitted config uses T::default().
+    /// Read during init; changing settings in init.lua restarts the instance.
+    pub fn config<T: serde::de::DeserializeOwned + Default>() -> Result<T, String> {
+        let raw = plugin_config()?;
+        if raw == "null" {
+            return Ok(T::default());
+        }
+        serde_json::from_str(&raw).map_err(|e| format!("plugin config: {e}"))
+    }
+
+    pub use super::bindings::proteus::plugin::host::*;
+
+    /// Register an action, e.g. ("sidebar.toggle", "Files: sidebar", Some("alt+e")).
+    /// Users bind it as `plugin:PLUGIN-ID:sidebar.toggle` in any Lua keymap.
+    /// The matching `Event::Action` carries "sidebar.toggle".
+    pub fn register_action(id: &str, name: &str, default_key: Option<&str>) -> Result<(), String> {
+        super::bindings::proteus::plugin::host::register_action_id(id, name, default_key)
+    }
+}
 #[doc(hidden)]
 pub use bindings::*;
 pub use bindings::{Guest, export};
 
+/// Fluent resources with typed arguments, select expressions, and CLDR plural rules.
+/// Create a catalog with `Catalog::new(&host::locale()?)`; refresh its locale
+/// on `Event::ConfigChanged` before redrawing localized UI.
+pub mod i18n;
+
+pub mod ui;
 pub mod widgets;
+pub use ui::{Component, Element};
 pub use widgets::{Column, Edit, Node, ScrollView, Spinner, Table, TextInput, Tree};
 
 use types::{Attrs, Color, Line, Span, Style};
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 impl Style {
     pub const PLAIN: Style = Style { fg: None, bg: None, attrs: Attrs::empty() };
@@ -92,7 +126,7 @@ impl Span {
 
 /// Display width in cells.
 pub fn width(s: &str) -> usize {
-    s.chars().map(|c| c.width().unwrap_or(0)).sum()
+    UnicodeWidthStr::width(s)
 }
 
 /// `s` cut to `cols` cells, with `…` if it was longer.
@@ -102,12 +136,12 @@ pub fn fit(s: &str, cols: usize) -> String {
     }
     let mut out = String::new();
     let mut w = 0;
-    for c in s.chars() {
-        let cw = c.width().unwrap_or(0);
+    for c in s.graphemes(true) {
+        let cw = width(c);
         if w + cw + 1 > cols {
             break;
         }
-        out.push(c);
+        out.push_str(c);
         w += cw;
     }
     if cols > 0 {

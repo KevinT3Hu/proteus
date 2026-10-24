@@ -36,6 +36,7 @@ pub const EVENTS: &[&str] = &[
     "command_finished",
     "bell",
     "config_changed",
+    "theme_changed",
     "block_state_changed",
 ];
 
@@ -179,7 +180,7 @@ pub trait Host {
     /// Run an action on the focused pane of the keyboard window.
     fn run_action(&mut self, action: Action);
     fn notify(&mut self, text: String, error: bool, timeout: Option<Duration>);
-    /// `p.ui.open`: a surface like a plugin's; its events come back
+    /// `p.ui.open`: a config-owned UI surface; its events come back
     /// through [`Script::surface_event`].
     fn ui_open(&mut self, _: proteus_wasm::types::SurfaceOptions) -> Result<u32, String> {
         Err("surfaces are not available here".into())
@@ -893,7 +894,7 @@ mod tests {
             r#"
             local p = require("proteus")
             p.on("command_finished", function(ev)
-              if ev.exit_code ~= 0 then
+              if ev.exit_code ~= nil and ev.exit_code ~= 0 then
                 p.notify("failed: " .. ev.command .. " in " .. ev.pane.cwd, { level = "error", timeout = 3 })
               end
               local new = ev.pane:split { dir = "right", cmd = { "htop", "-d", "5" }, cwd = "/srv" }
@@ -934,6 +935,27 @@ mod tests {
                 "notify true nil false None",
             ]
         );
+    }
+
+    #[test]
+    fn example_config_does_not_report_unknown_or_successful_exit_as_failure() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/config/init.lua");
+        let s = crate::config::load(&path, true).unwrap().script;
+        let mut h = mock();
+        let event = |code| {
+            ScriptEvent::new("command_finished")
+                .pane(1)
+                .with("command", Val::Str("fish".into()))
+                .with("exit_code", code)
+        };
+        // A nested interactive shell can finish a command block without
+        // reporting the outer command's exit status. Lua receives nil.
+        s.emit(&mut h, &event(Val::Nil));
+        s.emit(&mut h, &event(Val::Int(0)));
+        assert!(h.log.is_empty(), "{:?}", h.log);
+        s.emit(&mut h, &event(Val::Int(1)));
+        assert_eq!(h.log, ["notify Command failed: fish false None"]);
+        assert!(s.take_messages().is_empty());
     }
 
     #[test]

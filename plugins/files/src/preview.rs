@@ -1,6 +1,7 @@
 //! File previews: what kind a file is, syntax-highlighted text, image
 //! sizes and the freedesktop thumbnail cache. No host calls (testable).
 
+use crate::i18n::tr;
 use std::cell::OnceCell;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -136,18 +137,6 @@ pub fn image_size(head: &[u8]) -> Option<(u32, u32)> {
     Some((s.width as u32, s.height as u32)).filter(|&(w, h)| w > 0 && h > 0)
 }
 
-/// Cells for a `w`×`h` px image in at most `cols`×`rows` cells, keeping
-/// its shape (cells are about twice as tall as wide) and not enlarging
-/// small images beyond `cell_px` px per column.
-pub fn fit_cells((w, h): (u32, u32), cols: usize, rows: usize, cell_px: u32) -> (u32, u32) {
-    let (w, h) = (w.max(1) as f64, h.max(1) as f64);
-    let natural = (w / cell_px.max(1) as f64).ceil();
-    let c = (cols as f64).min(natural).max(1.0);
-    let r = c * h / w / 2.0;
-    let (c, r) = if r > rows as f64 { (rows as f64 * w / h * 2.0, rows as f64) } else { (c, r) };
-    ((c.round() as u32).max(1), (r.round() as u32).max(1))
-}
-
 /// An SVG drawn to PNG bytes at most `max` px on its long side.
 pub fn svg_png(data: &[u8], max: u32) -> Result<(Vec<u8>, (u32, u32)), String> {
     use resvg::{tiny_skia, usvg};
@@ -155,7 +144,7 @@ pub fn svg_png(data: &[u8], max: u32) -> Result<(Vec<u8>, (u32, u32)), String> {
     let size = tree.size();
     let scale = (max as f32 / size.width().max(size.height())).min(4.0);
     let (w, h) = (((size.width() * scale).ceil() as u32).max(1), ((size.height() * scale).ceil() as u32).max(1));
-    let mut pm = tiny_skia::Pixmap::new(w, h).ok_or("svg: bad size")?;
+    let mut pm = tiny_skia::Pixmap::new(w, h).ok_or_else(|| tr!("svg-size-error"))?;
     resvg::render(&tree, tiny_skia::Transform::from_scale(scale, scale), &mut pm.as_mut());
     Ok((pm.encode_png().map_err(|e| e.to_string())?, (w, h)))
 }
@@ -222,9 +211,6 @@ mod tests {
 
     #[test]
     fn images_and_thumbnails() {
-        assert_eq!(fit_cells((800, 400), 40, 30, 8), (40, 10));
-        assert_eq!(fit_cells((400, 800), 40, 20, 8), (20, 20));
-        assert_eq!(fit_cells((16, 16), 40, 20, 8), (2, 1));
         let png = svg_png(br#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"/>"#, 100).unwrap();
         assert_eq!(png.1, (80, 40));
         assert_eq!(image_size(&png.0), Some((80, 40)));

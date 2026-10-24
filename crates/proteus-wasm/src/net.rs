@@ -9,6 +9,9 @@ use std::time::Duration;
 
 use ureq::http;
 
+#[path = "net_transport.rs"]
+mod transport;
+
 use crate::manifest::host_allowed;
 use crate::runtime::Poster;
 use crate::runtime::types::{Event, HttpHead, HttpRequest, HttpResponse};
@@ -44,6 +47,10 @@ fn agent(global: Option<Duration>, response: Option<Duration>) -> ureq::Agent {
         .allow_non_standard_methods(true)
         .timeout_global(global)
         .timeout_recv_response(response)
+        .timeout_resolve(response)
+        .timeout_connect(response)
+        .timeout_send_request(response)
+        .timeout_send_body(response)
         .tls_config(TlsConfig::builder().root_certs(RootCerts::PlatformVerifier).build())
         .user_agent(format!("Proteus/{}", env!("CARGO_PKG_VERSION")))
         .build()
@@ -98,12 +105,24 @@ impl Streams {
             return Err(format!("at most {MAX_STREAMS} streams at a time"));
         }
         let cancel = Arc::new(AtomicBool::new(false));
+        if self.live.contains_key(&id) {
+            return Err(format!("stream {id} is still running"));
+        }
         self.live.insert(id, cancel.clone());
         std::thread::Builder::new()
             .name("plugin-http".into())
             .spawn(move || {
                 let result = (|| {
-                    let agent = agent(None, Some(timeout(req.timeout_ms)));
+                    use ureq::unversioned::resolver::DefaultResolver;
+                    use ureq::unversioned::transport::{ConnectProxyConnector, Connector, RustlsConnector};
+                    let idle = timeout(req.timeout_ms);
+                    let base = agent(None, Some(idle));
+                    let config = base.config().clone();
+                    let connector =
+                        ().chain(ConnectProxyConnector::default())
+                            .chain(transport::StreamConnector { cancel: cancel.clone(), idle })
+                            .chain(RustlsConnector::default());
+                    let agent = ureq::Agent::with_parts(config, connector, DefaultResolver::default());
                     let r = send(&agent, uri, req)?;
                     let head = HttpHead { id, status: r.status().as_u16(), headers: headers(&r) };
                     if !post.event(Event::HttpResponse(head)) {
@@ -118,7 +137,7 @@ impl Streams {
                         match body.read(&mut buf) {
                             Ok(0) => return Ok(()),
                             Ok(n) => {
-                                if !post.data(n, Event::HttpBody((id, buf[..n].to_vec()))) {
+                                if !post.data_until(n, Event::HttpBody((id, buf[..n].to_vec())), &cancel) {
                                     return Ok(());
                                 }
                             }
@@ -136,7 +155,9 @@ impl Streams {
     }
 
     pub fn cancel(&mut self, id: u32) {
-        if let Some(c) = self.live.remove(&id) {
+        // Keep cancelled workers counted until they actually release their
+        // token. Repeated cancellation cannot bypass MAX_STREAMS.
+        if let Some(c) = self.live.get(&id) {
             c.store(true, Ordering::Relaxed);
         }
     }
@@ -164,6 +185,121 @@ mod tests {
         assert!(check(&allowed, "https://user@api.example.com/").is_err());
         assert!(check(&allowed, "ftp://api.example.com/").is_err());
         assert!(check(&allowed, "file:///etc/passwd").is_err());
+    }
+
+    #[test]
+    fn cancelling_stalled_body_releases_worker_and_keeps_slot_until_exit() {
+        use std::io::Write;
+        use std::time::Instant;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (release, wait) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = [0; 4096];
+            let mut request = Vec::new();
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = socket.read(&mut buf).unwrap();
+                assert!(n > 0);
+                request.extend_from_slice(&buf[..n]);
+            }
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n").unwrap();
+            let _ = wait.recv_timeout(Duration::from_secs(3));
+        });
+        let url = format!("http://{addr}/");
+        let req =
+            HttpRequest { method: "GET".into(), url: url.clone(), headers: vec![], body: vec![], timeout_ms: 5_000 };
+        let (post, events) = Poster::testing();
+        let mut streams = Streams::default();
+        streams.start(1, check(&[addr.to_string()], &url).unwrap(), req, post).unwrap();
+        assert!(matches!(
+            events.recv_timeout(Duration::from_secs(1)).unwrap(),
+            crate::runtime::ToPlugin::Event(Event::HttpResponse(_))
+        ));
+        // Ensure the worker is waiting for the body, not just checking its flag.
+        std::thread::sleep(Duration::from_millis(20));
+        streams.cancel(1);
+        assert_eq!(streams.live.len(), 1, "a cancelled worker still consumes a slot until it exits");
+        let end = Instant::now() + Duration::from_secs(1);
+        while Arc::strong_count(streams.live.get(&1).unwrap()) > 1 && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let exited = Arc::strong_count(streams.live.get(&1).unwrap()) == 1;
+        let _ = release.send(());
+        server.join().unwrap();
+        assert!(exited, "cancel must interrupt a body read independently of the server");
+    }
+
+    #[test]
+    fn cancellation_interrupts_a_stalled_tls_handshake() {
+        use std::time::Instant;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (accepted, wait_accept) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            accepted.send(()).unwrap();
+            let _ = wait.recv_timeout(Duration::from_secs(3));
+            drop(socket);
+        });
+        let url = format!("https://{addr}/");
+        let req =
+            HttpRequest { method: "GET".into(), url: url.clone(), headers: vec![], body: vec![], timeout_ms: 5_000 };
+        let (post, _events) = Poster::testing();
+        let mut streams = Streams::default();
+        streams.start(1, check(&[addr.to_string()], &url).unwrap(), req, post).unwrap();
+        wait_accept.recv_timeout(Duration::from_secs(1)).unwrap();
+        streams.cancel(1);
+        let end = Instant::now() + Duration::from_secs(1);
+        while Arc::strong_count(streams.live.get(&1).unwrap()) > 1 && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let exited = Arc::strong_count(streams.live.get(&1).unwrap()) == 1;
+        let _ = release.send(());
+        server.join().unwrap();
+        assert!(exited, "cancellation must interrupt TLS I/O too");
+    }
+
+    #[test]
+    fn stream_idle_timeout_is_reset_by_progress() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = [0; 4096];
+            let mut request = Vec::new();
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = socket.read(&mut buf).unwrap();
+                assert!(n > 0);
+                request.extend_from_slice(&buf[..n]);
+            }
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\na").unwrap();
+            for byte in [b"b", b"c"] {
+                std::thread::sleep(Duration::from_millis(80));
+                socket.write_all(byte).unwrap();
+            }
+        });
+        let url = format!("http://{addr}/");
+        let req =
+            HttpRequest { method: "GET".into(), url: url.clone(), headers: vec![], body: vec![], timeout_ms: 140 };
+        let (post, events) = Poster::testing();
+        let mut streams = Streams::default();
+        streams.start(1, check(&[addr.to_string()], &url).unwrap(), req, post).unwrap();
+        let mut body = Vec::new();
+        loop {
+            match events.recv_timeout(Duration::from_secs(2)).unwrap() {
+                crate::runtime::ToPlugin::Event(Event::HttpBody((_, data))) => body.extend(data),
+                crate::runtime::ToPlugin::Event(Event::HttpDone((_, error))) => {
+                    assert_eq!(error, None);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(body, b"abc");
+        server.join().unwrap();
     }
 
     /// A request to a local server is answered; redirects are returned as is.

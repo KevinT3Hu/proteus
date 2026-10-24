@@ -97,6 +97,24 @@ impl Terminal {
     /// Feed bytes to `vte`, cutting out APC strings (kitty graphics) on the
     /// way. `ESC _` and the terminating `ESC \` still reach `vte` so its state
     /// machine stays in sync.
+    // vte 0.15 can consume an extra ASCII byte when completing a partial
+    // UTF-8 scalar from a previous call. Feeding the first three bytes singly
+    // completes any pending scalar without giving that path surplus input.
+    // The rest retains the parser's fast bulk path; no buffering or copies.
+    fn advance_parser(&mut self, parser: &mut vte::Parser, bytes: &[u8]) {
+        let mut prefix = bytes.len().min(3);
+        // Do not introduce a new split inside a scalar at our bulk boundary.
+        while prefix < bytes.len().min(6) && bytes[prefix] & 0xc0 == 0x80 {
+            prefix += 1;
+        }
+        for byte in &bytes[..prefix] {
+            parser.advance(self, std::slice::from_ref(byte));
+        }
+        if prefix < bytes.len() {
+            parser.advance(self, &bytes[prefix..]);
+        }
+    }
+
     pub(super) fn feed(&mut self, parser: &mut vte::Parser, bytes: &[u8]) {
         let mut start = 0;
         let mut i = 0;
@@ -112,7 +130,7 @@ impl Terminal {
                 Apc::Esc => {
                     let b = bytes[i];
                     if b == b'_' {
-                        parser.advance(self, &bytes[start..=i]);
+                        self.advance_parser(parser, &bytes[start..=i]);
                         start = i + 1;
                         self.apc = Apc::Body;
                         self.apc_buf.clear();
@@ -140,12 +158,12 @@ impl Terminal {
                     self.apc_buf = data;
                     self.apc_buf.clear();
                     if bytes[i] == b'\\' {
-                        parser.advance(self, b"\x1b\\");
+                        self.advance_parser(parser, b"\x1b\\");
                         start = i + 1;
                         self.apc = Apc::Ground;
                     } else {
                         // ESC aborted the string; it starts a new sequence.
-                        parser.advance(self, b"\x1b");
+                        self.advance_parser(parser, b"\x1b");
                         start = i;
                         self.apc = Apc::Esc;
                         continue;
@@ -155,7 +173,7 @@ impl Terminal {
             i += 1;
         }
         if start < bytes.len() && matches!(self.apc, Apc::Ground | Apc::Esc) {
-            parser.advance(self, &bytes[start..]);
+            self.advance_parser(parser, &bytes[start..]);
         }
     }
 

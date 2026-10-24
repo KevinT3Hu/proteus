@@ -33,9 +33,9 @@ impl Layout {
 
     pub fn label(self) -> &'static str {
         match self {
-            Layout::List => "list",
-            Layout::Tree => "tree",
-            Layout::Miller => "columns",
+            Layout::List => "layout-list",
+            Layout::Tree => "layout-tree",
+            Layout::Miller => "layout-columns",
         }
     }
 }

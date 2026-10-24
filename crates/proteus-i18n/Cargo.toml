@@ -1,0 +1,14 @@
+[package]
+name = "proteus-i18n"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.97"
+
+[dependencies]
+fluent-bundle = "=0.16.0"
+# Matches fluent-bundle's unic-langid-based negotiation API.
+fluent-langneg = "=0.13.1"
+unic-langid = "=0.9.6"
+
+[lints]

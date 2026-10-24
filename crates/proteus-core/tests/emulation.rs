@@ -394,3 +394,36 @@ fn grapheme_clustering_default_from_config() {
     let t = proteus_core::Terminal::new(10, 2, proteus_core::Config::default());
     assert!(!t.mode().contains(proteus_core::TermMode::GRAPHEME_CLUSTERING));
 }
+
+#[test]
+fn insert_before_wide_char_preserves_pair() {
+    let mut t = proteus_core::Terminal::new(8, 2, Default::default());
+    t.advance("中x\x1b[1G\x1b[@".as_bytes());
+    assert_eq!(t.row_text(0), " 中x");
+    t.advance("\x1b[1G\x1b[4hA".as_bytes());
+    assert_eq!(t.row_text(0), "A 中x");
+}
+
+#[test]
+fn theme_reload_preserves_osc_and_reset_restores_configured_palette() {
+    use proteus_core::color::Palette;
+    let mut t = term(8, 2);
+    feed(&mut t, "hello\x1b]11;#123456\x07\x1b]4;4;#abcdef\x07");
+    let fg = Rgb::new(10, 20, 30);
+    let bg = Rgb::new(240, 230, 220);
+    let mut palette = Palette::new([fg; 16], fg, bg, Some(fg));
+    palette.set_base_indexed(255, bg);
+    t.take_damage();
+    t.rebase_palette(&palette);
+    assert!(t.take_damage().full);
+    assert_eq!(t.row_text(0), "hello");
+    assert_eq!(t.palette().foreground(), fg);
+    assert_eq!(t.palette().background(), Rgb::new(0x12, 0x34, 0x56));
+    assert_eq!(t.palette().indexed(4), Rgb::new(0xab, 0xcd, 0xef));
+    feed(&mut t, "\x1b]111\x07\x1b]104;4\x07");
+    assert_eq!(t.palette().background(), bg);
+    assert_eq!(t.palette().indexed(4), fg);
+    feed(&mut t, "\x1bc");
+    assert_eq!(t.palette().indexed(255), bg);
+    assert_eq!(t.palette().cursor(), Some(fg));
+}

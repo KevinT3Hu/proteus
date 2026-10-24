@@ -11,7 +11,7 @@ use proteus_plugin::types::{
 };
 use proteus_plugin::{Guest, List, fit, host, pad, text, types};
 
-const TOGGLE: &str = "Pane list: toggle";
+const TOGGLE: &str = "sidebar.toggle";
 const WIDTH: u32 = 28;
 
 #[derive(Default)]
@@ -21,6 +21,7 @@ struct State {
     panes: Vec<PaneInfo>,
     list: List,
     theme: Option<Theme>,
+    i18n: proteus_plugin::i18n::Catalog,
 }
 
 thread_local! {
@@ -33,7 +34,9 @@ fn refresh(s: &mut State) {
     s.panes = host::list_panes().unwrap_or_default();
     s.list.len = s.panes.len();
     let n = s.panes.len();
-    let _ = host::set_status(types::StatusSide::Right, &format!("{n} pane{}", if n == 1 { "" } else { "s" }));
+    let mut args = proteus_plugin::i18n::FluentArgs::new();
+    args.set("count", n);
+    let _ = host::set_status(types::StatusSide::Right, &s.i18n.format("panes-count", Some(&args)).unwrap_or_default());
 }
 
 fn draw(s: &mut State) {
@@ -61,9 +64,9 @@ fn draw(s: &mut State) {
         lines.push(pad(vec![types::Span { text: dir, style: sub, link: None }], cols, sub));
     }
     if s.panes.is_empty() {
-        lines.push(vec![text("no panes").fg(dim)]);
+        lines.push(vec![text(s.i18n.format("panes-empty", None).unwrap_or_default()).fg(dim)]);
     }
-    let _ = host::draw(id, &Frame { lines, cursor: None, background: None, images: vec![] });
+    let _ = host::draw(id, &Frame { lines, cursor: None, background: None, images: vec![], accessibility: vec![] });
 }
 
 fn home(p: &str) -> String {
@@ -80,7 +83,7 @@ fn toggle(s: &mut State) {
     }
     let opts = SurfaceOptions {
         kind: SurfaceKind::SidebarLeft,
-        title: "Panes".into(),
+        title: s.i18n.format("panes-title", None).unwrap_or_default(),
         cols: WIDTH,
         rows: 0,
         focus: true,
@@ -102,7 +105,12 @@ fn toggle(s: &mut State) {
 
 impl Guest for PaneList {
     fn init() -> Result<(), String> {
-        host::register_action(TOGGLE, Some("alt+p"))?;
+        STATE.with_borrow_mut(|s| -> Result<(), String> {
+            s.i18n = proteus_plugin::i18n::catalog()?;
+            s.i18n.add_resource("en", include_str!("../locales/en.ftl"))?;
+            s.i18n.add_resource("zh", include_str!("../locales/zh.ftl"))?;
+            host::register_action(TOGGLE, &s.i18n.format("panes-toggle", None)?, Some("alt+p"))
+        })?;
         STATE.with_borrow_mut(refresh);
         host::log("pane list ready");
         Ok(())
@@ -113,6 +121,15 @@ impl Guest for PaneList {
             match event {
                 Event::Action(a) if a == TOGGLE => return toggle(s),
                 Event::ThemeChanged(t) => s.theme = Some(t),
+                Event::ConfigChanged => {
+                    let _ = proteus_plugin::i18n::sync(&mut s.i18n);
+                    let _ = host::register_action(
+                        TOGGLE,
+                        &s.i18n.format("panes-toggle", None).unwrap_or_default(),
+                        Some("alt+p"),
+                    );
+                    refresh(s);
+                }
                 Event::PaneOpened(_)
                 | Event::PaneClosed(_)
                 | Event::FocusChanged(_)
@@ -166,7 +183,11 @@ impl Guest for PaneList {
                     s.surface = None;
                     return;
                 }
-                UiEvent::Text(_) | UiEvent::Preedit(_) | UiEvent::Focus(_) | UiEvent::Drop(_) => return,
+                UiEvent::Accessibility(_)
+                | UiEvent::Text(_)
+                | UiEvent::Preedit(_)
+                | UiEvent::Focus(_)
+                | UiEvent::Drop(_) => return,
             }
             draw(s);
         })

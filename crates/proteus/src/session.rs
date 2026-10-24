@@ -20,6 +20,15 @@ pub fn spawn_pty(opts: &SpawnOptions) -> io::Result<(Pty, Option<Shell>)> {
     }
     let terminfo = shell::data_dir().and_then(|d| shell::install_terminfo(&d.join("terminfo")));
     shell::apply_term(&mut spec, terminfo.as_deref());
+    if let Some(term) = &opts.term {
+        spec.set_env("TERM", term);
+    }
+    // Do not inherit a parent terminal's control endpoint in a nested instance.
+    if let Some(path) = &opts.ipc_socket {
+        spec.set_env("PROTEUS_SOCKET", path);
+    } else {
+        spec.env.push(("PROTEUS_SOCKET".into(), None));
+    }
     let mut sh = None;
     if opts.integration {
         let dir = shell::runtime_dir().join("shell-integration");
@@ -52,6 +61,8 @@ pub struct SpawnOptions {
     /// Program and arguments; `None` runs the user's shell.
     pub command: Option<Vec<OsString>>,
     pub integration: bool,
+    pub ipc_socket: Option<PathBuf>,
+    pub term: Option<String>,
     /// Working directory; `None` inherits ours.
     pub cwd: Option<PathBuf>,
     pub cols: u16,

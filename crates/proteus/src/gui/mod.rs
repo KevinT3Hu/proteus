@@ -5,13 +5,16 @@
 //! reader thread, and timers. Frames are drawn only when something changed
 //! and only after the compositor's frame callback (no busy loop).
 
+mod accessibility;
 mod blocks;
 mod chrome;
+mod config_ui;
 mod copy;
 mod font;
 mod hint;
 mod images;
 mod ime;
+mod ipc;
 mod keys;
 mod notify;
 mod pane;
@@ -108,8 +111,6 @@ const APP_NAME: &str = "Proteus";
 /// How long the visual bell tints a pane.
 const FLASH: Duration = Duration::from_millis(120);
 const MIMES: [&str; 4] = ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain", "STRING"];
-/// Padding around the grid, logical pixels.
-const PAD: f64 = 4.0;
 /// Longest time a synchronized update (mode 2026) may hold a frame.
 const SYNC_TIMEOUT: Duration = Duration::from_millis(150);
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
@@ -149,6 +150,10 @@ enum Prompt {
 }
 
 pub(crate) enum Msg {
+    Ipc(crate::ipc::Call),
+    Accessibility(WinId, Option<accesskit::ActionRequest>),
+    GpuLost(WinId),
+    Exported(Result<(), String>),
     Pty(PaneId, Vec<u8>),
     PtyClosed(PaneId),
     Clipboard(ClipTarget, String),
@@ -159,6 +164,7 @@ pub(crate) enum Msg {
     ImagesDecoded(PaneId),
     /// A plugin called the host, started, stopped or failed.
     Plugin(proteus_wasm::Key, proteus_wasm::FromPlugin),
+    PluginsResolved(u64, Vec<Result<proteus_wasm::Resolved, String>>),
     /// A `text/uri-list` dropped on a plugin surface.
     Dropped(u32, String),
 }
@@ -352,6 +358,7 @@ pub(crate) type WinId = u32;
 struct Win {
     // Drop order matters: the wgpu surface must go before the window.
     renderer: Renderer,
+    accessibility: Option<accesskit_unix::Adapter>,
     window: Window,
     id: WinId,
     viewport: Option<WpViewport>,
@@ -362,6 +369,7 @@ struct Win {
     /// Logical window size.
     size: (u32, u32),
     configured: bool,
+    suspended: bool,
     frame_pending: bool,
     dirty: bool,
     sync_since: Option<Instant>,
@@ -422,6 +430,7 @@ struct App {
     /// Window with keyboard focus (keys and IME go there).
     kbd_win: Option<WinId>,
     instance: wgpu::Instance,
+    ipc_socket: Option<PathBuf>,
     xdg: XdgShell,
     viewporter: Option<WpViewporter>,
     fractional_manager: Option<WpFractionalScaleManagerV1>,
@@ -492,6 +501,28 @@ struct App {
 
 /// Wayland and GPU objects of a new window.
 #[allow(clippy::too_many_arguments)]
+fn gpu_surface(
+    instance: &wgpu::Instance,
+    conn: &Connection,
+    window: &Window,
+) -> Result<wgpu::Surface<'static>, String> {
+    let raw_display = RawDisplayHandle::Wayland(WaylandDisplayHandle::new(
+        NonNull::new(conn.backend().display_ptr().cast()).ok_or("no Wayland display")?,
+    ));
+    let raw_window = RawWindowHandle::Wayland(WaylandWindowHandle::new(
+        NonNull::new(window.wl_surface().id().as_ptr().cast()).ok_or("no surface")?,
+    ));
+    // SAFETY: the display (kept alive by `conn`) and the surface (owned by
+    // `window`) outlive the wgpu surface, which `Win` drops first.
+    unsafe {
+        instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+            raw_display_handle: Some(raw_display),
+            raw_window_handle: raw_window,
+        })
+    }
+    .map_err(|e| format!("cannot create GPU surface: {e}"))
+}
+
 fn make_win(
     id: WinId,
     conn: &Connection,
@@ -518,29 +549,15 @@ fn make_win(
     window.set_min_size(Some((100, 60)));
     window.commit();
 
-    let fonts = Fonts::new(&cfg.font_family, cfg.font_size, 1.0).map_err(err)?;
+    let fonts = Fonts::from_config(cfg, 1.0).map_err(err)?;
     let m = fonts.metrics();
-    let pad = (PAD * 2.0) as u32;
-    let size = logical.unwrap_or((80 * m.cell_w + pad, 24 * m.cell_h + pad));
-    let raw_display = RawDisplayHandle::Wayland(WaylandDisplayHandle::new(
-        NonNull::new(conn.backend().display_ptr().cast()).ok_or_else(|| err("no Wayland display".into()))?,
-    ));
-    let raw_window = RawWindowHandle::Wayland(WaylandWindowHandle::new(
-        NonNull::new(window.wl_surface().id().as_ptr().cast()).ok_or_else(|| err("no surface".into()))?,
-    ));
-    // SAFETY: the display (kept alive by `conn`) and the surface (owned by
-    // `window`) outlive the wgpu surface, which `Win` drops first.
-    let wsurface = unsafe {
-        instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
-            raw_display_handle: Some(raw_display),
-            raw_window_handle: raw_window,
-        })
-    }
-    .map_err(|e| err(format!("cannot create GPU surface: {e}")))?;
-    let mut renderer = Renderer::new(instance, wsurface, size).map_err(err)?;
+    let size = logical.unwrap_or_else(|| cfg.window_size((m.cell_w, m.cell_h), 1.0));
+    let wsurface = gpu_surface(instance, conn, &window).map_err(err)?;
+    let mut renderer = Renderer::new(instance, wsurface.into(), size).map_err(err)?;
     renderer.images.budget = cfg.graphics.gpu_memory;
     Ok(Win {
         renderer,
+        accessibility: None,
         window,
         id,
         viewport,
@@ -550,6 +567,7 @@ fn make_win(
         scale: 1.0,
         size,
         configured: false,
+        suspended: false,
         frame_pending: false,
         dirty: true,
         sync_since: None,
@@ -576,6 +594,17 @@ fn make_win(
     })
 }
 
+/// Inspect compositor capabilities without creating windows or PTYs.
+pub fn diagnostic_protocols() -> Result<Vec<String>, String> {
+    let conn = Connection::connect_to_env().map_err(|e| e.to_string())?;
+    let (globals, _queue) = registry_queue_init::<App>(&conn).map_err(|e| e.to_string())?;
+    let mut protocols: Vec<_> =
+        globals.contents().clone_list().into_iter().map(|g| format!("{} v{}", g.interface, g.version)).collect();
+    protocols.sort();
+    protocols.dedup();
+    Ok(protocols)
+}
+
 /// Run the GUI. `command` runs in the first pane instead of the shell;
 /// `layout` opens a layout file instead.
 pub fn run(
@@ -585,6 +614,7 @@ pub fn run(
     config_error: Option<String>,
     command: Option<Vec<OsString>>,
     layout: Option<LayoutSpec>,
+    listen: Option<PathBuf>,
 ) -> io::Result<i32> {
     let err = |e: String| io::Error::other(e);
     let crate::config::Loaded { config: cfg, script } = loaded;
@@ -628,12 +658,20 @@ pub fn run(
     let (sender, rx) = channel::channel();
     handle
         .insert_source(rx, |ev, _, app: &mut App| match ev {
+            channel::Event::Msg(Msg::Exported(result)) => match result {
+                Ok(()) => app.toast(app.cfg.i18n.t("notice-scrollback-exported", &[]), false, None),
+                Err(e) => app.toast(e, true, None),
+            },
+            channel::Event::Msg(Msg::Accessibility(window, action)) => app.accessibility_event(window, action),
+            channel::Event::Msg(Msg::Ipc(call)) => app.ipc_call(call),
+            channel::Event::Msg(Msg::GpuLost(id)) => app.recover_gpu(id),
             channel::Event::Msg(Msg::Pty(id, bytes)) => app.pty_output(id, &bytes),
             channel::Event::Msg(Msg::PtyClosed(id)) => app.close_pane(id),
             channel::Event::Msg(Msg::Clipboard(target, text)) => app.clipboard_received(target, text),
             channel::Event::Msg(Msg::NotifyActivated(pane, token)) => app.notification_clicked(pane, token),
             channel::Event::Msg(Msg::ImagesDecoded(id)) => app.pty_output(id, &[]),
             channel::Event::Msg(Msg::Plugin(key, m)) => app.plugin_msg(key, m),
+            channel::Event::Msg(Msg::PluginsResolved(generation, results)) => app.plugins_resolved(generation, results),
             channel::Event::Msg(Msg::Dropped(s, list)) => app.surface_dropped(s, &list),
             channel::Event::Closed => app.exit = true,
         })
@@ -649,6 +687,7 @@ pub fn run(
         next_win: 2,
         kbd_win: None,
         instance,
+        ipc_socket: None,
         xdg,
         viewporter,
         fractional_manager,
@@ -701,6 +740,18 @@ pub fn run(
         sc: scripting::Scripting::default(),
         pl: plugins::Plugins::default(),
     };
+    let _ipc_server = if let Some(path) = listen.or_else(|| app.cfg.ipc_socket.clone()) {
+        let path = if path.is_absolute() { path } else { std::env::current_dir()?.join(path) };
+        let sender = app.sender.clone();
+        let server = crate::ipc::Server::start(path, move |call| sender.send(Msg::Ipc(call)).is_ok())?;
+        eprintln!("proteus: control socket {}", server.path.display());
+        app.ipc_socket = Some(server.path.clone());
+        Some(server)
+    } else {
+        None
+    };
+    app.setup_accessibility();
+    app.watch_gpu();
     app.sc.config_path = config_path;
     app.sc.overrides = overrides;
     app.install_script(script);
@@ -846,6 +897,43 @@ impl App {
         }
     }
 
+    fn watch_gpu(&self) {
+        let sender = self.sender.clone();
+        let id = self.w.id;
+        let lost = self.w.renderer.lost.clone();
+        self.w.renderer.device.set_device_lost_callback(move |reason, message| {
+            if reason != wgpu::DeviceLostReason::Destroyed {
+                lost.store(true, std::sync::atomic::Ordering::Release);
+                eprintln!("proteus: GPU device lost: {message}");
+                let _ = sender.send(Msg::GpuLost(id));
+            }
+        });
+    }
+
+    fn recover_gpu(&mut self, id: WinId) {
+        if !self.activate(id) {
+            return;
+        }
+        let result = self.w.renderer.recover(&self.instance, self.physical());
+        match result {
+            Ok(mut renderer) => {
+                renderer.images.budget = self.cfg.graphics.gpu_memory;
+                self.w.renderer = renderer;
+                self.watch_gpu();
+                self.w.frame_pending = false;
+                self.w.dirty = true;
+                eprintln!("proteus: GPU recovered with {}", self.w.renderer.adapter_info);
+            }
+            Err(e) => {
+                eprintln!("proteus: GPU recovery failed: {e}; retrying in two seconds");
+                let _ = self.handle.insert_source(Timer::from_duration(Duration::from_secs(2)), move |_, _, app| {
+                    app.recover_gpu(id);
+                    TimeoutAction::Drop
+                });
+            }
+        }
+    }
+
     /// Open a new (empty) window and make it current. Its size follows the
     /// current window.
     fn new_window(&mut self) -> io::Result<WinId> {
@@ -861,10 +949,12 @@ impl App {
             self.fractional_manager.as_ref(),
             &self.instance,
             &self.cfg,
-            Some(self.w.size),
+            (self.cfg.window == Default::default()).then_some(self.w.size),
         )?;
         self.parked.push(win);
         self.activate(id);
+        self.setup_accessibility();
+        self.watch_gpu();
         Ok(id)
     }
 
@@ -892,6 +982,7 @@ impl App {
     fn draw_all(&mut self) {
         for id in self.window_ids() {
             if self.activate(id) {
+                self.update_accessibility();
                 self.draw();
             }
         }
@@ -899,6 +990,10 @@ impl App {
     }
 
     fn snapshot(&mut self, path: &std::path::Path) {
+        if self.w.renderer.lost.load(std::sync::atomic::Ordering::Acquire) {
+            eprintln!("proteus: snapshot unavailable while the GPU is recovering");
+            return;
+        }
         let mut parts = self.frame_parts();
         // PROTEUS_PREEDIT=text[@byte] previews a composition (testing aid).
         if let Some(pre) = std::env::var("PROTEUS_PREEDIT").ok().filter(|s| !s.is_empty()) {
@@ -927,7 +1022,15 @@ impl App {
     // --- geometry ------------------------------------------------------------
 
     fn pad(&self) -> u32 {
-        (PAD * self.w.scale).round() as u32
+        (self.cfg.padding * self.w.scale).round() as u32
+    }
+
+    fn pad_y(&self) -> u32 {
+        (self.cfg.padding_vertical * self.w.scale).round() as u32
+    }
+
+    fn pane_gap(&self) -> i32 {
+        self.cfg.pane_gap.map_or(self.cell().0 as i32, |n| (n * self.w.scale).round() as i32)
     }
 
     fn physical(&self) -> (u32, u32) {
@@ -945,7 +1048,7 @@ impl App {
             Some(t) => self.tab_metrics(t),
             None => {
                 let (w, h) = self.cell();
-                layout::Metrics { cell_w: w as i32, cell_h: h as i32, gap: w as i32, titles: false }
+                layout::Metrics { cell_w: w as i32, cell_h: h as i32, gap: self.pane_gap(), titles: false }
             }
         }
     }
@@ -957,7 +1060,7 @@ impl App {
             PaneTitles::Never => false,
             PaneTitles::Auto => matches!(t.root, layout::Node::Split { .. }),
         };
-        layout::Metrics { cell_w: w as i32, cell_h: h as i32, gap: w as i32, titles }
+        layout::Metrics { cell_w: w as i32, cell_h: h as i32, gap: self.pane_gap(), titles }
     }
 
     fn tab_bar_visible(&self) -> bool {
@@ -987,13 +1090,14 @@ impl App {
         let (pw, ph) = self.physical();
         let p = self.pad() as i32;
         let ch = self.cell().1 as i32;
-        let mut top = p;
-        let mut bottom = ph as i32 - p;
+        let py = self.pad_y() as i32;
+        let mut top = py;
+        let mut bottom = ph as i32 - py;
         if self.tab_bar_visible() {
-            top += ch + p;
+            top += ch + py;
         }
         if self.cfg.hint_bar == HintBar::Always {
-            bottom -= ch + p;
+            bottom -= ch + py;
         }
         // The block gutter of the leftmost panes lives in the padding (or
         // the gap after a sidebar).
@@ -1100,7 +1204,7 @@ impl App {
             return None;
         }
         let (_, ph) = self.physical();
-        let (p, ch) = (self.pad() as f32, self.cell().1 as f32);
+        let (p, ch) = (self.pad_y() as f32, self.cell().1 as f32);
         Some((ph as f32 - p - ch - p / 2.0).floor() as i32)
     }
 
@@ -1140,7 +1244,16 @@ impl App {
     fn theme(&self) -> Theme {
         let pal = self.focused_pane().term.palette();
         let (fg, bg) = (pal.foreground(), pal.background());
-        Theme { fg, bg, accent: pal.indexed(4), bar: chrome::mix(bg, fg, 0.10), dim: chrome::mix(bg, fg, 0.35) }
+        let ui = self.cfg.theme.ui;
+        Theme {
+            fg: ui.foreground.unwrap_or(fg),
+            bg: ui.background.unwrap_or(bg),
+            accent: ui.accent.unwrap_or_else(|| pal.indexed(4)),
+            bar: ui.bar.unwrap_or_else(|| chrome::mix(bg, fg, 0.10)),
+            dim: ui.dim.unwrap_or_else(|| chrome::mix(bg, fg, 0.35)),
+            colors: ui,
+            cursor_shape: self.cfg.cursor_shape,
+        }
     }
 
     fn tab_labels(&self, theme: &Theme) -> Vec<render::Label> {
@@ -1166,7 +1279,7 @@ impl App {
             .collect();
         let cols = ((pw as f32 - 2.0 * p) / cw).max(1.0) as usize;
         let cols = cols.saturating_sub(self.status_cols(cols)).max(1);
-        chrome::tab_bar(&titles, self.w.active, p, p, cols, cw, theme)
+        chrome::tab_bar(&titles, self.w.active, p, self.pad_y() as f32, cols, cw, theme)
     }
 
     fn pane_part(&self, id: PaneId, r: Rect, fid: PaneId, floating: bool, theme: &Theme) -> PanePart {
@@ -1214,7 +1327,8 @@ impl App {
         let (cw, ch) = self.cell();
         let (cw, ch) = (cw as f32, ch as f32);
         let p = self.pad() as f32;
-        let thick = (self.w.scale.round() as f32).max(1.0);
+        let py = self.pad_y() as f32;
+        let thick = (self.cfg.border_width * self.w.scale) as f32;
         let float_focus = self.w.tabs[self.w.active].focus_is_float();
         let mut panes: Vec<PanePart> =
             view.panes.iter().map(|&(id, r)| self.pane_part(id, r, fid, false, &theme)).collect();
@@ -1317,54 +1431,98 @@ impl App {
         let mut rects = Vec::new();
         let mut labels = Vec::new();
         if self.tab_bar_visible() {
-            rects.push(([0.0, 0.0, pw as f32, 1.5 * p + ch], theme.bar));
+            rects.push(([0.0, 0.0, pw as f32, 1.5 * py + ch], theme.bar));
             let tabs = self.tab_labels(&theme);
             labels.extend(self.status_labels(&tabs, &theme));
             labels.extend(tabs);
         }
         if self.hint_bar_visible() {
-            let y = ph as f32 - p - ch;
-            rects.push(([0.0, y - p / 2.0, pw as f32, ph as f32 - y + p / 2.0], theme.bar));
+            let y = ph as f32 - py - ch;
+            rects.push(([0.0, y - py / 2.0, pw as f32, ph as f32 - y + py / 2.0], theme.bar));
             let cols = ((pw as f32 - 2.0 * p) / cw).max(1.0) as usize;
             if let Some(i) = &self.w.input {
                 use unicode_segmentation::UnicodeSegmentation;
                 use unicode_width::UnicodeWidthStr;
                 let caret_cols: usize = i.before_cursor().graphemes(true).map(|g| g.width().clamp(1, 2)).sum();
-                let (l, x) =
-                    chrome::input_bar(i.purpose.badge(), &i.text, caret_cols, &i.status, p, y, cols, cw, &theme);
+                let (l, x) = chrome::input_bar(
+                    i.purpose.badge(),
+                    &i.text,
+                    caret_cols,
+                    &i.status,
+                    p,
+                    y,
+                    cols,
+                    cw,
+                    &theme,
+                    &self.cfg.i18n,
+                );
                 labels.extend(l);
                 rects.push(([x, y, (cw / 8.0).round().max(1.0), ch], theme.fg));
             } else if let Some(v) = &self.w.viewer {
                 let hints = [
-                    ("wheel +-", "zoom"),
-                    ("0", "fit"),
+                    ("wheel +-", "ui-zoom"),
+                    ("0", "ui-fit"),
                     ("1", "1:1"),
-                    ("drag ←→", "pan"),
-                    ("c", "copy"),
-                    ("s", "save"),
-                    ("esc", "close"),
+                    ("drag ←→", "ui-pan"),
+                    ("c", "action-copy"),
+                    ("s", "ui-save"),
+                    ("esc", "ui-close"),
                 ]
                 .map(|(k, a)| (k.to_string(), a))
                 .to_vec();
-                labels.extend(chrome::hint_bar(&v.title(self.viewer_area()), &hints, p, y, cols, cw, &theme));
+                labels.extend(chrome::hint_bar(
+                    &v.title(self.viewer_area(), &self.cfg.i18n),
+                    &hints,
+                    p,
+                    y,
+                    cols,
+                    cw,
+                    &theme,
+                    &self.cfg.i18n,
+                ));
             } else if let Some(h) = &self.w.hints {
                 let hints = vec![
-                    ("a-z".to_string(), h.action.key()),
-                    ("shift".to_string(), "copy"),
-                    ("ctrl".to_string(), "insert"),
-                    ("bksp".to_string(), "undo"),
-                    ("esc".to_string(), "cancel"),
+                    (
+                        "a-z".to_string(),
+                        match h.action {
+                            crate::modes::HintAction::Copy => "action-copy",
+                            crate::modes::HintAction::Open => "ui-open",
+                            crate::modes::HintAction::Insert => "ui-insert",
+                        },
+                    ),
+                    ("shift".to_string(), "action-copy"),
+                    ("ctrl".to_string(), "ui-insert"),
+                    ("bksp".to_string(), "ui-undo"),
+                    ("esc".to_string(), "ui-cancel"),
                 ];
-                labels.extend(chrome::hint_bar(&format!("HINTS {}", h.items.len()), &hints, p, y, cols, cw, &theme));
+                labels.extend(chrome::hint_bar(
+                    &self.cfg.i18n.t("ui-hints-count", &[("count", &h.items.len().to_string())]),
+                    &hints,
+                    p,
+                    y,
+                    cols,
+                    cw,
+                    &theme,
+                    &self.cfg.i18n,
+                ));
             } else {
-                let mut name = self.w.mode.name().to_string();
+                let mut name = self.cfg.i18n.t(&format!("badge-{}", self.w.mode.key()), &[]);
                 if self.w.tabs[self.w.active].zoomed {
-                    name.push_str(" (zoom)");
+                    name.push_str(&self.cfg.i18n.t("ui-zoom-suffix", &[]));
                 }
                 if let Some(s) = &self.w.search {
-                    name = format!("{name} {}", s.status());
+                    name = format!("{name} {}", s.status(&self.cfg.i18n));
                 }
-                labels.extend(chrome::hint_bar(&name, &self.keymap.hints(self.w.mode), p, y, cols, cw, &theme));
+                labels.extend(chrome::hint_bar(
+                    &name,
+                    &self.keymap.hints(self.w.mode),
+                    p,
+                    y,
+                    cols,
+                    cw,
+                    &theme,
+                    &self.cfg.i18n,
+                ));
             }
         }
 
@@ -1379,6 +1537,7 @@ impl App {
             info: FrameInfo {
                 panes: Vec::new(),
                 pad: p,
+                pad_y: py,
                 theme,
                 cursor_blink_off: self.blink_off,
                 ligatures: self.cfg.ligatures,
@@ -1386,7 +1545,7 @@ impl App {
                 tiled_labels,
                 rects,
                 labels,
-                overlay: self.w.prompts.front().map(Prompt::overlay),
+                overlay: self.w.prompts.front().map(|p| p.overlay(&self.cfg.i18n)),
                 viewer: None,
             },
         }
@@ -1479,7 +1638,7 @@ impl App {
     }
 
     fn draw(&mut self) {
-        if !self.w.configured || self.w.frame_pending || self.exit {
+        if !self.w.configured || self.w.suspended || self.w.frame_pending || self.exit {
             return;
         }
         let view = self.view();
@@ -1564,6 +1723,8 @@ impl App {
         self.next_id += 1;
         let (cw, ch) = self.cell();
         let opts = SpawnOptions {
+            ipc_socket: self.ipc_socket.clone(),
+            term: self.cfg.term.clone(),
             command: command.or_else(|| self.cfg.command.clone()),
             integration: self.cfg.shell_integration,
             cwd,
@@ -1579,7 +1740,8 @@ impl App {
                 let _ = tx.send(Msg::ImagesDecoded(id));
             }
         })));
-        let pane = Pane::spawn(id, &opts, core, (cw, ch), self.sender.clone())?;
+        let mut pane = Pane::spawn(id, &opts, core, (cw, ch), self.sender.clone())?;
+        pane.term.set_palette(self.cfg.theme.palette());
         self.panes.insert(id, pane);
         self.emit(ScriptEvent::new("pane_opened").pane(id));
         Ok(id)
@@ -1831,7 +1993,7 @@ impl App {
         if self.parked.is_empty() {
             return self.request_quit();
         }
-        self.request_close(ids, "this window");
+        self.request_close(ids, "ui-this-window");
     }
 
     /// Names of programs that closing these panes would kill.
@@ -1849,7 +2011,12 @@ impl App {
                 self.close_pane(id);
             }
         } else {
-            self.w.prompts.push_back(Prompt::Close(ids, format!("Close {what}? Running: {}", busy.join(", "))));
+            self.w.prompts.push_back(Prompt::Close(
+                ids,
+                self.cfg
+                    .i18n
+                    .t("prompt-close-busy", &[("what", &self.cfg.i18n.t(what, &[])), ("programs", &busy.join(", "))]),
+            ));
             self.w.dirty = true;
         }
     }
@@ -1861,7 +2028,9 @@ impl App {
             self.quit_requested = true;
             self.exit = true;
         } else if !self.w.prompts.iter().any(|p| matches!(p, Prompt::Quit(_))) {
-            self.w.prompts.push_back(Prompt::Quit(format!("Close the window? Running: {}", busy.join(", "))));
+            self.w
+                .prompts
+                .push_back(Prompt::Quit(self.cfg.i18n.t("prompt-close-window", &[("programs", &busy.join(", "))])));
             self.w.dirty = true;
         }
     }
@@ -1977,7 +2146,7 @@ impl App {
             }
             Action::Split(axis) => self.split(Some(axis)),
             Action::NewPane => self.split(None),
-            Action::ClosePane => self.request_close(vec![old], "this pane"),
+            Action::ClosePane => self.request_close(vec![old], "ui-this-pane"),
             Action::Zoom => {
                 if tab.tiled().len() > 1 && !tab.focus_is_float() {
                     tab.zoomed = !tab.zoomed;
@@ -2012,7 +2181,7 @@ impl App {
             Action::NextTab => self.w.active = (self.w.active + 1) % n,
             Action::CloseTab => {
                 let ids = tab.panes();
-                self.request_close(ids, "this tab");
+                self.request_close(ids, "ui-this-tab");
             }
             Action::Scroll(s) => self.scroll(s),
             Action::Copy => {
@@ -2039,6 +2208,10 @@ impl App {
             Action::RenamePane => {
                 let current = self.focused_pane().name.clone().unwrap_or_default();
                 self.open_input(Purpose::RenamePane(old), &current, "empty: automatic title".into());
+            }
+            Action::ResetRenderer => self.recover_gpu(self.w.id),
+            Action::ExportScrollback => {
+                self.open_input(Purpose::ExportScrollback(old), "", self.cfg.i18n.t("hint-export-scrollback", &[]));
             }
             Action::SaveLayout => {
                 let hint = spec::layouts_dir().map(|d| format!("→ {}/NAME.lua", d.display())).unwrap_or_default();
@@ -2099,13 +2272,7 @@ impl App {
             Action::Hints(h) => self.hints_start(h),
             Action::ViewImage => self.view_last_image(),
             Action::Lua(f) => self.queue_lua(f),
-            Action::FocusSurface => self.cycle_surface_focus(),
             Action::Plugin(i) => self.run_plugin_action(i),
-            Action::CloseSurface => {
-                if let Some(s) = self.w.surface_focus {
-                    self.close_surface(s);
-                }
-            }
             Action::TogglePrivate => {
                 if let Some(p) = self.panes.get_mut(&old) {
                     p.private = !p.private;
@@ -2335,11 +2502,14 @@ impl App {
         let Some(p) = self.panes.get(&id) else { return };
         let command = p.term.blocks().get(block).and_then(|b| b.command.clone()).filter(|c| !c.is_empty());
         let summary = match exit_code {
-            Some(c) if c != 0 => format!("Command failed (exit {c})"),
-            _ => "Command finished".to_string(),
+            Some(c) if c != 0 => self.cfg.i18n.t("ui-command-failed-exit-code", &[("code", &c.to_string())]),
+            _ => self.cfg.i18n.t("ui-command-finished", &[]),
         };
         let mut body = command.map(|c| c.lines().next().unwrap_or("").to_string()).unwrap_or_default();
-        body.push_str(&format!("{}took {}", if body.is_empty() { "" } else { "\n" }, blocks::human_duration(d)));
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str(&self.cfg.i18n.t("ui-took-duration", &[("duration", &blocks::human_duration(d))]));
         self.notifier.send(id, summary, body);
     }
 
@@ -2630,7 +2800,9 @@ impl App {
         let Some(p) = self.panes.get_mut(&id) else { return };
         let bytes = input::encode_paste(text, p.term.mode());
         p.term.scroll_to_bottom();
-        p.write(&bytes);
+        if let Err(e) = p.try_write(&bytes) {
+            self.toast(format!("Paste not queued: {e}"), true, None);
+        }
     }
 
     // --- prompts ---------------------------------------------------------------
@@ -2853,7 +3025,7 @@ impl App {
                         }
                         (MouseButton::Middle, Some(i)) => {
                             let ids = self.w.tabs[i].panes();
-                            self.request_close(ids, "this tab");
+                            self.request_close(ids, "ui-this-tab");
                         }
                         _ => {}
                     }
@@ -3227,17 +3399,25 @@ impl WindowHandler for App {
         if !self.activate_surface(window.wl_surface()) {
             return;
         }
+        let suspended = cfg.state.contains(smithay_client_toolkit::reexports::csd_frame::WindowState::SUSPENDED);
+        if self.w.suspended && !suspended {
+            // A hidden surface may never receive its old frame callback.
+            self.w.frame_pending = false;
+            self.w.dirty = true;
+        }
+        self.w.suspended = suspended;
         let (w, h) = cfg.new_size;
         let default = if self.w.configured {
             self.w.size
         } else {
-            // First configure without a size: 80x24 cells at the current scale.
-            let m = self.w.fonts.metrics();
-            let pad = self.pad() * 2;
-            (
-                ((80 * m.cell_w + pad) as f64 / self.w.scale).round() as u32,
-                ((24 * m.cell_h + pad) as f64 / self.w.scale).round() as u32,
-            )
+            // A compositor-provided dimension takes precedence on that axis.
+            // Recompute at the negotiated scale, preserving inherited sizes for new windows.
+            if self.w.id == 1 || self.cfg.window != Default::default() {
+                let m = self.w.fonts.metrics();
+                self.cfg.window_size((m.cell_w, m.cell_h), self.w.scale)
+            } else {
+                self.w.size
+            }
         };
         self.w.size = (w.map_or(default.0, |v| v.get()), h.map_or(default.1, |v| v.get()));
         let focused = cfg.is_activated();
@@ -3595,47 +3775,52 @@ fn needs_paste_confirmation(text: &str, mode: TermMode) -> bool {
 }
 
 impl Prompt {
-    fn overlay(&self) -> Overlay {
+    fn overlay(&self, catalog: &crate::i18n::Catalog) -> Overlay {
         match self {
             Prompt::ClipboardRead(_, kind, _) => {
-                let which = if matches!(kind, ClipboardKind::Primary) { "primary selection" } else { "clipboard" };
+                let which =
+                    if matches!(kind, ClipboardKind::Primary) { "ui-primary-selection" } else { "ui-clipboard" };
                 Overlay {
-                    title: format!("The application wants to read the {which}."),
+                    title: catalog.t("prompt-read-clipboard", &[("which", &catalog.t(which, &[]))]),
                     detail: None,
-                    keys: "[y] allow once   [a] always (this session)   [n] deny".into(),
+                    keys: catalog.t("prompt-clipboard-keys", &[]),
                 }
             }
             Prompt::Paste(_, text) => {
                 let lines = text.trim_end_matches('\n').split('\n').count();
                 let control = text.chars().any(|c| c.is_control() && !matches!(c, '\t' | '\n' | '\r'));
                 let title = match (lines, control) {
-                    (1, false) => "Paste and run this line?".to_string(),
-                    (1, true) => "Paste text containing control characters?".to_string(),
-                    (n, false) => format!("Paste {n} lines? Each newline may run a command."),
-                    (n, true) => format!("Paste {n} lines containing control characters?"),
+                    (1, false) => catalog.t("prompt-paste-run", &[]),
+                    (1, true) => catalog.t("prompt-paste-control", &[]),
+                    (n, false) => catalog.t("prompt-paste-lines", &[("count", &n.to_string())]),
+                    (n, true) => catalog.t("prompt-paste-control-lines", &[("count", &n.to_string())]),
                 };
                 let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
                 let preview: String =
                     first.chars().map(|c| if c.is_control() { '\u{fffd}' } else { c }).take(200).collect();
-                Overlay { title, detail: Some(preview), keys: "[Enter] paste   [Esc] cancel".into() }
+                Overlay { title, detail: Some(preview), keys: catalog.t("prompt-paste-keys", &[]) }
             }
             Prompt::Restore(spec) => Overlay {
-                title: format!(
-                    "Restore the previous session? ({} windows, {} tabs, {} panes; it did not exit normally)",
-                    spec.windows.len(),
-                    spec.tabs().count(),
-                    spec.pane_count()
+                title: catalog.t(
+                    "prompt-restore-session",
+                    &[
+                        ("windows", &spec.windows.len().to_string()),
+                        ("tabs", &spec.tabs().count().to_string()),
+                        ("panes", &spec.pane_count().to_string()),
+                    ],
                 ),
                 detail: None,
-                keys: "[y] restore   [n] start fresh".into(),
+                keys: catalog.t("prompt-restore-keys", &[]),
             },
             Prompt::Close(_, msg) | Prompt::Quit(msg) => {
-                Overlay { title: msg.clone(), detail: None, keys: "[y] close   [n] cancel".into() }
+                Overlay { title: msg.clone(), detail: None, keys: catalog.t("prompt-close-keys", &[]) }
             }
             Prompt::Notice(msg) => {
-                Overlay { title: msg.clone(), detail: None, keys: "press any key to dismiss".into() }
+                Overlay { title: msg.clone(), detail: None, keys: catalog.t("prompt-dismiss-keys", &[]) }
             }
-            Prompt::PluginConfirm(_, q) => Overlay { title: q.clone(), detail: None, keys: "[y] yes   [n] no".into() },
+            Prompt::PluginConfirm(_, q) => {
+                Overlay { title: q.clone(), detail: None, keys: catalog.t("prompt-confirm-keys", &[]) }
+            }
         }
     }
 }
@@ -3656,6 +3841,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn translated_prompts_keep_user_content_and_shortcuts() {
+        let mut catalog = crate::i18n::defaults();
+        catalog.set_locale("zh").unwrap();
+        let overlay = Prompt::Paste(1, "echo one\necho two\n".into()).overlay(&catalog);
+        assert!(overlay.title.contains("2 行"));
+        assert_eq!(overlay.detail.as_deref(), Some("echo one"));
+        assert!(overlay.keys.contains("[Enter]"));
+        let overlay = Prompt::PluginConfirm(1, "plugin's own text".into()).overlay(&catalog);
+        assert_eq!(overlay.title, "plugin's own text");
+        assert_eq!(overlay.keys, "[y] 是   [n] 否");
+    }
+
+    #[test]
     fn paste_protection_rules() {
         let plain = TermMode::default();
         assert!(!needs_paste_confirmation("ls -la", plain));
@@ -3670,10 +3868,10 @@ mod tests {
 
     #[test]
     fn prompt_texts() {
-        let o = Prompt::Paste(1, "echo 1\necho 2\n".into()).overlay();
+        let o = Prompt::Paste(1, "echo 1\necho 2\n".into()).overlay(&crate::i18n::Catalog::new("en").unwrap());
         assert!(o.title.contains("2 lines"), "{o:?}");
         assert_eq!(o.detail.as_deref(), Some("echo 1"));
-        let o = Prompt::Paste(1, "a\x1bb".into()).overlay();
+        let o = Prompt::Paste(1, "a\x1bb".into()).overlay(&crate::i18n::Catalog::new("en").unwrap());
         assert!(o.title.contains("control"), "{o:?}");
         assert!(o.detail.unwrap().contains('\u{fffd}'));
     }

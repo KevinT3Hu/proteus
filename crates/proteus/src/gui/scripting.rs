@@ -125,7 +125,7 @@ impl App {
         // Calls into the old script's functions lapse with it, and so do
         // its surfaces.
         self.sc.queue.retain(|c| matches!(c, ScriptCall::Event(_)));
-        self.drop_lua_surfaces();
+        self.drop_config_surfaces();
         self.sc.has_segments = script.has_segments();
         self.sc.segments_due = true;
         self.sc.script = Some(script);
@@ -292,7 +292,7 @@ impl App {
         let cols = ((pw as f32 - 2.0 * p) / cw).max(1.0) as usize;
         let max = (cols * 2 / 3).max(10).min(cols);
         let red = self.focused_pane().term.palette().indexed(1);
-        let mut y = self.area().y as f32 + p;
+        let mut y = self.area().y as f32 + self.pad_y() as f32;
         for t in self.w.toasts.iter().rev() {
             let lines: Vec<String> = t.text.lines().flat_map(|l| wrap(l, max - 2)).take(6).collect();
             let w = lines.iter().map(|l| super::chrome::text_width(l)).max().unwrap_or(0).saturating_add(2).min(max);
@@ -341,7 +341,7 @@ impl App {
         if rw > 0 {
             out.push(render::Label {
                 x: p + (cols - rw) as f32 * cw,
-                y: p,
+                y: self.pad_y() as f32,
                 cols: rw,
                 text: right_text,
                 fg: theme.fg,
@@ -356,7 +356,7 @@ impl App {
         if lw > 0 {
             out.push(render::Label {
                 x: p + start as f32 * cw,
-                y: p,
+                y: self.pad_y() as f32,
                 cols: lw,
                 text: left_text,
                 fg: theme.dim,
@@ -386,19 +386,7 @@ impl App {
             | inotify::WatchFlags::MOVED_FROM
             | inotify::WatchFlags::CREATE
             | inotify::WatchFlags::DELETE;
-        let mut dirs = vec![dir.clone()];
-        if let Ok(rd) = std::fs::read_dir(&dir) {
-            // Layouts are data, not config.
-            dirs.extend(
-                rd.flatten()
-                    .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()) && e.file_name() != "layouts")
-                    .map(|e| e.path()),
-            );
-        }
-        // The config directory may not exist yet: watch the nearest parent.
-        if !dir.is_dir() {
-            dirs = dir.ancestors().find(|d| d.is_dir()).map(|d| vec![d.to_path_buf()]).unwrap_or_default();
-        }
+        let dirs = config_dirs(&dir);
         let mut any = false;
         for d in &dirs {
             any |= inotify::add_watch(&fd, d.as_path(), flags).is_ok();
@@ -407,41 +395,14 @@ impl App {
             return;
         }
         let source = Generic::new(fd, Interest::READ, PollMode::Level);
-        let _ = self.handle.insert_source(source, |_, fd, app: &mut App| {
+        let _ = self.handle.insert_source(source, move |_, fd, app: &mut App| {
             let relevant = drain_inotify(fd.as_fd());
             if relevant {
+                // New module directories become watched as soon as they appear.
+                for d in config_dirs(&dir) {
+                    let _ = inotify::add_watch(fd.as_fd(), &d, flags);
+                }
                 app.schedule_reload();
-            }
-            Ok(PostAction::Continue)
-        });
-    }
-
-    /// Watch one directory; `then` runs (debounced) when a file whose name
-    /// passes `filter` is written, moved in or out, or deleted.
-    pub(super) fn watch_dir(&mut self, dir: &Path, filter: fn(&str) -> bool, then: fn(&mut App)) {
-        use rustix::fs::inotify;
-        let Ok(fd) = inotify::init(inotify::CreateFlags::CLOEXEC | inotify::CreateFlags::NONBLOCK) else { return };
-        let flags = inotify::WatchFlags::CLOSE_WRITE
-            | inotify::WatchFlags::MOVED_TO
-            | inotify::WatchFlags::MOVED_FROM
-            | inotify::WatchFlags::DELETE;
-        if inotify::add_watch(&fd, dir, flags).is_err() {
-            return;
-        }
-        let pending: std::rc::Rc<std::cell::Cell<Option<Instant>>> = Default::default();
-        let source = Generic::new(fd, Interest::READ, PollMode::Level);
-        let _ = self.handle.insert_source(source, move |_, fd, app: &mut App| {
-            if drain_inotify_names(fd.as_fd()).iter().any(|n| filter(n)) {
-                let at = Instant::now() + RELOAD_DELAY;
-                pending.set(Some(at));
-                let pending = pending.clone();
-                let _ = app.handle.insert_source(Timer::from_deadline(at), move |_, _, app: &mut App| {
-                    if pending.get() == Some(at) {
-                        pending.set(None);
-                        then(app);
-                    }
-                    TimeoutAction::Drop
-                });
             }
             Ok(PostAction::Continue)
         });
@@ -471,7 +432,7 @@ impl App {
                 self.install_script(l.script);
                 self.apply_config(l.config);
                 self.sc.shown.clear();
-                self.toast("config reloaded".into(), false, Some(Duration::from_secs(2)));
+                self.toast(self.cfg.i18n.t("ui-config-reloaded", &[]), false, Some(Duration::from_secs(2)));
                 self.emit(ScriptEvent::new("config_changed"));
             }
         }
@@ -481,18 +442,33 @@ impl App {
     /// apply to panes opened from now on.
     fn apply_config(&mut self, new: Config) {
         let old = std::mem::replace(&mut self.cfg, new);
+        if old.plugins != self.cfg.plugins {
+            self.pl.failures.clear();
+        }
+        // Re-run Cargo incrementally on config reload so local source edits are picked up.
+        self.sync_plugins();
         self.keymap = self.cfg.keymap();
         self.apply_plugin_keys();
+        if old.theme != self.cfg.theme {
+            let palette = self.cfg.theme.palette();
+            for pane in self.panes.values_mut() {
+                pane.term.rebase_palette(&palette);
+            }
+            self.retheme_surfaces(&palette);
+            self.emit(ScriptEvent::new("theme_changed"));
+        }
         self.plugins_config_changed();
         self.hint_patterns = super::hint::patterns(&self.cfg.hint_patterns);
-        let font_changed = old.font_family != self.cfg.font_family || old.font_size != self.cfg.font_size;
+        let font_changed = old.font_family != self.cfg.font_family
+            || old.font_size != self.cfg.font_size
+            || old.font_settings != self.cfg.font_settings;
         for id in self.window_ids() {
             if !self.activate(id) {
                 continue;
             }
             self.w.renderer.images.budget = self.cfg.graphics.gpu_memory;
             if font_changed {
-                match Fonts::new(&self.cfg.font_family, self.cfg.font_size, self.w.scale) {
+                match Fonts::from_config(&self.cfg, self.w.scale) {
                     Ok(f) => {
                         self.w.fonts = f;
                         self.w.font_size = self.cfg.font_size;
@@ -500,6 +476,8 @@ impl App {
                     }
                     Err(e) => self.toast(format!("font: {e}"), true, None),
                 }
+                self.apply_size();
+            } else if old.padding != self.cfg.padding || old.padding_vertical != self.cfg.padding_vertical {
                 self.apply_size();
             } else {
                 self.relayout();
@@ -579,6 +557,26 @@ fn wrap(line: &str, cols: usize) -> Vec<String> {
     out
 }
 
+/// Watch nested config modules without following symlinks or layout data.
+fn config_dirs(dir: &Path) -> Vec<std::path::PathBuf> {
+    if !dir.is_dir() {
+        return dir.ancestors().find(|d| d.is_dir()).map(|d| vec![d.to_path_buf()]).unwrap_or_default();
+    }
+    let mut dirs = vec![dir.to_path_buf()];
+    let mut i = 0;
+    while i < dirs.len() {
+        if let Ok(rd) = std::fs::read_dir(&dirs[i]) {
+            dirs.extend(
+                rd.flatten()
+                    .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()) && e.file_name() != "layouts")
+                    .map(|e| e.path()),
+            );
+        }
+        i += 1;
+    }
+    dirs
+}
+
 /// Read pending inotify events; true if one concerns a `.lua` file.
 fn drain_inotify(fd: std::os::fd::BorrowedFd<'_>) -> bool {
     use rustix::fs::inotify;
@@ -590,18 +588,6 @@ fn drain_inotify(fd: std::os::fd::BorrowedFd<'_>) -> bool {
         relevant |= name.ends_with(".lua") || ev.events().contains(inotify::ReadFlags::ISDIR);
     }
     relevant
-}
-
-/// Names of the files in pending inotify events.
-fn drain_inotify_names(fd: std::os::fd::BorrowedFd<'_>) -> Vec<String> {
-    use rustix::fs::inotify;
-    let mut buf = [std::mem::MaybeUninit::<u8>::uninit(); 4096];
-    let mut reader = inotify::Reader::new(fd, &mut buf);
-    let mut names = Vec::new();
-    while let Ok(ev) = reader.next() {
-        names.push(ev.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
-    }
-    names
 }
 
 fn block_state(s: BlockState) -> &'static str {
@@ -746,29 +732,45 @@ impl Host for App {
     }
 
     fn ui_open(&mut self, o: proteus_wasm::types::SurfaceOptions) -> Result<u32, String> {
-        self.lua_surface_open(o)
+        self.config_surface_open(o)
     }
 
     fn ui_draw(&mut self, id: u32, frame: proteus_wasm::types::Frame) -> Result<(), String> {
-        self.lua_surface_draw(id, frame)
+        self.config_surface_draw(id, frame)
     }
 
     fn ui_close(&mut self, id: u32) {
-        self.lua_surface_close(id);
+        self.config_surface_close(id);
     }
 
     fn ui_focus(&mut self, id: u32) -> Result<(), String> {
-        self.lua_surface_focus(id)
+        self.config_surface_focus(id)
     }
 
     fn ui_size(&self, id: u32) -> Option<(u32, u32)> {
-        self.lua_surface_size(id)
+        self.config_surface_size(id)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::wrap;
+    use super::{config_dirs, wrap};
+
+    #[test]
+    fn config_modules_are_watched_recursively_without_loading_directories() {
+        let root = std::env::temp_dir().join(format!("proteus-config-watch-{}", std::process::id()));
+        let nested = root.join("extensions/nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(root.join("layouts/ignored")).unwrap();
+        std::os::unix::fs::symlink(&root, nested.join("cycle")).unwrap();
+        let dirs = config_dirs(&root);
+        assert!(dirs.contains(&nested));
+        assert_eq!(dirs.len(), 3);
+        let later = nested.join("added");
+        std::fs::create_dir_all(&later).unwrap();
+        assert!(config_dirs(&root).contains(&later));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn wrapping() {

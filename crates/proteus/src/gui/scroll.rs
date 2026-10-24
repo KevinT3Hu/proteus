@@ -48,24 +48,24 @@ pub struct SearchState {
 
 impl SearchState {
     /// `3/17`, `no matches`, or the regex error.
-    pub fn status(&self) -> String {
+    pub fn status(&self, catalog: &crate::i18n::Catalog) -> String {
         if let Some(e) = &self.error {
-            return e.clone();
+            return catalog.t(e, &[]);
         }
         match (self.current, self.matches.len()) {
             (_, 0) if self.query.is_empty() => String::new(),
-            (_, 0) => "no matches".into(),
+            (_, 0) => catalog.t("ui-no-matches", &[]),
             (Some(i), n) => format!("{}/{n}", i + 1),
-            (None, n) => format!("{n} matches"),
+            (None, n) => catalog.t("ui-count-matches", &[("count", &n.to_string())]),
         }
     }
 
     /// `[regex] [tab] [output] ` for the options that are on.
-    fn flags(&self) -> String {
-        [(self.regex, "[regex] "), (self.tab, "[tab] "), (self.output, "[output] ")]
+    fn flags(&self, catalog: &crate::i18n::Catalog) -> String {
+        [(self.regex, "ui-regex"), (self.tab, "ui-tab-title"), (self.output, "ui-output")]
             .iter()
             .filter(|f| f.0)
-            .map(|f| f.1)
+            .map(|f| format!("{} ", catalog.t(f.1.trim_end(), &[])))
             .collect()
     }
 }
@@ -350,7 +350,7 @@ impl App {
                         matches.extend(found.into_iter().map(|m| (id, m)));
                     }
                 }
-                Err(_) => error = Some("invalid regex".to_string()),
+                Err(_) => error = Some("ui-invalid-regex".to_string()),
             }
         }
         if let Some(s) = self.w.search.as_mut() {
@@ -378,7 +378,7 @@ impl App {
         let target = current.map(|i| s.matches[i]);
         let Some(s) = self.w.search.as_mut() else { return };
         s.current = current;
-        let status = format!("{}{}", s.flags(), s.status());
+        let status = format!("{}{}", s.flags(&self.cfg.i18n), s.status(&self.cfg.i18n));
         if let Some(i) = self.w.input.as_mut() {
             i.status = status;
         }
@@ -490,25 +490,38 @@ impl App {
     /// Every palette entry: actions, tabs of this window, panes of all
     /// windows, saved layouts.
     fn palette_items(&self) -> Vec<(String, Item)> {
-        let mut v: Vec<(String, Item)> = Action::all().into_iter().map(|a| (a.name(), Item::Action(a))).collect();
+        let mut v: Vec<(String, Item)> = Action::all()
+            .into_iter()
+            .map(|a| {
+                let id = a.name();
+                let label = self.cfg.i18n.t(&crate::i18n::action_id(&id), &[]);
+                (if label == id { id } else { format!("{label} ({id})") }, Item::Action(a))
+            })
+            .collect();
         v.sort_by(|a, b| a.0.cmp(&b.0));
         v.extend(self.sc.palette.iter().map(|(name, f)| (name.clone(), Item::Lua(*f))));
         v.extend(self.plugin_palette().into_iter().map(|(label, id, a)| (label, Item::Plugin(id, a))));
         for (i, t) in self.w.tabs.iter().enumerate() {
             let title =
                 t.name.clone().unwrap_or_else(|| self.panes.get(&t.focus).map_or("", |p| p.title()).to_string());
-            v.push((format!("tab {}: {title}", i + 1), Item::Tab(i)));
+            v.push((
+                self.cfg.i18n.t("ui-tab-number-title", &[("number", &(i + 1).to_string()), ("title", &title)]),
+                Item::Tab(i),
+            ));
         }
         let mut ids: Vec<PaneId> =
             std::iter::once(&self.w).chain(&self.parked).flat_map(|w| w.tabs.iter().flat_map(|t| t.panes())).collect();
         ids.sort();
         for id in ids {
             if let Some(p) = self.panes.get(&id) {
-                v.push((format!("pane {id}: {}", p.title()), Item::Pane(id)));
+                v.push((
+                    self.cfg.i18n.t("ui-pane-id-title", &[("id", &id.to_string()), ("title", p.title())]),
+                    Item::Pane(id),
+                ));
             }
         }
         for name in Self::layout_names() {
-            v.push((format!("layout: {name}"), Item::Layout(name)));
+            v.push((self.cfg.i18n.t("ui-layout-name", &[("name", &name)]), Item::Layout(name)));
         }
         v
     }
@@ -546,7 +559,7 @@ impl App {
         };
         if hits.is_empty() {
             i.choice = 0;
-            i.status = "no match".into();
+            i.status = self.cfg.i18n.t("ui-no-match", &[]);
             return;
         }
         i.choice = i.choice.min(hits.len() - 1);
@@ -674,6 +687,29 @@ impl App {
                     p.name = name;
                 }
                 self.update_title();
+            }
+            Purpose::ExportScrollback(pane) => {
+                if text.is_empty() {
+                    return;
+                }
+                let Some(p) = self.panes.get(&pane) else {
+                    return;
+                };
+                let output = p.term.scrollback_text();
+                let sender = self.sender.clone();
+                std::thread::spawn(move || {
+                    use std::io::Write;
+                    let result = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&text)
+                        .and_then(|mut file| {
+                            file.write_all(output.as_bytes())?;
+                            file.sync_all()
+                        })
+                        .map_err(|e| format!("{text}: {e}"));
+                    let _ = sender.send(super::Msg::Exported(result));
+                });
             }
             Purpose::SaveLayout if !text.is_empty() => self.save_layout(&text),
             Purpose::LoadLayout if !text.is_empty() => self.load_layout(&text),

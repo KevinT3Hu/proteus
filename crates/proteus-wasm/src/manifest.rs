@@ -12,7 +12,7 @@
 //! [permissions]
 //! ui = true
 //! read-panes = true
-//! fs = ["~/src:rw", "/etc/hosts:r"]
+//! fs = ["~/src:rw", "/etc:r"]
 //! run-command = ["git"]
 //! network = ["api.example.com"]
 //! ```
@@ -72,6 +72,19 @@ impl FsGrant {
                 home.join(rest.trim_start_matches('/'))
             }
             None => PathBuf::from(&self.path),
+        }
+    }
+
+    /// WASI preopens directories, not individual files. Missing directories
+    /// may be mounted on a later start; existing files must not be ignored.
+    pub fn validate_directory(&self) -> Result<(), String> {
+        match std::fs::metadata(self.host_path()) {
+            Ok(m) if !m.is_dir() => {
+                Err(format!("fs: `{}`: expected a directory; single-file grants are not supported", self.path))
+            }
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("fs: `{}`: {e}", self.path)),
         }
     }
 
@@ -310,7 +323,11 @@ impl Permissions {
             ("fs", Some(p)) => {
                 let path = p.strip_suffix(":rw").or_else(|| p.strip_suffix(":r")).unwrap_or(p);
                 let before = self.fs.len();
-                self.fs.retain(|f| f.path != path.trim_end_matches('/'));
+                let path = match path.trim_end_matches('/') {
+                    "" => "/",
+                    p => p,
+                };
+                self.fs.retain(|f| f.path != path);
                 self.fs.len() != before
             }
             _ => false,
@@ -338,16 +355,25 @@ struct RawPlugin {
     wasm: Option<PathBuf>,
 }
 
+/// A local action ID is stable metadata, not a display label or a filesystem path.
+pub fn valid_action_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 100 && id.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))
+}
+
+/// IDs are names, never filesystem paths.
+pub fn valid_plugin_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "-_.".contains(c))
+        && !id.starts_with('.')
+        && !id.contains("..")
+}
+
 impl Manifest {
     pub fn parse(text: &str) -> Result<Manifest, String> {
         let raw: Raw = toml::from_str(text).map_err(|e| e.message().to_string())?;
         let p = raw.plugin;
-        let id_ok = !p.id.is_empty()
-            && p.id.len() <= 64
-            && p.id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "-_.".contains(c))
-            && !p.id.starts_with('.')
-            && !p.id.contains("..");
-        if !id_ok {
+        if !valid_plugin_id(&p.id) {
             return Err(format!("plugin.id `{}`: use lowercase letters, digits, `-`, `_` and `.`", p.id));
         }
         if p.api != API {
@@ -425,6 +451,15 @@ mod tests {
         assert!(host_allowed(&p.network, "localhost", 11434));
         assert!(!host_allowed(&p.network, "localhost", 80));
         assert!(!host_allowed(&p.network, "example.com", 443));
+    }
+
+    #[test]
+    fn root_grant_can_be_revoked() {
+        for name in ["fs:/", "fs:/:r", "fs:/:rw"] {
+            let mut p = Permissions { fs: vec![FsGrant::parse("/:r").unwrap()], ..Default::default() };
+            assert!(p.revoke(name));
+            assert!(p.fs.is_empty());
+        }
     }
 
     #[test]

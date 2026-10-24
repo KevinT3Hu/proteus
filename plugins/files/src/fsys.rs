@@ -65,10 +65,10 @@ pub enum SortKey {
 impl SortKey {
     pub fn label(self) -> &'static str {
         match self {
-            SortKey::Name => "name",
-            SortKey::Mtime => "mtime",
-            SortKey::Size => "size",
-            SortKey::Ext => "ext",
+            SortKey::Name => "sort-name",
+            SortKey::Mtime => "sort-mtime",
+            SortKey::Size => "sort-size",
+            SortKey::Ext => "sort-ext",
         }
     }
 }

@@ -71,6 +71,7 @@ pub struct Pixels {
 /// A call from a plugin into the terminal (already permitted).
 #[derive(Debug, Clone)]
 pub enum Call {
+    Locale,
     Log(String),
     Notify {
         text: String,
@@ -98,10 +99,15 @@ pub enum Call {
     CloseSurface(SurfaceId),
     FocusSurface(SurfaceId),
     SurfaceSize(SurfaceId),
+    SetSurfaceTitle(SurfaceId, String),
     StartDrag(SurfaceId, Vec<String>),
     SetStatus(StatusSide, String),
-    /// A palette entry, with a suggested key.
-    RegisterAction(String, Option<String>),
+    /// Stable local ID, display label and optional default key.
+    RegisterAction {
+        id: String,
+        name: String,
+        key: Option<String>,
+    },
     LoadImage(ImageId, Arc<Pixels>),
     DropImage(ImageId),
     /// Answer with `Event::Answered(id, ..)`.
@@ -143,7 +149,7 @@ impl Call {
                 | Call::CloseSurface(_)
                 | Call::StartDrag(..)
                 | Call::SetStatus(..)
-                | Call::RegisterAction(..)
+                | Call::RegisterAction { .. }
                 | Call::LoadImage(..)
                 | Call::DropImage(_)
                 | Call::Prompt { .. }
@@ -213,19 +219,37 @@ impl Poster {
     /// An event carrying `n` bytes of output: waits while the plugin is
     /// behind.
     pub fn data(&self, n: usize, e: Event) -> bool {
+        self.data_until(n, e, &AtomicBool::new(false))
+    }
+
+    pub(crate) fn stopped(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn data_until(&self, n: usize, e: Event, cancel: &AtomicBool) -> bool {
         while self.backlog.load(Ordering::Relaxed) > MAX_BACKLOG {
-            if self.stop.load(Ordering::Relaxed) {
+            if self.stopped() || cancel.load(Ordering::Relaxed) {
                 return false;
             }
             std::thread::sleep(Duration::from_millis(5));
         }
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
         self.backlog.fetch_add(n, Ordering::Relaxed);
         self.event(e)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing() -> (Self, mpsc::Receiver<ToPlugin>) {
+        let (tx, rx) = mpsc::channel();
+        (Self { tx, backlog: Arc::default(), stop: Arc::default() }, rx)
     }
 }
 
 /// What to run.
 pub struct Spec {
+    pub config: serde_json::Value,
     pub key: Key,
     pub wasm: Vec<u8>,
     /// Compiled components are cached by this.
@@ -320,6 +344,7 @@ impl Drop for Handle {
 }
 
 struct State {
+    config: String,
     key: Key,
     granted: Permissions,
     sink: Sink,
@@ -401,7 +426,16 @@ impl State {
         }
         let (tx, rx) = mpsc::channel();
         (self.sink)(self.key.clone(), FromPlugin::Call(call, Some(tx)));
-        self.excluded(|_| rx.recv().unwrap_or_else(|_| Err("the terminal is shutting down".into())))
+        self.excluded(|s| {
+            loop {
+                match rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(answer) => break answer,
+                    Err(RecvTimeoutError::Timeout) if !s.stop.load(Ordering::Relaxed) => {}
+                    Err(RecvTimeoutError::Timeout) => break Err("stopped".into()),
+                    Err(RecvTimeoutError::Disconnected) => break Err("the terminal is shutting down".into()),
+                }
+            }
+        })
     }
 
     fn request_id(&mut self) -> RequestId {
@@ -467,6 +501,17 @@ fn decode_image(data: &[u8]) -> Result<Pixels, String> {
 impl types::Host for State {}
 
 impl proteus::plugin::host::Host for State {
+    fn plugin_config(&mut self) -> Result<String, String> {
+        Ok(self.config.clone())
+    }
+
+    fn locale(&mut self) -> Result<String, String> {
+        match self.rpc(Call::Locale)? {
+            Reply::Text(s) => Ok(s),
+            _ => bad_reply(),
+        }
+    }
+
     fn log(&mut self, message: String) {
         let _ = self.rpc(Call::Log(message));
     }
@@ -557,7 +602,13 @@ impl proteus::plugin::host::Host for State {
         }
     }
 
+    fn set_surface_title(&mut self, surface: SurfaceId, title: String) -> Result<(), String> {
+        self.need(self.granted.ui, "ui")?;
+        self.rpc(Call::SetSurfaceTitle(surface, short(&title, 100))).map(|_| ())
+    }
+
     fn draw(&mut self, surface: SurfaceId, frame: Frame) -> Result<(), String> {
+        crate::accessibility::validate(&frame.accessibility)?;
         self.need(self.granted.ui, "ui")?;
         if let Some(i) = frame.images.iter().find(|i| !self.images.contains_key(&i.image)) {
             return Err(format!("no image {}", i.image));
@@ -594,7 +645,24 @@ impl proteus::plugin::host::Host for State {
         if name.trim().is_empty() || name.len() > 100 {
             return Err("register-action: the name must be 1 to 100 bytes".into());
         }
-        self.rpc(Call::RegisterAction(name, key.map(|k| short(&k, 40)))).map(|_| ())
+        self.rpc(Call::RegisterAction { id: name.clone(), name, key: key.map(|k| short(&k, 40)) }).map(|_| ())
+    }
+
+    fn register_action_id(&mut self, id: String, name: String, default_key: Option<String>) -> Result<(), String> {
+        self.need(self.granted.ui, "ui")?;
+        if !crate::manifest::valid_action_id(&id) {
+            return Err(
+                "register-action: invalid action ID (1–100 ASCII letters, digits, dots, underscores or hyphens)".into(),
+            );
+        }
+        if name.trim().is_empty() || name.len() > 100 || name.chars().any(char::is_control) {
+            return Err("register-action: label must be 1–100 bytes without control characters".into());
+        }
+        if default_key.as_ref().is_some_and(|key| key.is_empty() || key.len() > 40 || key.chars().any(char::is_control))
+        {
+            return Err("register-action: invalid default key".into());
+        }
+        self.rpc(Call::RegisterAction { id, name, key: default_key }).map(|_| ())
     }
 
     fn load_image(&mut self, data: Vec<u8>) -> Result<ImageId, String> {
@@ -805,6 +873,48 @@ impl proteus::plugin::host::Host for State {
         self.excluded(|_| files::mime_type(&host))
     }
 
+    fn file_mode(&mut self, path: String) -> Result<u32, String> {
+        use std::os::unix::fs::PermissionsExt;
+        let host = self.access.resolve(&path, false, true)?;
+        std::fs::metadata(host).map(|m| m.permissions().mode() & 0o777).map_err(|e| e.to_string())
+    }
+
+    fn set_file_mode(&mut self, path: String, mode: u32) -> Result<(), String> {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::PermissionsExt;
+        let host = self.access.resolve(&path, true, false)?;
+        std::fs::File::options()
+            .read(true)
+            .custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32)
+            .open(host)
+            .and_then(|f| f.set_permissions(std::fs::Permissions::from_mode(mode & 0o777)))
+            .map_err(|e| e.to_string())
+    }
+
+    fn create_private(&mut self, path: String, directory: bool) -> Result<(), String> {
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        let host = self.access.resolve(&path, true, false)?;
+        if directory {
+            std::fs::DirBuilder::new().mode(0o700).create(host).map_err(|e| e.to_string())
+        } else {
+            std::fs::File::options()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(host)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }
+    }
+
+    fn publish_file(&mut self, staged: String, destination: String, replace: bool) -> Result<(), String> {
+        use rustix::fs::{CWD, RenameFlags, renameat_with};
+        let staged = self.access.resolve(&staged, true, false)?;
+        let destination = self.access.resolve(&destination, true, false)?;
+        let flags = if replace { RenameFlags::empty() } else { RenameFlags::NOREPLACE };
+        renameat_with(CWD, staged, CWD, destination, flags).map_err(|e| e.to_string())
+    }
+
     fn set_timer(&mut self, ms: u32, repeat: bool) -> TimerId {
         // Over the limit: the oldest timer goes.
         if self.timers.len() >= MAX_TIMERS
@@ -906,6 +1016,37 @@ fn save_compiled(engine: &Engine, spec: &Spec, c: &Component) {
     }
 }
 
+enum Wake<T> {
+    Message(T),
+    Timers(Vec<TimerId>),
+    Idle,
+    Disconnected,
+}
+
+/// Due timers take precedence over queued traffic; idle waits remain bounded
+/// so stopping an instance also works when its next timer is far in the future.
+fn next_wake<T>(rx: &mpsc::Receiver<T>, timers: &BTreeMap<TimerId, (Instant, Option<Duration>)>) -> Wake<T> {
+    let due = || {
+        let now = Instant::now();
+        timers.iter().filter(|(_, t)| t.0 <= now).map(|(id, _)| *id).collect::<Vec<_>>()
+    };
+    let ready = due();
+    if !ready.is_empty() {
+        return Wake::Timers(ready);
+    }
+    let idle = Duration::from_millis(250);
+    let wait =
+        timers.values().map(|t| t.0).min().map_or(idle, |at| at.saturating_duration_since(Instant::now()).min(idle));
+    match rx.recv_timeout(wait) {
+        Ok(message) => Wake::Message(message),
+        Err(RecvTimeoutError::Disconnected) => Wake::Disconnected,
+        Err(RecvTimeoutError::Timeout) => {
+            let ready = due();
+            if ready.is_empty() { Wake::Idle } else { Wake::Timers(ready) }
+        }
+    }
+}
+
 fn run(
     engine: &Engine,
     cache: &Mutex<HashMap<String, Component>>,
@@ -946,6 +1087,7 @@ fn run(
     wasi.preopened_dir(&spec.data_dir, "/data", FsPerms::ReadWrite)
         .map_err(|e| format!("{}: {e}", spec.data_dir.display()))?;
     for f in &spec.granted.fs {
+        f.validate_directory()?;
         let perms = if f.write { FsPerms::ReadWrite } else { FsPerms::ReadOnly };
         let host = f.host_path();
         // Seen at its real path. Missing directories are left out (the
@@ -957,6 +1099,7 @@ fn run(
     }
     let backlog = post.backlog.clone();
     let state = State {
+        config: spec.config.to_string(),
         key: spec.key.clone(),
         granted: spec.granted.clone(),
         sink: sink.clone(),
@@ -1013,14 +1156,8 @@ fn run(
         if store.data().stop.load(Ordering::Relaxed) {
             return Ok(());
         }
-        let next = store.data().timers.values().map(|t| t.0).min();
-        let msg = match next {
-            Some(at) => rx.recv_timeout(at.saturating_duration_since(Instant::now())),
-            // Wake up now and then to notice `stop`.
-            None => rx.recv_timeout(Duration::from_millis(250)),
-        };
-        match msg {
-            Ok(ToPlugin::Event(e)) => {
+        match next_wake(&rx, &store.data().timers) {
+            Wake::Message(ToPlugin::Event(e)) => {
                 if let Event::ProcessOutput(ProcessOutput { data, .. }) | Event::HttpBody((_, data)) = &e {
                     backlog.fetch_sub(data.len(), Ordering::Relaxed);
                 }
@@ -1028,25 +1165,118 @@ fn run(
                     guarded!(store, plugin.call_on_event(&mut store, &e));
                 }
             }
-            Ok(ToPlugin::Ui(s, e)) => guarded!(store, plugin.call_on_ui(&mut store, s, &e)),
-            Err(RecvTimeoutError::Timeout) => {
+            Wake::Message(ToPlugin::Ui(s, e)) => guarded!(store, plugin.call_on_ui(&mut store, s, &e)),
+            Wake::Idle => {}
+            Wake::Disconnected => return Ok(()),
+            Wake::Timers(due) => {
                 let now = Instant::now();
-                let due: Vec<TimerId> =
-                    store.data().timers.iter().filter(|(_, t)| t.0 <= now).map(|(id, _)| *id).collect();
                 for id in due {
                     let timers = &mut store.data_mut().timers;
-                    match timers.get(&id).and_then(|t| t.1) {
-                        Some(every) => {
-                            timers.insert(id, (now + every, Some(every)));
-                        }
-                        None => {
-                            timers.remove(&id);
-                        }
+                    // An earlier callback may have cancelled another due timer.
+                    let Some((_, every)) = timers.remove(&id) else { continue };
+                    if let Some(every) = every {
+                        timers.insert(id, (now + every, Some(every)));
                     }
                     guarded!(store, plugin.call_on_event(&mut store, &Event::Timer(id)));
                 }
             }
-            Err(RecvTimeoutError::Disconnected) => return Ok(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn queued_messages_cannot_starve_due_timers() {
+        let (tx, rx) = mpsc::channel();
+        for message in 0..100 {
+            tx.send(message).unwrap();
+        }
+        let mut timers = BTreeMap::new();
+        timers.insert(1, (Instant::now(), None));
+        assert!(matches!(next_wake(&rx, &timers), Wake::Timers(ids) if ids == [1]));
+        timers.clear();
+        assert!(matches!(next_wake(&rx, &timers), Wake::Message(0)));
+        timers.insert(2, (Instant::now(), Some(Duration::from_millis(10))));
+        assert!(matches!(next_wake(&rx, &timers), Wake::Timers(ids) if ids == [2]));
+    }
+
+    #[test]
+    fn private_staging_and_modes_enforce_filesystem_grants() {
+        use super::proteus::plugin::host::Host;
+        let root = std::env::temp_dir().join(format!("proteus-mode-host-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let data = root.join("data");
+        let read = root.join("read");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&read).unwrap();
+        std::fs::write(read.join("file"), "outside").unwrap();
+        let (post, _events) = Poster::testing();
+        let mut state = State {
+            config: "null".into(),
+            key: Key { id: "test".into(), instance: 1 },
+            granted: Permissions::default(),
+            sink: Arc::new(|_, _| {}),
+            wasi: WasiCtxBuilder::new().build(),
+            table: ResourceTable::new(),
+            limits: StoreLimitsBuilder::new().build(),
+            call_start: Instant::now(),
+            stop: post.stop.clone(),
+            timers: BTreeMap::new(),
+            next_timer: 0,
+            post,
+            access: Access {
+                data_dir: data.clone(),
+                fs: vec![crate::FsGrant { path: read.display().to_string(), write: false }],
+            },
+            storage: Storage::new(root.join("storage.toml")),
+            processes: Processes::default(),
+            streams: Streams::default(),
+            watcher: None,
+            keyring: None,
+            images: HashMap::new(),
+            next_image: 0,
+            tasks: HashSet::new(),
+            next_task: 0,
+            next_request: 0,
+        };
+        state.create_private("/data/staged".into(), false).unwrap();
+        assert_eq!(state.file_mode("/data/staged".into()).unwrap(), 0o600);
+        state.create_private("/data/directory".into(), true).unwrap();
+        assert_eq!(state.file_mode("/data/directory".into()).unwrap(), 0o700);
+        state.set_file_mode("/data/staged".into(), 0o700).unwrap();
+        std::fs::write(data.join("staged"), "staged").unwrap();
+        std::fs::write(data.join("destination"), "existing").unwrap();
+        assert!(state.publish_file("/data/staged".into(), "/data/destination".into(), false).is_err());
+        assert_eq!(std::fs::read_to_string(data.join("destination")).unwrap(), "existing");
+        state.publish_file("/data/staged".into(), "/data/destination".into(), true).unwrap();
+        assert_eq!(state.file_mode("/data/destination".into()).unwrap(), 0o700);
+        assert_eq!(std::fs::read_to_string(data.join("destination")).unwrap(), "staged");
+        assert!(state.set_file_mode(read.join("file").display().to_string(), 0o600).is_err());
+        assert!(state.create_private(read.join("new").display().to_string(), false).is_err());
+        assert!(state.publish_file("/data/destination".into(), read.join("new").display().to_string(), false).is_err());
+        std::os::unix::fs::symlink(read.join("file"), data.join("link")).unwrap();
+        assert!(state.set_file_mode("/data/link".into(), 0o600).is_err());
+        assert_eq!(std::fs::read_to_string(read.join("file")).unwrap(), "outside");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stream_cancellation_interrupts_backlog_wait() {
+        let (post, _events) = Poster::testing();
+        post.backlog.store(MAX_BACKLOG + 1, Ordering::Relaxed);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let c = cancel.clone();
+        let worker = std::thread::spawn(move || post.data_until(1, Event::HttpBody((1, vec![0])), &c));
+        std::thread::sleep(Duration::from_millis(20));
+        cancel.store(true, Ordering::Relaxed);
+        let end = Instant::now() + Duration::from_secs(1);
+        while !worker.is_finished() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(worker.is_finished());
+        assert!(!worker.join().unwrap());
     }
 }

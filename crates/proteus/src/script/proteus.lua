@@ -55,7 +55,7 @@ function Pane:read_screen(opts) end
 ---@field id integer
 ---@field command string?
 ---@field cwd string?
----@field exit_code integer?
+---@field exit_code integer? nil means unknown (e.g. a nested shell prompt); it is not failure.
 ---@field duration number? Seconds.
 ---@field block integer? Block id (for `pane:block_text`).
 ---@field state ("prompt"|"input"|"running"|"finished")?
@@ -82,6 +82,7 @@ function Pane:block_text(block, part) end
 ---| "command_finished" # { pane, command, exit_code, duration }
 ---| "bell"             # { pane }
 ---| "config_changed"   # {} after a reload
+---| "theme_changed"    # {} after configured theme colors change
 ---| "block_state_changed" # { pane, block, state } a prompt, command or result began
 
 ---@class proteus.EventData
@@ -91,21 +92,79 @@ function Pane:block_text(block, part) end
 ---@field cwd string?
 ---@field title string?
 ---@field command string?
----@field exit_code integer?
+---@field exit_code integer? nil means unknown (e.g. a nested shell prompt); it is not failure.
 ---@field duration number? Seconds.
 
 ---@class proteus.Timer
 local Timer = {}
 function Timer:stop() end
 
+---@class proteus.ThemeUi
+---@field foreground (string|false)? Chrome text; false restores automatic colors.
+---@field background (string|false)? Chrome background.
+---@field accent (string|false)? Active tabs, focus borders, mode badges and hints.
+---@field bar (string|false)? Inactive tabs and bars.
+---@field dim (string|false)? Inactive text and dividers.
+---@field selection_foreground (string|false)?
+---@field selection_background (string|false)?
+---@field search_foreground (string|false)?
+---@field search_background (string|false)?
+---@field search_current_background (string|false)?
+---@field cursor_text (string|false)? Text beneath a block cursor.
+---@field bell (string|false)? Visual bell tint.
+
+---@class proteus.Theme
+---@field preset ("default"|"dark"|"light")? Reset theme before applying overrides.
+---@field foreground string? Hex or X11 RGB color.
+---@field background string?
+---@field cursor (string|false)? false restores the cell-based cursor color.
+---@field ansi string[]? Exactly 16 colors, ordered black through bright white.
+---@field indexed table<integer,string|false>? Palette overrides keyed 0–255; false resets an entry.
+---@field ui proteus.ThemeUi?
+
+---@class proteus.Font
+---@field family string? Regular font family or fontconfig pattern.
+---@field size number? Font size in points, 4–96.
+---@field ligatures boolean?
+---@field bold_family (string|false)? false restores automatic style selection.
+---@field italic_family (string|false)?
+---@field bold_italic_family (string|false)?
+---@field cell_width (number|false)? Logical pixels, 1–512; false uses font metrics.
+---@field cell_height (number|false)? Logical pixels, 1–512; false uses font metrics.
+---@field letter_spacing number? Extra logical pixels per cell, -64–256.
+---@field line_spacing number? Extra logical pixels per row, -64–256.
+---@field offset_x number? Glyph offset in logical pixels, -256–256.
+---@field offset_y number? Baseline offset in logical pixels, positive down, -256–256.
+
+---@class proteus.Window
+---@field width (integer|false)? Initial whole-window width in logical pixels, 100–8192.
+---@field height (integer|false)? Initial whole-window height in logical pixels, 60–8192.
+---@field columns (integer|false)? Initial grid columns, 2–8192, default 80.
+---@field rows (integer|false)? Initial grid rows, 1–8192, default 24.
+
+---@class proteus.PluginConfig
+---@field source string? A WASM file, package/source directory, Git URL or raw WASM URL.
+---@field path string? Alias for source; specify exactly one of source, path or url.
+---@field url string? Alias for source.
+---@field sha256 string? Expected SHA-256 of the compiled/downloaded WASM artifact.
+---@field rev string? Git revision; cached snapshots are keyed by URL and revision.
+---@field subdir string? Package directory within a repository.
+---@field id string? ID for a bare WASM file; must match a package manifest if present.
+---@field config table? Plugin-owned settings, passed unchanged as JSON; schema belongs to the plugin.
+---@field permissions table? Replaces the manifest permissions; omitted uses the manifest.
+
 ---@class proteus.Config
----@field font { family: string?, size: number?, ligatures: boolean? }?
----@field cursor { blink: (boolean|"app")? }?
+---@field ipc { socket: string }? Opt-in same-user control socket; startup only.
+---@field language string? UI locale; default LC_ALL/LC_MESSAGES/LANG, then English.
+---@field theme proteus.Theme?
+---@field window proteus.Window?
+---@field font proteus.Font?
+---@field cursor { blink: (boolean|"app")?, shape: ("app"|"block"|"bar"|"underline")? }?
 ---@field text { grapheme_clustering: boolean?, ambiguous_width: (1|2)? }?
 ---@field clipboard { osc52_read: ("ask"|"allow"|"deny")?, osc52_write: boolean?, paste_protection: boolean? }?
----@field shell { command: (string|string[])?, integration: boolean? }?
+---@field shell { command: (string|string[])?, integration: boolean?, term: string? }?
 ---@field scrollback integer?
----@field ui { hint_bar: ("in-mode"|"always"|"never")?, tab_bar: ("auto"|"always"|"never")?, pane_titles: ("auto"|"always"|"never")?, gutter: number? }?
+---@field ui { hint_bar: ("in-mode"|"always"|"never")?, tab_bar: ("auto"|"always"|"never")?, pane_titles: ("auto"|"always"|"never")?, gutter: number?, padding: (number|{horizontal: number?, vertical: number?})?, pane_gap: (number|false)?, border_width: number? }?
 ---@field panes { confirm_close: boolean?, confirm_close_ignore: string[]?, keep_last_shell: boolean? }?
 ---@field session { restore: ("ask"|"always"|"never")?, restore_commands: string[]? }?
 ---@field notify { min_duration: (number|false)?, osc: boolean? }?
@@ -132,14 +191,16 @@ function Timer:stop() end
 ---@alias proteus.Line string|proteus.Span|(string|proteus.Span)[]
 
 ---@class proteus.UiEvent
----@field type "key"|"text"|"preedit"|"mouse"|"resize"|"focus"|"close"|"drop"
+---@field type "key"|"text"|"preedit"|"mouse"|"resize"|"focus"|"close"|"drop"|"accessibility"
 ---@field key string? key: `a`, `enter`, `escape`, `up`, `page-down`, `f5`, ...
 ---@field text string? key, text: what was typed; preedit: the composition (nil: it ended)
 ---@field cursor integer? preedit: byte offset of its cursor
 ---@field mods { shift: boolean, ctrl: boolean, alt: boolean, logo: boolean }? key, mouse
 ---@field repeat boolean? key
 ---@field button ("left"|"middle"|"right"|"wheel_up"|"wheel_down")? mouse
----@field action ("press"|"release"|"drag")? mouse
+---@field node string? accessibility: stable semantic node ID
+---@field value string? accessibility: replacement text
+---@field action ("press"|"release"|"drag"|"focus"|"activate"|"select"|"set_value"|"scroll_up"|"scroll_down")? mouse or accessibility
 ---@field col integer? mouse (1-based)
 ---@field row integer? mouse (1-based)
 ---@field cols integer? resize
@@ -175,9 +236,29 @@ function Surface:size() end
 ---@field version string
 local p = {}
 
+p.i18n = {}
+---Effective normalized locale, for example zh-cn.
+---@return string
+function p.i18n.locale() end
+---Load a standard Fluent (.ftl) resource while config loads. Later entries override earlier ones.
+---@param locale string
+---@param source string
+function p.i18n.load(locale, source) end
+---Format a Fluent message or message.attribute with typed arguments; errors are reported to Lua.
+---@param id string
+---@param args table<string,string|number|boolean>?
+---@return string
+function p.i18n.t(id, args) end
+
+
 ---Set options; later calls override earlier keys. Only while the config loads.
 ---@param cfg proteus.Config
 function p.config(cfg) end
+
+---Load a WASM plugin from a local path or URL. Rust sources are built and cached.
+---Only while config loads; calls accumulate in order. Lua modules use require().
+---@param config proteus.PluginConfig
+function p.load_plugin(config) end
 
 ---Bind a key in a mode to an action name (`proteus --list-actions`), a
 ---function, or "none"/false to unbind. Only while the config loads.
@@ -241,7 +322,7 @@ p.palette = {}
 function p.palette.add(name, f) end
 
 p.ui = {}
----A surface drawn like a plugin's (only in callbacks). Draw it on its
+---A config-owned UI surface (only in callbacks). Draw it on its
 ---first `resize` event; it closes when the config reloads.
 ---@param opts proteus.SurfaceOpts?
 ---@return proteus.Surface

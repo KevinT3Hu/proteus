@@ -3,16 +3,18 @@
 //! Settings come from `$XDG_CONFIG_HOME/proteus/init.lua` (see [`config`]);
 //! command-line options override them.
 
-mod bundled;
+mod appearance;
 mod config;
 mod gui;
+mod i18n;
 mod icat;
+mod ipc;
 mod layout;
 mod modes;
-mod plugin_cli;
 mod script;
 mod session;
 mod spec;
+mod theme;
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -32,12 +34,24 @@ use clap::Parser;
 struct Cli {
     #[command(subcommand)]
     tool: Option<Tool>,
-    /// Config file [default: $XDG_CONFIG_HOME/proteus/init.lua].
-    #[arg(short, long, value_name = "FILE", conflicts_with = "no_config")]
+    /// Lua config file [default: $XDG_CONFIG_HOME/proteus/init.lua].
+    #[arg(short = 'c', long, value_name = "FILE", conflicts_with = "no_config")]
     config: Option<PathBuf>,
     /// Ignore the config file and use built-in defaults.
     #[arg(long)]
     no_config: bool,
+    /// Evaluate the config and exit without opening a window or loading WASM plugins.
+    #[arg(long)]
+    check_config: bool,
+    /// Print configured keybindings as JSON (runtime plugin defaults require a running plugin).
+    #[arg(long)]
+    list_keybindings: bool,
+    /// Print support diagnostics without opening a window.
+    #[arg(long)]
+    diagnostics: bool,
+    /// Enable same-user local control on this Unix socket.
+    #[arg(long, value_name = "SOCKET")]
+    listen: Option<PathBuf>,
     /// Font family or fontconfig pattern (overrides `font.family`).
     #[arg(long, value_name = "FAMILY")]
     font: Option<String>,
@@ -64,9 +78,9 @@ enum Tool {
     /// Show images in the terminal (kitty graphics protocol).
     #[command(name = "+icat")]
     Icat(icat::Icat),
-    /// Install and manage WASM plugins.
-    #[command(name = "+plugin")]
-    Plugin(plugin_cli::Plugin),
+    /// Control an existing terminal instance.
+    #[command(name = "+msg")]
+    Msg(ipc::Client),
 }
 
 /// The config, the file it came from (watched for changes) and its error.
@@ -79,6 +93,16 @@ fn load_config(cli: &Cli) -> (config::Loaded, Option<PathBuf>, Option<String>) {
         None => (config::default_path(), false),
     };
     let Some(path) = path else { return (config::defaults(), None, None) };
+    // Keep require(), relative plugin sources, and reload watches anchored
+    // to the selected file even when -c names a relative path.
+    let path = if path.is_absolute() {
+        path
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(path),
+            Err(e) => return (config::defaults(), None, Some(format!("config directory: {e}"))),
+        }
+    };
     match config::load(&path, explicit) {
         Ok(c) => (c, Some(path), None),
         Err(e) => (config::defaults(), Some(path), Some(e)),
@@ -89,7 +113,15 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.tool {
         Some(Tool::Icat(args)) => return ExitCode::from(icat::run(args)),
-        Some(Tool::Plugin(args)) => return ExitCode::from(plugin_cli::run(args)),
+        Some(Tool::Msg(args)) => {
+            return match args.run() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("proteus: {e}");
+                    ExitCode::from(2)
+                }
+            };
+        }
         None => {}
     }
     if cli.list_actions {
@@ -113,6 +145,65 @@ fn main() -> ExitCode {
         };
     }
     let (mut loaded, config_path, error) = load_config(&cli);
+    if cli.check_config || cli.diagnostics || cli.list_keybindings {
+        if cli.diagnostics {
+            println!("proteus {}", env!("CARGO_PKG_VERSION"));
+            println!("platform: {} / {}", std::env::consts::OS, std::env::consts::ARCH);
+            println!(
+                "config: {}",
+                config_path.as_ref().map_or_else(|| "built-in defaults".into(), |p| p.display().to_string())
+            );
+            println!("font: {} ({} pt)", loaded.config.font_family, loaded.config.font_size);
+            println!("plugins declared: {}", loaded.config.plugins.len());
+            for key in
+                ["WAYLAND_DISPLAY", "XDG_SESSION_TYPE", "XDG_CURRENT_DESKTOP", "LANG", "LC_ALL", "TERM", "COLORTERM"]
+            {
+                if let Some(value) = std::env::var_os(key) {
+                    println!("{key}: {}", value.to_string_lossy().escape_debug());
+                }
+            }
+            println!(
+                "child TERM: {}",
+                loaded.config.term.as_deref().unwrap_or("auto (proteus with terminfo, otherwise xterm-256color)")
+            );
+            match gui::diagnostic_protocols() {
+                Ok(protocols) => println!("Wayland protocols:\n  {}", protocols.join("\n  ")),
+                Err(e) => println!("Wayland unavailable: {e}"),
+            }
+            let mut seen = Vec::new();
+            for (mode, chord, _) in &loaded.config.keys.binds {
+                if seen.contains(&(*mode, *chord)) {
+                    println!("keybinding override: {} / {} (last declaration wins)", mode.key(), chord.label());
+                }
+                seen.push((*mode, *chord));
+            }
+            println!("Selected GPU is reported in window startup logs.");
+        }
+        if error.is_none() && cli.list_keybindings {
+            let keymap = loaded.config.keymap();
+            let bindings: Vec<_> = modes::MODES
+                .into_iter()
+                .flat_map(|mode| {
+                    keymap.bindings(mode).iter().map(move |(chord, action)| {
+                    serde_json::json!({"mode": mode.key(), "key": chord.label(), "action": action.name()})
+                })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&bindings).expect("JSON values serialize"));
+        }
+        return match error {
+            Some(e) => {
+                eprintln!("proteus: {e}");
+                ExitCode::from(2)
+            }
+            None => {
+                if cli.check_config {
+                    println!("Config OK");
+                }
+                ExitCode::SUCCESS
+            }
+        };
+    }
     if let Some(e) = &error {
         eprintln!("proteus: config error, using defaults: {e}");
     }
@@ -133,7 +224,7 @@ fn main() -> ExitCode {
                 }
             },
         };
-    match gui::run(loaded, config_path, overrides, error, command, layout) {
+    match gui::run(loaded, config_path, overrides, error, command, layout, cli.listen) {
         Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
         Err(e) => {
             eprintln!("proteus: {e}");
@@ -148,12 +239,40 @@ mod tests {
     use clap::CommandFactory;
 
     #[test]
+    fn relative_custom_config_loads_its_modules() {
+        let cli = Cli::try_parse_from(["proteus", "-c", "../../examples/config/init.lua"]).unwrap();
+        let (loaded, path, error) = load_config(&cli);
+        assert!(error.is_none(), "{error:?}");
+        assert!(path.unwrap().is_absolute());
+        assert_eq!(loaded.config.font_size, 13.0);
+        assert!(loaded.script.has_segments());
+        assert!(loaded.script.has_hooks("command_finished"));
+    }
+
+    #[test]
     fn cli() {
         Cli::command().debug_assert();
         let c = Cli::try_parse_from(["proteus", "--font-size", "14", "--", "htop", "-d", "5"]).unwrap();
         assert_eq!(c.font_size, Some(14.0));
         assert_eq!(c.command, ["htop", "-d", "5"]);
         assert!(Cli::try_parse_from(["proteus", "--no-config", "-c", "x.lua"]).is_err());
+        for flag in ["-c", "--config"] {
+            let c = Cli::try_parse_from(["proteus", flag, "custom.lua"]).unwrap();
+            assert_eq!(c.config, Some(PathBuf::from("custom.lua")));
+        }
+        assert!(Cli::try_parse_from(["proteus", "-c"]).is_err());
+        assert!(matches!(
+            Cli::try_parse_from(["proteus", "+msg", "--socket", "/tmp/test.sock", "list"]).unwrap().tool,
+            Some(Tool::Msg(_))
+        ));
+        assert!(Cli::try_parse_from(["proteus", "+msg", "split", "--axis", "invalid"]).is_err());
+        assert_eq!(
+            Cli::try_parse_from(["proteus", "--listen", "/tmp/test.sock"]).unwrap().listen,
+            Some(PathBuf::from("/tmp/test.sock"))
+        );
+        assert!(Cli::try_parse_from(["proteus", "--check-config"]).unwrap().check_config);
+        assert!(Cli::try_parse_from(["proteus", "--diagnostics"]).unwrap().diagnostics);
+        assert!(Cli::try_parse_from(["proteus", "--list-keybindings"]).unwrap().list_keybindings);
         // The old subcommands are gone.
         assert!(Cli::try_parse_from(["proteus", "run"]).is_err());
         assert_eq!(Cli::try_parse_from(["proteus", "-l", "dev"]).unwrap().layout.as_deref(), Some("dev"));
@@ -169,11 +288,6 @@ mod tests {
         // Window options do not mix with tools.
         assert!(Cli::try_parse_from(["proteus", "--no-config", "+icat", "a.png"]).is_err());
         assert!(Cli::try_parse_from(["proteus", "--", "htop"]).unwrap().tool.is_none());
-        let c = Cli::try_parse_from(["proteus", "+plugin", "install", "--yes", "./x"]).unwrap();
-        assert!(matches!(
-            c.tool,
-            Some(Tool::Plugin(plugin_cli::Plugin { cmd: plugin_cli::Cmd::Install { yes: true, .. } }))
-        ));
-        assert!(Cli::try_parse_from(["proteus", "+plugin", "revoke", "a.b"]).is_err());
+        assert!(Cli::try_parse_from(["proteus", "+plugin", "install", "./x"]).is_err());
     }
 }

@@ -19,7 +19,11 @@ fn fixture() -> Option<&'static [u8]> {
         let sysroot = Command::new("rustc").args(["--print", "sysroot"]).output().ok()?;
         let sysroot = PathBuf::from(String::from_utf8_lossy(&sysroot.stdout).trim());
         if !sysroot.join("lib/rustlib/wasm32-wasip2").is_dir() {
-            eprintln!("skipping: no wasm32-wasip2 target (rustup target add wasm32-wasip2)");
+            assert!(
+                std::env::var_os("PROTEUS_REQUIRE_WASM_TESTS").is_none(),
+                "wasm32-wasip2 is required for this test job"
+            );
+            eprintln!("skipping: no wasm32-wasip2 target (set PROTEUS_REQUIRE_WASM_TESTS=1 in WASI CI)");
             return None;
         }
         let ok = Command::new(cargo)
@@ -61,8 +65,9 @@ fn start(name: &str, granted: Permissions) -> Option<Host> {
         let _ = tx.lock().unwrap().send((k, m));
     });
     let spec = Spec {
+        config: serde_json::json!({"position": "right", "width": 40}),
         key: Key { id: name.into(), instance: 1 },
-        hash: proteus_wasm::store::sha256(&wasm),
+        hash: proteus_wasm::source::sha256(&wasm),
         wasm,
         granted,
         data_dir: data.clone(),
@@ -87,6 +92,7 @@ impl Host {
             match m {
                 FromPlugin::Call(c, reply) => {
                     let answer = match &c {
+                        Call::Locale => Ok(Reply::Text("zh-CN".into())),
                         Call::ListPanes => {
                             Ok(Reply::Panes(vec![PaneInfo { id: 1, title: "sh".into(), ..pane() }, pane()]))
                         }
@@ -101,7 +107,8 @@ impl Host {
                     match c {
                         Call::Notify { text, .. } => seen.push(text),
                         Call::Draw(s, f) => seen.push(format!("draw {s} {}", f.lines[0][0].text)),
-                        Call::RegisterAction(a, _) => seen.push(format!("action {a}")),
+                        Call::SetSurfaceTitle(s, title) => seen.push(format!("title {s} {title}")),
+                        Call::RegisterAction { id, name, .. } => seen.push(format!("action {id} ({name})")),
                         _ => {}
                     }
                 }
@@ -161,11 +168,13 @@ fn pane() -> PaneInfo {
 fn permissions_are_enforced() {
     let granted = Permissions { read_panes: true, ui: true, ..Permissions::default() };
     let Some(h) = start("perms", granted) else { return };
-    assert_eq!(h.wait(|m| matches!(m, FromPlugin::Started)), ["action fixture", "init", "started"]);
+    assert_eq!(h.wait(|m| matches!(m, FromPlugin::Started)), ["action fixture (Fixture action)", "init", "started"]);
+    assert_eq!(h.act("fixture"), ["fixture invoked"]);
     assert_eq!(h.act("panes"), ["panes: Ok(2)"]);
     assert_eq!(h.act("type"), [r#"type: Err("permission denied: write-pty")"#]);
     assert_eq!(h.act("screen"), [r#"screen: Err("permission denied: read-screen")"#]);
     assert_eq!(h.act("surface"), ["draw 7 hello", "surface: Ok(7)"]);
+    assert_eq!(h.act("surface-title"), ["title 7 文件", "title: Ok(())"]);
     // Its data directory works; the rest of the file system is not there.
     assert_eq!(h.act_n("fs", 3), ["write: Ok(())", r#"read: Ok("hi")"#, "etc: Err(NotFound)"]);
     assert_eq!(std::fs::read_to_string(h.data.join("x")).unwrap(), "hi");
@@ -215,4 +224,44 @@ fn failures_stop_the_instance() {
     let seen = h.wait(|m| matches!(m, FromPlugin::Failed(_) | FromPlugin::Exited));
     assert_eq!(seen, ["failed: stopped"]);
     assert!(t.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
+fn queued_events_do_not_starve_timers_and_file_modes_are_scoped() {
+    let Some(h) = start("fairness", Permissions { ui: true, ..Default::default() }) else { return };
+    h.wait(|m| matches!(m, FromPlugin::Started));
+    h.handle.event(Event::Action("timer".into()));
+    for _ in 0..30 {
+        h.handle.event(Event::Action("work".into()));
+    }
+    h.handle.event(Event::Action("sentinel".into()));
+    let seen = h.wait(|m| matches!(m, FromPlugin::Call(Call::Notify { text, .. }, _) if text == "sentinel"));
+    assert_eq!(seen, ["timer 1", "sentinel"]);
+    assert_eq!(
+        h.act_n("modes", 4),
+        [
+            "private mode: Ok(384)",
+            "chmod: Ok(())",
+            "new mode: Ok(448)",
+            "outside grant: Err(\"/etc/hostname: not inside the plugin's directories (permission `fs`)\")"
+        ]
+    );
+}
+
+#[test]
+fn sdk_translates_using_the_host_locale() {
+    let Some(h) = start("locale", Permissions { ui: true, ..Permissions::default() }) else { return };
+    h.wait(|m| matches!(m, FromPlugin::Started));
+    h.handle.event(Event::Action("locale".into()));
+    let seen = h.wait(|m| matches!(m, FromPlugin::Call(Call::Notify { text, .. }, _) if text == "你好 WASM"));
+    assert!(seen.iter().any(|s| s == "你好 WASM"));
+    let seen = h.wait(|m| matches!(m, FromPlugin::Call(Call::Notify { text, .. }, _) if text == "WASM plural: other"));
+    assert!(seen.iter().any(|s| s == "WASM plural: other"));
+}
+
+#[test]
+fn plugin_reads_its_own_config() {
+    let Some(h) = start("config", Permissions { ui: true, ..Permissions::default() }) else { return };
+    h.wait(|m| matches!(m, FromPlugin::Started));
+    assert_eq!(h.act("config"), ["config: \"right\" 40"]);
 }
