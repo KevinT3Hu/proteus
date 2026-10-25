@@ -466,33 +466,75 @@ pub fn rename_plan(dir: &Path, names: &[String], edited: &str) -> Result<Vec<(Pa
 /// Carry out renames (also swaps and cycles: through temporary names).
 /// Returns those done.
 pub fn rename_all(pairs: &[(PathBuf, PathBuf)]) -> Result<Vec<(PathBuf, PathBuf)>, String> {
-    let mut tmp = Vec::new();
-    for (i, (from, _)) in pairs.iter().enumerate() {
-        let t = from.with_file_name(format!(".proteus-rename-{i}-{}", std::process::id()));
-        if let Err(e) = std::fs::rename(from, &t) {
-            // Put back what was moved.
-            for ((f, _), t) in pairs.iter().zip(&tmp) {
-                let _ = std::fs::rename(t, f);
+    rename_all_with(pairs, |_, _| {})
+}
+
+fn rename_all_with(
+    pairs: &[(PathBuf, PathBuf)],
+    staged: impl FnOnce(&[(PathBuf, PathBuf)], &[PathBuf]),
+) -> Result<Vec<(PathBuf, PathBuf)>, String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let mut tmp = Vec::<PathBuf>::new();
+    let mut directories = Vec::new();
+    for (from, _) in pairs {
+        // Reserve a private directory exclusively, then keep its entry until
+        // publication or recovery. Existing staging paths are never replaced.
+        let result = (|| {
+            let dir = loop {
+                let dir = from.with_file_name(format!(
+                    ".proteus-rename-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                match create_private(&dir, true) {
+                    Ok(()) => break dir,
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => return Err(e),
+                }
+            };
+            let t = dir.join("entry");
+            directories.push(dir);
+            publish_file(from, &t, false)?;
+            Ok(t)
+        })();
+        let t = match result {
+            Ok(t) => t,
+            Err(e) => {
+                // Put back what was moved.
+                let mut errors = vec![format!("{}: {e}", from.display())];
+                for ((f, _), t) in pairs.iter().zip(&tmp) {
+                    if let Err(e) = publish_file(t, f, false) {
+                        errors.push(format!("recovery file {}: {e}", t.display()));
+                    }
+                }
+                for dir in directories {
+                    let _ = std::fs::remove_dir(dir);
+                }
+                return Err(errors.join("\n"));
             }
-            return Err(format!("{}: {e}", from.display()));
-        }
+        };
         tmp.push(t);
     }
+    staged(pairs, &tmp);
     let mut done = Vec::new();
-    let mut err = None;
+    let mut errors = Vec::new();
     for ((from, to), t) in pairs.iter().zip(&tmp) {
-        match std::fs::rename(t, to) {
+        match publish_file(t, to, false) {
             Ok(()) => done.push((from.clone(), to.clone())),
             Err(e) => {
-                let _ = std::fs::rename(t, from);
-                err.get_or_insert(format!("{}: {e}", to.display()));
+                let recovery = match publish_file(t, from, false) {
+                    Ok(()) => String::new(),
+                    Err(e) => format!("; recovery file {}: {e}", t.display()),
+                };
+                errors.push(format!("{}: {e}{recovery}", to.display()));
             }
         }
     }
-    match err {
-        Some(e) if done.is_empty() => Err(e),
-        _ => Ok(done),
+    for dir in directories {
+        let _ = std::fs::remove_dir(dir);
     }
+    if errors.is_empty() { Ok(done) } else { Err(format!("{} renames completed; {}", done.len(), errors.join("\n"))) }
 }
 
 /// Where the home trash put `path` (the newest), if it is there.
@@ -733,6 +775,53 @@ mod tests {
         assert!(d.join("a/x.txt").exists());
         assert_eq!(std::fs::read(d.join("a/sub/y")).unwrap(), b"y");
         std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn bulk_rename_preserves_staging_collisions_and_racing_destinations() {
+        let root = tmp("rename-collisions");
+        let from = root.join("source");
+        let to = root.join("target");
+        std::fs::write(&from, "source data").unwrap();
+        // Cover both the old staging name and a range of reserved-directory
+        // names: all preexisting objects must survive untouched.
+        let mut occupied = vec![root.join(format!(".proteus-rename-0-{}", std::process::id()))];
+        occupied.extend((0..10).map(|n| root.join(format!(".proteus-rename-{}-{n}", std::process::id()))));
+        for p in &occupied {
+            std::fs::write(p, "unrelated data").unwrap();
+        }
+        rename_all(&[(from.clone(), to.clone())]).unwrap();
+        for p in occupied {
+            assert_eq!(std::fs::read_to_string(p).unwrap(), "unrelated data");
+        }
+        std::fs::rename(&to, &from).unwrap();
+        let result = rename_all_with(&[(from.clone(), to.clone())], |_, _| {
+            std::fs::write(&to, "concurrent writer").unwrap();
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(&to).unwrap(), "concurrent writer");
+        assert_eq!(std::fs::read_to_string(&from).unwrap(), "source data");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bulk_rename_retains_recovery_files_when_rollback_is_obstructed() {
+        let root = tmp("rename-recovery");
+        let a = root.join("one");
+        let b = root.join("two");
+        std::fs::write(&a, "one").unwrap();
+        std::fs::write(&b, "two").unwrap();
+        let mut retained = PathBuf::new();
+        let result = rename_all_with(&[(a.clone(), b.clone()), (b.clone(), a.clone())], |_, temps| {
+            retained = temps[1].clone();
+            std::fs::write(&a, "concurrent writer").unwrap();
+        });
+        let error = result.unwrap_err();
+        assert!(error.contains(&retained.display().to_string()));
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "concurrent writer");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "one");
+        assert_eq!(std::fs::read_to_string(&retained).unwrap(), "two");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

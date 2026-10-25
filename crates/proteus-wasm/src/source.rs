@@ -477,16 +477,13 @@ mod tests {
 
     #[test]
     fn real_rust_source_build_reuses_cargo_artifact() {
-        let sysroot = Command::new("rustc").args(["--print", "sysroot"]).output().unwrap();
+        let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        let sysroot = Command::new(rustc).args(["--print", "sysroot"]).output().unwrap();
         let sysroot = PathBuf::from(String::from_utf8(sysroot.stdout).unwrap().trim());
-        if !sysroot.join("lib/rustlib/wasm32-wasip2/lib").is_dir() {
-            assert!(
-                std::env::var_os("PROTEUS_REQUIRE_WASM_TESTS").is_none() && std::env::var_os("CI").is_none(),
-                "wasm32-wasip2 is required for this test job"
-            );
-            eprintln!("skipping real source compilation: no wasm32-wasip2 target");
-            return;
-        }
+        assert!(
+            sysroot.join("lib/rustlib/wasm32-wasip2/lib").is_dir(),
+            "wasm32-wasip2 is required: install it for the selected Rust compiler"
+        );
         let t = Temp::new();
         let cache = t.cache();
         let dir =

@@ -1,0 +1,64 @@
+name: Release distributions
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*'
+
+permissions:
+  contents: read
+
+jobs:
+  dist:
+    name: Linux ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check tag matches package version
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import tomllib
+
+          with open("Cargo.toml", "rb") as manifest:
+              version = tomllib.load(manifest)["workspace"]["package"]["version"]
+          expected = f"v{version}"
+          tag = os.environ["TAG_NAME"]
+          if tag != expected:
+              raise SystemExit(f"Version tag {tag!r} must match Cargo.toml: {expected!r}")
+          PY
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: wasm32-wasip2
+      - name: Install build and packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libwayland-dev libxkbcommon-dev libfontconfig1-dev dpkg-dev tar
+      - name: Build release distributions
+        env:
+          PROTEUS_DEB_MAINTAINER: ${{ vars.PROTEUS_DEB_MAINTAINER || 'Proteus contributors <maintainers@proteus.invalid>' }}
+        run: cargo run --locked --package xtask -- dist --deb
+      - name: Verify distribution checksums
+        working-directory: target/dist
+        run: sha256sum --check *.SHA256SUMS
+      - name: Upload release distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: proteus-dist-${{ github.ref_name }}-${{ matrix.arch }}
+          path: |
+            target/dist/*.tar.gz
+            target/dist/*.deb
+            target/dist/*.SHA256SUMS
+          if-no-files-found: error
+          compression-level: 0

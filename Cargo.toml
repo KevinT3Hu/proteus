@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/proteus-i18n", "crates/proteus-core", "crates/proteus-pty", "crates/proteus-wasm", "crates/proteus"]
+members = ["xtask", "crates/proteus-i18n", "crates/proteus-core", "crates/proteus-pty", "crates/proteus-wasm", "crates/proteus"]
 # Built for wasm32-wasip2 on their own (see examples/plugins/README.md).
 exclude = ["crates/proteus-plugin", "crates/proteus-wasm/tests/fixture", "examples/plugins"]
 

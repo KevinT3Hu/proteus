@@ -5,6 +5,8 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{OnceLock, mpsc};
+use std::time::Duration;
 
 use rustix::fs::{Mode, OFlags};
 use rustix::process::Pid;
@@ -122,7 +124,45 @@ pub struct ForegroundProcess {
 /// A child process attached to a pseudo-terminal.
 pub struct Pty {
     master: File,
-    child: Child,
+    child: Option<Child>,
+    reaper: mpsc::Sender<Child>,
+}
+
+/// Keep ownership of children after panes disappear. One polling worker reaps
+/// all of them, so a child ignoring HUP cannot block the GUI or other reaping.
+fn reaper() -> io::Result<mpsc::Sender<Child>> {
+    static REAPER: OnceLock<io::Result<mpsc::Sender<Child>>> = OnceLock::new();
+    REAPER
+        .get_or_init(|| {
+            let (tx, rx) = mpsc::channel::<Child>();
+            std::thread::Builder::new().name("pty-reaper".into()).spawn(move || {
+                let mut children = Vec::<Child>::new();
+                loop {
+                    if children.is_empty() {
+                        match rx.recv() {
+                            Ok(child) => children.push(child),
+                            Err(_) => break,
+                        }
+                    }
+                    match rx.recv_timeout(Duration::from_millis(25)) {
+                        Ok(child) => children.push(child),
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) if children.is_empty() => break,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => std::thread::sleep(Duration::from_millis(25)),
+                    }
+                    children.extend(rx.try_iter().take(64));
+                    children.retain_mut(|child| match child.try_wait() {
+                        Ok(None) => true,
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => true,
+                        _ => false,
+                    });
+                }
+            })?;
+            Ok(tx)
+        })
+        .as_ref()
+        .cloned()
+        .map_err(|e| io::Error::new(e.kind(), e.to_string()))
 }
 
 /// Open a master and its slave. Prefers `TIOCGPTPEER` (no path lookup race).
@@ -149,6 +189,8 @@ impl Pty {
     /// Spawn `spec` as session leader with the PTY as controlling terminal.
     /// `TERM`, `COLORTERM` and `TERM_PROGRAM*` are set unless `spec` overrides them.
     pub fn spawn(spec: &CommandSpec, size: WindowSize) -> io::Result<Pty> {
+        // Establish the cleanup worker before starting a child.
+        let reaper = reaper()?;
         let (master, slave) = open_pair()?;
         termios::tcsetwinsize(&slave, size.to_winsize())?;
 
@@ -181,7 +223,7 @@ impl Pty {
             });
         }
         let child = cmd.spawn()?;
-        Ok(Pty { master: File::from(master), child })
+        Ok(Pty { master: File::from(master), child: Some(child), reaper })
     }
 
     /// Handle to read output from / write input to the child.
@@ -205,7 +247,7 @@ impl Pty {
     }
 
     pub fn child_pid(&self) -> i32 {
-        self.child.id() as i32
+        self.child.as_ref().expect("owned until drop").id() as i32
     }
 
     /// Process group in the foreground of the terminal.
@@ -236,11 +278,11 @@ impl Pty {
     }
 
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        self.child.try_wait()
+        self.child.as_mut().expect("owned until drop").try_wait()
     }
 
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
-        self.child.wait()
+        self.child.as_mut().expect("owned until drop").wait()
     }
 
     /// Send SIGHUP to the session, as closing a terminal does.
@@ -253,15 +295,13 @@ impl Pty {
 
 impl Drop for Pty {
     fn drop(&mut self) {
-        if matches!(self.child.try_wait(), Ok(None)) {
+        if matches!(self.try_wait(), Ok(None)) {
             self.hangup();
-            // Reap if it exits promptly; otherwise leave it (no blocking in drop).
-            for _ in 0..10 {
-                if !matches!(self.child.try_wait(), Ok(None)) {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
+        }
+        if let Some(child) = self.child.take() {
+            // The process-wide sender keeps the receiver alive; the worker
+            // owns this handle until wait succeeds, even after a delayed exit.
+            let _ = self.reaper.send(child);
         }
     }
 }
@@ -331,5 +371,45 @@ mod tests {
             out.extend_from_slice(&buf[..n]);
         }
         assert!(pty.raw_input());
+    }
+
+    #[test]
+    fn dropped_children_are_reaped_without_waiting_for_hup_resistant_child() {
+        let slow = Pty::spawn(
+            &CommandSpec::new("/bin/sh").args(["-c", "trap '' HUP; echo ready; exec sleep 30"]),
+            WindowSize::new(80, 24),
+        )
+        .unwrap();
+        let slow_pid = slow.child_pid();
+        let mut reader = slow.try_clone_master().unwrap();
+        let mut buf = [0; 64];
+        assert!(reader.read(&mut buf).unwrap() > 0);
+        drop(reader);
+        let start = std::time::Instant::now();
+        drop(slow);
+        assert!(start.elapsed() < Duration::from_millis(100));
+
+        let fast = Pty::spawn(
+            &CommandSpec::new("/bin/sh").args(["-c", "trap '' HUP; echo ready; exec sleep 0.2"]),
+            WindowSize::new(80, 24),
+        )
+        .unwrap();
+        let fast_pid = fast.child_pid();
+        let mut reader = fast.try_clone_master().unwrap();
+        assert!(reader.read(&mut buf).unwrap() > 0);
+        drop(reader);
+        drop(fast);
+        let wait_reaped = |pid| {
+            let end = std::time::Instant::now() + Duration::from_secs(3);
+            while std::path::Path::new(&format!("/proc/{pid}")).exists() && std::time::Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            !std::path::Path::new(&format!("/proc/{pid}")).exists()
+        };
+        let fast_reaped = wait_reaped(fast_pid);
+        // Clean up the deliberately persistent child even if the assertion fails.
+        let _ = rustix::process::kill_process_group(Pid::from_raw(slow_pid).unwrap(), rustix::process::Signal::KILL);
+        assert!(wait_reaped(slow_pid));
+        assert!(fast_reaped, "a live child must not delay reaping a later exit");
     }
 }

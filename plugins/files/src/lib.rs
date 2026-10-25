@@ -1371,7 +1371,10 @@ impl State {
                     self.undo = Some(Undo::Renamed(done));
                     self.changed();
                 }
-                Err(e) => self.say(id, e, true),
+                Err(e) => {
+                    self.changed();
+                    self.say(id, e, true);
+                }
             },
             _ => {}
         }
@@ -1667,10 +1670,8 @@ impl State {
                     ui.input = Some(TextInput::new(&value));
                     ui.view.set_filter(&value);
                 }
-                A::Focus => {
-                    if ui.input.is_none() {
-                        ui.input = Some(TextInput::new(&ui.view.filter));
-                    }
+                A::Focus if ui.input.is_none() => {
+                    ui.input = Some(TextInput::new(&ui.view.filter));
                 }
                 _ => {}
             }

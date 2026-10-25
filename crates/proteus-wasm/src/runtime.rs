@@ -16,8 +16,9 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::limits::Limits;
 use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
-use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder, UpdateDeadline};
+use wasmtime::{Config, Engine, Store, UpdateDeadline};
 use wasmtime_wasi::{FsPerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use crate::files::{self, Access, Watcher};
@@ -36,7 +37,7 @@ wasmtime::component::bindgen!({
 pub use proteus::plugin::types;
 use types::*;
 
-/// Default memory limit of an instance.
+/// Guest allocation budget (all linear memories and table slots) per instance.
 pub const MEMORY: usize = 256 << 20;
 /// Longest a single call into a plugin may run.
 pub const CALL_LIMIT: Duration = Duration::from_secs(5);
@@ -336,7 +337,7 @@ struct State {
     sink: Sink,
     wasi: WasiCtx,
     table: ResourceTable,
-    limits: StoreLimits,
+    limits: Limits,
     /// When the current call into the plugin started (moved forward by the
     /// time spent in the host).
     call_start: Instant,
@@ -1111,7 +1112,7 @@ fn run(
         sink: sink.clone(),
         wasi: wasi.build(),
         table: ResourceTable::new(),
-        limits: StoreLimitsBuilder::new().memory_size(spec.memory).instances(32).tables(64).build(),
+        limits: Limits::new(spec.memory),
         call_start: Instant::now(),
         stop: post.stop.clone(),
         timers: BTreeMap::new(),
@@ -1229,7 +1230,7 @@ mod tests {
             sink: Arc::new(|_, _| {}),
             wasi: WasiCtxBuilder::new().build(),
             table: ResourceTable::new(),
-            limits: StoreLimitsBuilder::new().build(),
+            limits: Limits::new(MEMORY),
             call_start: Instant::now(),
             stop: post.stop.clone(),
             timers: BTreeMap::new(),

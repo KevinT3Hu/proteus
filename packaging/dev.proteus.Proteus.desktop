@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Proteus
+Comment=Wayland terminal with workspaces and extensible panes
+Exec=proteus
+Icon=dev.proteus.Proteus
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=terminal;shell;console;
+StartupNotify=true

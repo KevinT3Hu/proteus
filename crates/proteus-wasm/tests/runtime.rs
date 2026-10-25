@@ -9,39 +9,36 @@ use std::time::{Duration, Instant};
 use proteus_wasm::types::{Event, PaneInfo};
 use proteus_wasm::{Call, FromPlugin, Key, Permissions, Reply, Runtime, Spec};
 
-/// The fixture component, or `None` if the wasm32-wasip2 target is missing.
-fn fixture() -> Option<&'static [u8]> {
-    static WASM: OnceLock<Option<Vec<u8>>> = OnceLock::new();
+/// A real fixture component. Missing prerequisites fail rather than skip tests.
+fn fixture() -> &'static [u8] {
+    static WASM: OnceLock<Vec<u8>> = OnceLock::new();
     WASM.get_or_init(|| {
         if let Some(path) = std::env::var_os("PROTEUS_WASM_FIXTURE") {
             let bytes = std::fs::read(path).expect("read explicit fixture component");
             assert!(bytes.starts_with(b"\0asm"), "fixture must be WebAssembly");
-            return Some(bytes);
+            return bytes;
         }
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture");
         let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/plugin-fixture");
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-        let sysroot = Command::new("rustc").args(["--print", "sysroot"]).output().expect("locate Rust sysroot");
+        let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        let sysroot = Command::new(rustc).args(["--print", "sysroot"]).output().expect("locate Rust sysroot");
         let sysroot = PathBuf::from(String::from_utf8_lossy(&sysroot.stdout).trim());
-        if !sysroot.join("lib/rustlib/wasm32-wasip2/lib").is_dir() {
-            assert!(
-                std::env::var_os("PROTEUS_REQUIRE_WASM_TESTS").is_none() && std::env::var_os("CI").is_none(),
-                "wasm32-wasip2 is required for this test job"
-            );
-            eprintln!("skipping: no wasm32-wasip2 target (set PROTEUS_REQUIRE_WASM_TESTS=1 in WASI CI)");
-            return None;
-        }
+        assert!(
+            sysroot.join("lib/rustlib/wasm32-wasip2/lib").is_dir(),
+            "wasm32-wasip2 is required: rustup target add wasm32-wasip2, or set PROTEUS_WASM_FIXTURE to a built fixture component"
+        );
         let ok = Command::new(cargo)
-            .args(["build", "--quiet", "--locked", "--target", "wasm32-wasip2", "--manifest-path"])
+            .args(["build", "--release", "--quiet", "--locked", "--target", "wasm32-wasip2", "--manifest-path"])
             .arg(dir.join("Cargo.toml"))
             .arg("--target-dir")
             .arg(&target)
             .status()
             .is_ok_and(|s| s.success());
         assert!(ok, "building tests/fixture failed");
-        Some(std::fs::read(target.join("wasm32-wasip2/debug/fixture.wasm")).expect("read built fixture component"))
+        std::fs::read(target.join("wasm32-wasip2/release/fixture.wasm")).expect("read built fixture component")
     })
-    .as_deref()
+    .as_slice()
 }
 
 fn runtime() -> &'static Runtime {
@@ -58,8 +55,8 @@ struct Host {
     root: PathBuf,
 }
 
-fn start(name: &str, granted: Permissions) -> Option<Host> {
-    let wasm = fixture()?.to_vec();
+fn start(name: &str, granted: Permissions) -> Host {
+    let wasm = fixture().to_vec();
     let root = std::env::temp_dir().join(format!("proteus-fixture-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let data = root.join("data");
@@ -86,7 +83,7 @@ fn start(name: &str, granted: Permissions) -> Option<Host> {
         compiled: Some(data.with_extension("compiled")),
     };
     let handle = runtime().start(spec, sink).unwrap();
-    Some(Host { rx, handle, data, storage, root })
+    Host { rx, handle, data, storage, root }
 }
 
 impl Host {
@@ -176,7 +173,7 @@ fn pane() -> PaneInfo {
 #[test]
 fn permissions_are_enforced() {
     let granted = Permissions { read_panes: true, ui: true, ..Permissions::default() };
-    let Some(h) = start("perms", granted) else { return };
+    let h = start("perms", granted);
     assert_eq!(h.wait(|m| matches!(m, FromPlugin::Started)), ["action fixture (Fixture action)", "init", "started"]);
     assert_eq!(h.act("fixture"), ["fixture invoked"]);
     assert_eq!(h.act("panes"), ["panes: Ok(2)"]);
@@ -194,7 +191,7 @@ fn permissions_are_enforced() {
 
 #[test]
 fn events_need_permissions() {
-    let Some(h) = start("noperm", Permissions::default()) else { return };
+    let h = start("noperm", Permissions::default());
     // Without `ui` the action cannot be registered: init fails.
     let seen = h.wait(|m| matches!(m, FromPlugin::Failed(_)));
     assert_eq!(seen, [r#"failed: init failed: permission denied: ui"#]);
@@ -203,20 +200,20 @@ fn events_need_permissions() {
 #[test]
 fn failures_stop_the_instance() {
     let ui = Permissions { ui: true, ..Permissions::default() };
-    let Some(h) = start("fail", ui.clone()) else { return };
+    let h = start("fail", ui.clone());
     assert_eq!(h.wait(|m| matches!(m, FromPlugin::Failed(_))), ["failed: init failed: asked to fail"]);
 
-    let h = start("panic", ui.clone()).unwrap();
+    let h = start("panic", ui.clone());
     h.wait(|m| matches!(m, FromPlugin::Started));
     let seen = h.act("panic");
     assert!(seen.last().unwrap().starts_with("failed: crashed"), "{seen:?}");
 
-    let h = start("alloc", ui.clone()).unwrap();
+    let h = start("alloc", ui.clone());
     h.wait(|m| matches!(m, FromPlugin::Started));
     let seen = h.act("alloc");
     assert!(seen.last().unwrap().starts_with("failed:"), "{seen:?}");
 
-    let h = start("loop", ui.clone()).unwrap();
+    let h = start("loop", ui.clone());
     h.wait(|m| matches!(m, FromPlugin::Started));
     let t = Instant::now();
     let seen = h.act("loop");
@@ -224,7 +221,7 @@ fn failures_stop_the_instance() {
     assert!(t.elapsed() < proteus_wasm::runtime::CALL_LIMIT + Duration::from_secs(2));
 
     // Stopping interrupts a busy plugin at once.
-    let h = start("stop", ui).unwrap();
+    let h = start("stop", ui);
     h.wait(|m| matches!(m, FromPlugin::Started));
     h.handle.event(Event::Action("loop".into()));
     std::thread::sleep(Duration::from_millis(100));
@@ -237,7 +234,7 @@ fn failures_stop_the_instance() {
 
 #[test]
 fn queued_events_do_not_starve_timers_and_file_modes_are_scoped() {
-    let Some(h) = start("fairness", Permissions { ui: true, ..Default::default() }) else { return };
+    let h = start("fairness", Permissions { ui: true, ..Default::default() });
     h.wait(|m| matches!(m, FromPlugin::Started));
     h.handle.event(Event::Action("timer".into()));
     for _ in 0..30 {
@@ -259,7 +256,7 @@ fn queued_events_do_not_starve_timers_and_file_modes_are_scoped() {
 
 #[test]
 fn sdk_translates_using_the_host_locale() {
-    let Some(h) = start("locale", Permissions { ui: true, ..Permissions::default() }) else { return };
+    let h = start("locale", Permissions { ui: true, ..Permissions::default() });
     h.wait(|m| matches!(m, FromPlugin::Started));
     h.handle.event(Event::Action("locale".into()));
     let seen = h.wait(|m| matches!(m, FromPlugin::Call(Call::Notify { text, .. }, _) if text == "你好 WASM"));
@@ -270,14 +267,14 @@ fn sdk_translates_using_the_host_locale() {
 
 #[test]
 fn plugin_reads_its_own_config() {
-    let Some(h) = start("config", Permissions { ui: true, ..Permissions::default() }) else { return };
+    let h = start("config", Permissions { ui: true, ..Permissions::default() });
     h.wait(|m| matches!(m, FromPlugin::Started));
     assert_eq!(h.act("config"), ["config: \"right\" 40"]);
 }
 
 #[test]
 fn host_flood_has_one_in_flight_call_and_stop_interrupts_backpressure() {
-    let Some(h) = start("host-flood", Permissions { ui: true, ..Default::default() }) else { return };
+    let h = start("host-flood", Permissions { ui: true, ..Default::default() });
     h.wait(|m| matches!(m, FromPlugin::Started));
     h.handle.event(Event::Action("host-flood".into()));
     let (_, message) = h.rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -292,7 +289,7 @@ fn host_flood_has_one_in_flight_call_and_stop_interrupts_backpressure() {
 
 #[test]
 fn storage_corruption_is_preserved_and_legacy_api_errors_reach_the_host() {
-    let Some(h) = start("storage", Permissions { ui: true, ..Default::default() }) else { return };
+    let h = start("storage", Permissions { ui: true, ..Default::default() });
     h.wait(|m| matches!(m, FromPlugin::Started));
     assert_eq!(h.act("storage-set"), ["storage-set: Ok(())"]);
     assert_eq!(h.act("storage-read"), ["storage: Some(\"persisted\")"]);

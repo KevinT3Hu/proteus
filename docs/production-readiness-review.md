@@ -2,6 +2,17 @@
 
 Reviewed 2026-10-24 against the current working tree, including existing uncommitted changes. This is a source and local-test review, not a penetration test or a compositor/GPU certification run.
 
+## Review fixes (2026-10-25)
+
+- Bulk rename now reserves private staging directories exclusively and uses no-replace renames for staging, publication, and rollback. Concurrent destination files survive; obstructed rollback retains the source at a reported recovery path. Partial failures are reported instead of silently claiming success.
+- Guest linear memories and tables share an aggregate allocation budget. Memory, table, instance, and table-element counts are bounded; failed growth releases its reservation. This bounds guest allocations, not all Wasmtime compiler or host bookkeeping memory.
+- PTY children that outlive pane closure remain owned by one background reaper until they exit. A child ignoring SIGHUP cannot delay reaping other children, and pane destruction does not wait for the child.
+- The CI workflow described in the earlier follow-up was absent from the reviewed checkout. `.github/workflows/ci.yml` is now supplied with a pinned compiler, WASI target, formatting, strict linting, workspace and standalone tests, component builds, and release builds. WASM integration and source-compilation tests now fail on missing prerequisites even outside CI. A prebuilt fixture can still be supplied explicitly with `PROTEUS_WASM_FIXTURE` for integration tests.
+
+Regression tests cover staging collisions, concurrent destination creation, obstructed rollback, aggregate memory/table allocation, failed-growth accounting, and delayed child reaping. Hosted CI execution and live desktop acceptance remain separate verification steps; the historical results below describe earlier runs.
+
+Local verification of these fixes passed 275 workspace tests (two unrelated tests ignored), including eight actual WASM integration tests and the real source-compilation/cache test; 32 Files tests; and 16 SDK unit tests plus two doctests (one doctest ignored). Formatting, strict workspace/standalone Clippy, and a release WASI Files build passed. The system compiler lacks a packaged WASI target, so real WASI validation used a freshly built standard library and fixture in an isolated temporary sysroot. Missing-target execution was also checked separately and now fails outside CI. The GitHub workflow has not yet run on a hosted runner.
+
 ## Hardening follow-up (2026-10-24)
 
 The findings below preserve the original review. The following changes now address findings 1–6 and 8, plus the native cache, graphics-file, decoder-queue, and clipboard hardening items:

@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          components: clippy, rustfmt
+          targets: wasm32-wasip2
+      - name: Install native dependencies and test shells
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libwayland-dev libxkbcommon-dev libfontconfig1-dev zsh fish ncurses-bin
+      - name: Check formatting
+        run: |
+          cargo fmt --all -- --check
+          cargo fmt --manifest-path crates/proteus-plugin/Cargo.toml -- --check
+          cargo fmt --manifest-path plugins/files/Cargo.toml -- --check
+      - name: Check lints
+        run: |
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo clippy --manifest-path crates/proteus-plugin/Cargo.toml --all-targets --locked -- -D warnings
+          cargo clippy --manifest-path plugins/files/Cargo.toml --all-targets --locked -- -D warnings
+      - name: Run workspace tests with real WASM execution
+        run: cargo test --workspace --all-targets --locked
+      - name: Test standalone SDK and Files plugin
+        run: |
+          cargo test --manifest-path crates/proteus-plugin/Cargo.toml --locked
+          cargo test --manifest-path plugins/files/Cargo.toml --locked
+      - name: Build WASI components
+        run: |
+          cargo build --manifest-path plugins/files/Cargo.toml --target wasm32-wasip2 --release --locked
+          cargo build --manifest-path examples/plugins/pane-list/Cargo.toml --target wasm32-wasip2 --release --locked
+      - name: Build release
+        run: cargo build --workspace --release --locked
