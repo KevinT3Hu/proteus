@@ -149,6 +149,8 @@ pub(super) struct Plugins {
     pub clip_waiters: HashMap<u64, Responder>,
     /// Tasks: (plugin id, task id).
     pub tasks: BTreeMap<(String, u32), Task>,
+    /// Loaded with the first plugin sync.
+    pub approvals: Option<super::approvals::Approvals>,
 }
 
 /// 0xRRGGBB.
@@ -345,6 +347,13 @@ impl App {
         if self.cfg.plugins.is_empty() {
             return;
         }
+        if self.pl.approvals.is_none() {
+            let approvals = super::approvals::Approvals::load().unwrap_or_else(|e| {
+                self.toast(format!("plugins: {e}; approvals are kept for this session only"), true, None);
+                Default::default()
+            });
+            self.pl.approvals = Some(approvals);
+        }
         let Some(cache) = self.pl.cache.clone() else {
             self.toast("plugins: no cache/data directory available".into(), true, None);
             return;
@@ -399,9 +408,44 @@ impl App {
         self.mark_all_dirty();
     }
 
+    /// The user answered a plugin's permission request.
+    pub(super) fn plugin_permissions_answer(&mut self, entry: Resolved, allow: bool) {
+        // The config may have changed while the question was up.
+        if !self.pl.resolved.contains(&entry) {
+            return;
+        }
+        let approvals = self.pl.approvals.get_or_insert_with(Default::default);
+        if !allow {
+            approvals.denied.insert(entry.id.clone());
+            let msg = format!("plugin {}: not started; grant `permissions` in the config to run it", entry.id);
+            return self.toast(msg, false, None);
+        }
+        if let Err(e) = approvals.approve(&entry) {
+            self.toast(format!("plugin {}: {e}", entry.id), true, None);
+        }
+        self.start_plugin(entry);
+        self.keymap = self.cfg.keymap();
+        self.apply_plugin_keys();
+        self.mark_all_dirty();
+    }
+
     fn start_plugin(&mut self, entry: Resolved) {
         // The final gate covers synchronization, delayed crash restarts and manual actions.
         if !self.cfg.plugin_should_load(&entry) {
+            return;
+        }
+        let approvals = self.pl.approvals.get_or_insert_with(Default::default);
+        if approvals.denied.contains(&entry.id) {
+            return;
+        }
+        if approvals.needs_approval(&entry) {
+            let queued = std::iter::once(&self.w).chain(&self.parked).any(|w| {
+                w.prompts.iter().any(|p| matches!(p, super::Prompt::PluginPermissions(e) if e.id == entry.id))
+            });
+            if !queued {
+                self.w.prompts.push_back(super::Prompt::PluginPermissions(Box::new(entry)));
+                self.w.dirty = true;
+            }
             return;
         }
         let Some(cache) = &self.pl.cache else { return };

@@ -341,7 +341,7 @@ impl App {
         if rw > 0 {
             out.push(render::Label {
                 x: p + (cols - rw) as f32 * cw,
-                y: self.pad_y() as f32,
+                y: (self.title_bar_h() + self.pad_y() as i32) as f32,
                 cols: rw,
                 text: right_text,
                 fg: theme.fg,
@@ -356,7 +356,7 @@ impl App {
         if lw > 0 {
             out.push(render::Label {
                 x: p + start as f32 * cw,
-                y: self.pad_y() as f32,
+                y: (self.title_bar_h() + self.pad_y() as i32) as f32,
                 cols: lw,
                 text: left_text,
                 fg: theme.dim,
@@ -475,6 +475,19 @@ impl App {
                 continue;
             }
             self.w.renderer.images.budget = self.cfg.graphics.gpu_memory;
+            if old.decorations != self.cfg.decorations {
+                use smithay_client_toolkit::shell::xdg::window::DecorationMode;
+                self.w.window.request_decoration_mode(Some(match self.cfg.decorations {
+                    crate::config::Decorations::Auto => DecorationMode::Server,
+                    crate::config::Decorations::None | crate::config::Decorations::Client => DecorationMode::Client,
+                }));
+            }
+            if (old.background_opacity, old.background_blur) != (self.cfg.background_opacity, self.cfg.background_blur)
+            {
+                self.w.styled = None;
+                self.blur_warned = false;
+                self.style_window();
+            }
             if font_changed {
                 match Fonts::from_config(&self.cfg, self.w.scale) {
                     Ok(f) => {

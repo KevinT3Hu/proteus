@@ -598,6 +598,8 @@ mod tests {
     fn access_and_trash() {
         let root = std::env::temp_dir().join(format!("proteus-files-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
         let (data, src, other) = (root.join("data"), root.join("src"), root.join("other"));
         for d in [&data, &src, &other] {
             std::fs::create_dir_all(d).unwrap();

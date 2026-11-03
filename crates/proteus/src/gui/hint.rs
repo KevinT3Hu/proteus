@@ -49,15 +49,81 @@ pub fn shell_quote(text: &str) -> String {
     }
 }
 
+/// `text` percent-encoded for use inside a URL (RFC 3986 unreserved kept).
+pub fn url_encode(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for b in text.bytes() {
+        if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Words of a command line as a POSIX shell splits it (quotes and
+/// backslashes; no expansions), so `$EDITOR` may name a path with spaces.
+pub fn split_words(line: &str) -> Vec<String> {
+    let (mut words, mut word, mut started) = (Vec::new(), String::new(), false);
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                started = true;
+                word.extend(chars.by_ref().take_while(|&c| c != '\''));
+            }
+            '"' => {
+                started = true;
+                while let Some(c) = chars.next() {
+                    match c {
+                        '"' => break,
+                        '\\' => match chars.next() {
+                            Some(n @ ('"' | '\\' | '$' | '`')) => word.push(n),
+                            Some(n) => word.extend(['\\', n]),
+                            None => word.push('\\'),
+                        },
+                        c => word.push(c),
+                    }
+                }
+            }
+            '\\' => {
+                started = true;
+                word.extend(chars.next());
+            }
+            c if c.is_whitespace() => {
+                if started {
+                    words.push(std::mem::take(&mut word));
+                    started = false;
+                }
+            }
+            c => {
+                started = true;
+                word.push(c);
+            }
+        }
+    }
+    if started {
+        words.push(word);
+    }
+    words
+}
+
+/// A path argument that cannot be mistaken for an option.
+fn path_arg(path: &Path) -> String {
+    let p = path.display().to_string();
+    if p.starts_with('-') { format!("./{p}") } else { p }
+}
+
 /// Editor command line opening `path` at `line`/`col`, from `$VISUAL` or
 /// `$EDITOR` (`vi` if neither is set).
 pub fn editor_command(editor: &str, path: &Path, line: Option<u32>, col: Option<u32>) -> Vec<OsString> {
-    let mut argv: Vec<OsString> = editor.split_whitespace().map(OsString::from).collect();
+    let mut argv: Vec<OsString> = split_words(editor).into_iter().map(OsString::from).collect();
     if argv.is_empty() {
         argv.push("vi".into());
     }
     let name = Path::new(&argv[0]).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let p = path.display().to_string();
+    let p = path_arg(path);
     match (name.as_str(), line) {
         (_, None) => argv.push(p.into()),
         ("hx" | "helix", Some(l)) => {
@@ -195,7 +261,7 @@ impl App {
             HintKind::Url => self.xdg_open(&hints::url_with_scheme(&h.text), base.as_deref()),
             HintKind::Custom(name) => {
                 match self.cfg.hint_patterns.iter().find(|p| &p.name == name).and_then(|p| p.url.clone()) {
-                    Some(url) => self.xdg_open(&url.replace("{}", &h.text), base.as_deref()),
+                    Some(url) => self.xdg_open(&url.replace("{}", &url_encode(&h.text)), base.as_deref()),
                     None => self.hint_pick(id, h, HintAction::Copy),
                 }
             }
@@ -222,7 +288,7 @@ impl App {
                         self.notice(e);
                     }
                 } else {
-                    self.xdg_open(&path.display().to_string(), base.as_deref());
+                    self.xdg_open(&path_arg(&path), base.as_deref());
                 }
             }
             _ => self.hint_pick(id, h, HintAction::Copy),
@@ -307,6 +373,16 @@ mod tests {
         assert_eq!(s(editor_command("code --wait", p, Some(3), None)), "code --wait -g /tmp/a.rs:3");
         assert_eq!(s(editor_command("nano", p, Some(3), Some(2))), "nano +3,2 /tmp/a.rs");
         assert_eq!(s(editor_command("", p, None, None)), "vi /tmp/a.rs");
+        let spaced = editor_command("'/opt/My Editor/vim' -u \"a b\" x\\ y", Path::new("-rf"), Some(1), None);
+        assert_eq!(spaced, ["/opt/My Editor/vim", "-u", "a b", "x y", "+1", "./-rf"].map(OsString::from));
+        assert_eq!(split_words(r#"  a"b\"c"'d e'  "#), [r#"ab"cd e"#]);
+        assert_eq!(split_words("'' x"), ["", "x"]);
+    }
+
+    #[test]
+    fn custom_urls_are_encoded() {
+        assert_eq!(url_encode("ABC-12"), "ABC-12");
+        assert_eq!(url_encode("a&b=c#d/ü"), "a%26b%3Dc%23d%2F%C3%BC");
     }
 
     #[test]

@@ -59,7 +59,6 @@ function Pane:read_screen(opts) end
 ---@field duration number? Seconds.
 ---@field block integer? Block id (for `pane:block_text`).
 ---@field state ("prompt"|"input"|"running"|"finished")?
----@field state "prompt"|"input"|"running"|"finished"
 
 ---Command blocks (shell integration), oldest first.
 ---@return proteus.Block[]
@@ -142,6 +141,9 @@ function Timer:stop() end
 ---@field height (integer|false)? Initial whole-window height in logical pixels, 60–8192.
 ---@field columns (integer|false)? Initial grid columns, 2–8192, default 80.
 ---@field rows (integer|false)? Initial grid rows, 1–8192, default 24.
+---@field opacity number? Opacity of the default background, 0–1, default 1. Colored cells and bars stay opaque.
+---@field background_blur boolean? Ask the compositor to blur behind a translucent window (ext-background-effect-v1).
+---@field decorations ("auto"|"client"|"none")? "auto": the compositor's, else Proteus's own; "client": always Proteus's own; "none": none.
 
 ---@class proteus.PluginConfig
 ---@field source string? A WASM file, package/source directory, Git URL or raw WASM URL.
@@ -152,7 +154,7 @@ function Timer:stop() end
 ---@field subdir string? Package directory within a repository.
 ---@field id string? ID for a bare WASM file; must match a package manifest if present.
 ---@field config table? Plugin-owned settings, passed unchanged as JSON; schema belongs to the plugin.
----@field permissions table? Replaces the manifest permissions; omitted uses the manifest.
+---@field permissions table? Grants exactly these permissions. Omitted: the manifest's request, after the user approves it.
 
 ---@class proteus.Config
 ---@field ipc { socket: string }? Opt-in same-user control socket; startup only.

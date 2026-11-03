@@ -216,6 +216,25 @@ cells (-256–256, positive right/down) without changing layout. Very small cell
 or large offsets can overlap neighboring glyphs. Font style overrides accept
 `false` to restore automatic selection.
 
+`window.opacity` (0–1, default 1) makes the default background translucent;
+cells with their own background color, the tab bar and the bottom bar stay
+opaque. It needs a surface that supports premultiplied alpha. With
+`window.background_blur = true`, Proteus asks the compositor to blur what shows
+through, using `ext-background-effect-v1`; compositors without that protocol
+(such as GNOME) show the translucent window unblurred. `window.decorations =
+"none"` tells the compositor that the window decorates itself and draws no
+title bar or borders; `"auto"` (the default) asks for server-side decorations
+and draws Proteus's own (as with `"client"`) when the compositor provides none,
+as GNOME does.
+`"client"` draws Proteus's own decorations in the UI theme: a title bar with
+the window title and minimize, maximize and close buttons (drag to move,
+double-click to maximize, right-click for the compositor's window menu), a
+one-pixel border, and resize grips along the edges. The border and grips are
+left out while the window is maximized or tiled, and the title bar while it
+is fullscreen. If the compositor insists on drawing decorations itself,
+Proteus draws none.
+All three apply to open windows when the config is reloaded.
+
 `window.width` and `window.height` choose the **initial entire client window**
 size (100–8192 and 60–8192 respectively), excluding compositor decorations.
 `window.columns` and `window.rows` choose an initial single-pane grid (2–8192 and
@@ -298,7 +317,14 @@ one WASM artifact. Source builds take precedence over any stale sibling WASM.
 Prebuilt packages without Cargo load the manifest's `wasm` path. Bare WASM files
 may specify `id` and `permissions`; otherwise their stable ID is derived from
 the source and they receive no capabilities. A sibling manifest, when present,
-supplies metadata and default permissions; an explicit ID must match it.
+supplies metadata and requested permissions; an explicit ID must match it.
+
+Permissions given in `p.load_plugin { permissions = ... }` are granted as is.
+Without them, a plugin requesting any permission in its manifest does not start
+until the user approves the request at a prompt. Approvals are stored in
+`$XDG_STATE_HOME/proteus/plugin-approvals.json` per plugin ID, source and exact
+permission set, so a plugin that later requests different permissions asks again.
+Declining keeps the plugin stopped for the rest of the session.
 
 `p.load_plugin` validates its config and records a load request; it does not
 block Lua on network access or compilation. It may be called conditionally, in

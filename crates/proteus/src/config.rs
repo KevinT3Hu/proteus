@@ -56,6 +56,17 @@ use proteus_core::ClipboardRead;
 use crate::modes::{Action, Chord, KeyConfig, Mode, Preset};
 use crate::script::{Registrar, Script};
 
+/// Window decorations (title bar, borders).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decorations {
+    /// Ask the compositor to draw them.
+    Auto,
+    /// Tell the compositor the client decorates, and draw none.
+    None,
+    /// Draw our own title bar, buttons and border.
+    Client,
+}
+
 /// Cursor blinking policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Blink {
@@ -78,6 +89,12 @@ pub struct Config {
     pub border_width: f64,
     pub font_settings: crate::appearance::FontSettings,
     pub window: crate::appearance::WindowSettings,
+    /// Opacity of the default background (cells with their own colors and
+    /// the bars stay opaque).
+    pub background_opacity: f32,
+    /// Ask the compositor to blur what shows through (`ext-background-effect-v1`).
+    pub background_blur: bool,
+    pub decorations: Decorations,
     pub font_family: String,
     pub font_size: f32,
     pub ligatures: bool,
@@ -220,6 +237,9 @@ impl Default for Config {
             border_width: 1.0,
             font_settings: Default::default(),
             window: Default::default(),
+            background_opacity: 1.0,
+            background_blur: false,
+            decorations: Decorations::Auto,
             font_family: "monospace".into(),
             font_size: 11.0,
             ligatures: true,
@@ -281,7 +301,9 @@ impl Config {
         self.window.size(
             (cell.0 as f64 / scale, cell.1 as f64 / scale),
             ((self.padding * scale).round() / scale, (self.padding_vertical * scale).round() / scale),
-            u32::from(self.tab_bar == TabBar::Always) + u32::from(self.hint_bar == HintBar::Always),
+            u32::from(self.tab_bar == TabBar::Always)
+                + u32::from(self.hint_bar == HintBar::Always)
+                + u32::from(self.decorations == Decorations::Client),
             self.pane_titles == PaneTitles::Always,
             ((self.gutter as f64 * cell.0 as f64).round() + 1.0) / scale,
         )
@@ -475,6 +497,26 @@ fn apply(c: &mut Config, t: &Table, reg: &Registrar) -> Result<(), String> {
                 c.theme.apply(t)?;
             }
             "window" => section(&v, "window", |k, v| {
+                match k {
+                    "opacity" => {
+                        c.background_opacity = bounded(v, "window.opacity", 0.0, 1.0)? as f32;
+                        return Ok(());
+                    }
+                    "background_blur" => {
+                        c.background_blur = boolean(v, "window.background_blur")?;
+                        return Ok(());
+                    }
+                    "decorations" => {
+                        c.decorations = match string(v, "window.decorations")?.as_str() {
+                            "auto" => Decorations::Auto,
+                            "none" => Decorations::None,
+                            "client" => Decorations::Client,
+                            _ => return Err("window.decorations: expected \"auto\", \"client\" or \"none\"".into()),
+                        };
+                        return Ok(());
+                    }
+                    _ => {}
+                }
                 let field = match k {
                     "width" => &mut c.window.width,
                     "height" => &mut c.window.height,
@@ -1161,7 +1203,19 @@ files = { $count ->
         assert_eq!(c.font_settings.cell_width, None);
         assert_eq!(c.font_settings.bold_family, None);
         assert_eq!(c.padding_vertical, 5.0);
+        let c =
+            ev(r#"require("proteus").config{window={opacity=0.9, background_blur=true, decorations="none"}}"#).unwrap();
+        assert_eq!((c.background_opacity, c.background_blur, c.decorations), (0.9, true, Decorations::None));
+        assert_eq!(c.window, Default::default(), "window style does not change initial sizing");
+        let c = ev(r#"require("proteus").config{window={decorations="client"}}"#).unwrap();
+        assert_eq!(c.decorations, Decorations::Client);
+        let plain = Config::default().window_size((10, 20), 1.0);
+        assert_eq!(c.window_size((10, 20), 1.0), (plain.0, plain.1 + 24), "room for the title bar");
         for src in [
+            "window={opacity=1.5}",
+            "window={opacity='x'}",
+            "window={decorations='server'}",
+            "window={background_blur=1}",
             "font={size=0/0}",
             "font={size=1/0}",
             "font={cell_width=0}",

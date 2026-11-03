@@ -356,6 +356,10 @@ pub enum Action {
     LoadLayout,
     /// Next pane in order (tmux `o`).
     FocusNext,
+    /// Next (`true`) or previous pane across all tabs of the window, wrapping.
+    FocusGlobal(bool),
+    /// Move the current tab one place right (`true`) or left, wrapping.
+    MoveTab(bool),
     /// Show/hide the floating panes (a first one is created if none).
     ToggleFloating,
     /// Float the focused pane, or embed the focused float.
@@ -496,6 +500,10 @@ impl Action {
             Action::ResetRenderer => "renderer.reset".into(),
             Action::LoadLayout => "layout.load".into(),
             Action::FocusNext => "pane.focus_next".into(),
+            Action::FocusGlobal(true) => "pane.focus_next_global".into(),
+            Action::FocusGlobal(false) => "pane.focus_prev_global".into(),
+            Action::MoveTab(true) => "tab.move_right".into(),
+            Action::MoveTab(false) => "tab.move_left".into(),
             Action::ToggleFloating => "pane.toggle_floating".into(),
             Action::ToggleEmbed => "pane.toggle_embed".into(),
             Action::NewFloating => "pane.new_floating".into(),
@@ -571,6 +579,10 @@ impl Action {
         ]);
         v.extend([
             Action::FocusNext,
+            Action::FocusGlobal(true),
+            Action::FocusGlobal(false),
+            Action::MoveTab(false),
+            Action::MoveTab(true),
             Action::ToggleFloating,
             Action::ToggleEmbed,
             Action::NewFloating,
@@ -654,7 +666,8 @@ impl Action {
             Action::ExportScrollback => "ui-export-scrollback",
             Action::ResetRenderer => "ui-reset-renderer",
             Action::LoadLayout => "ui-load-layout",
-            Action::FocusNext => "ui-next-pane",
+            Action::FocusNext | Action::FocusGlobal(_) => "ui-next-pane",
+            Action::MoveTab(_) => "ui-move",
             Action::ToggleFloating => "ui-floating",
             Action::ToggleEmbed => "ui-float-embed",
             Action::NewFloating => "ui-new-floating",

@@ -235,6 +235,9 @@ pub struct Renderer {
     /// An atlas filled up mid-frame: draw again so every glyph is valid.
     pub redraw_needed: bool,
     pub images: TextureCache,
+    /// See [`Renderer::set_opacity`].
+    opacity: f32,
+    alpha_modes: Vec<wgpu::CompositeAlphaMode>,
 }
 
 fn rgba(c: Rgb, a: f32) -> [f32; 4] {
@@ -272,6 +275,7 @@ impl Renderer {
             .copied()
             .find(|f| !f.is_srgb() && matches!(f, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm))
             .unwrap_or(caps.formats[0]);
+        let alpha_modes = caps.alpha_modes.clone();
         let alpha_mode = if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
             wgpu::CompositeAlphaMode::Opaque
         } else {
@@ -426,7 +430,36 @@ impl Renderer {
             adapter_info,
             redraw_needed: false,
             images,
+            opacity: 1.0,
+            alpha_modes,
         })
+    }
+
+    /// Opacity of the default background. Below 1 the surface is presented
+    /// with premultiplied alpha, if the compositor supports it; returns
+    /// whether it does.
+    pub fn set_opacity(&mut self, opacity: f32) -> bool {
+        let opacity = opacity.clamp(0.0, 1.0);
+        let wanted = if opacity < 1.0 {
+            [wgpu::CompositeAlphaMode::PreMultiplied, wgpu::CompositeAlphaMode::Inherit]
+                .into_iter()
+                .find(|m| self.alpha_modes.contains(m))
+        } else {
+            self.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque).then_some(wgpu::CompositeAlphaMode::Opaque)
+        };
+        let Some(mode) = wanted else {
+            self.opacity = 1.0;
+            return opacity >= 1.0;
+        };
+        self.opacity = opacity;
+        if mode != self.config.alpha_mode {
+            self.config.alpha_mode = mode;
+            if !self.lost.load(Ordering::Acquire) {
+                self.surface.configure(&self.device, &self.config);
+            }
+            self.redraw_needed = true;
+        }
+        true
     }
 
     /// Reconfigure the existing native surface with a fresh device. Creating a
@@ -611,6 +644,8 @@ impl Renderer {
                     *v = if *v <= 0.04045 { *v / 12.92 } else { ((*v + 0.055) / 1.055).powf(2.4) };
                 }
             }
+            let a = self.opacity as f64;
+            let (r, g, b) = (c[0] * a, c[1] * a, c[2] * a);
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -618,7 +653,7 @@ impl Renderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: c[0], g: c[1], b: c[2], a: 1.0 }),
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r, g, b, a }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -729,7 +764,11 @@ impl Renderer {
         let default_bg = pal.background();
         // Each pane owns its background, independently of chrome and other panes' OSC colors.
         // Paint it before images so default cells can omit redundant background runs.
-        self.rect(p.x, p.y, t.cols() as f32 * cw, (t.lines() - skip) as f32 * ch, rgba(default_bg, 1.0));
+        // A translucent window shows the cleared background instead, so the
+        // alpha does not compound where the colors agree.
+        if self.opacity >= 1.0 || default_bg != info.theme.bg {
+            self.rect(p.x, p.y, t.cols() as f32 * cw, (t.lines() - skip) as f32 * ch, rgba(default_bg, self.opacity));
+        }
         let reverse = t.mode().contains(TermMode::REVERSE_VIDEO);
         let selection = t.selection_range();
         let cursor = t.cursor();

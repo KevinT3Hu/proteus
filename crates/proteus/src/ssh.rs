@@ -88,6 +88,11 @@ impl Connection {
 /// The outer bash provides process substitution; the inner shell reads normal rc
 /// files before hooks. Task commands remain argv and execute only after selection.
 pub fn bash_command(cwd: Option<&Path>, task: Option<&[String]>) -> String {
+    remote(&bash_script(cwd, task))
+}
+
+/// POSIX `sh` code starting the integrated interactive Bash.
+fn bash_script(cwd: Option<&Path>, task: Option<&[String]>) -> String {
     let hooks = include_str!("../../proteus-pty/shell-integration/bash/proteus.bash");
     let mut rc =
         String::from("[[ -r /etc/bash.bashrc ]] && source /etc/bash.bashrc\n[[ -r ~/.bashrc ]] && source ~/.bashrc\n");
@@ -100,7 +105,16 @@ pub fn bash_command(cwd: Option<&Path>, task: Option<&[String]>) -> String {
         rc.push_str(&format!("\nbuiltin printf '\\e]133;A\\aTask> \\e]133;B\\a%s\\n\\e]133;C\\a' {}\n{command}\n__proteus_status=$?\nbuiltin printf '\\e]133;D;%s\\a' \"$__proteus_status\"\n", quote(&command)));
     }
     let launch = format!("exec bash --rcfile <(printf %s {}) -i", quote(&rc));
-    format!("bash -c {}", quote(&launch))
+    format!("exec bash -c {}", quote(&launch))
+}
+
+/// A remote command that any login shell (sh, bash, zsh, fish, csh/tcsh)
+/// passes unchanged to `sh`: the script travels as base64, so the login
+/// shell sees no newlines, backslashes or nested quotes.
+pub fn remote(script: &str) -> String {
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(script);
+    format!("sh -c 'eval \"$(printf %s {encoded} | base64 -d)\"'")
 }
 
 pub fn quote(value: &str) -> String {
@@ -376,7 +390,22 @@ mod tests {
         assert!(c.argv().iter().any(|s| s == "--"));
         assert!(forwarding("8080:localhost:80").is_ok());
         assert!(forwarding("8080:localhost:80\n!sh").is_err());
-        assert!(bash_command(None, None).contains("--rcfile"));
+        assert!(bash_script(None, None).contains("--rcfile"));
+        assert!(bash_command(None, None).bytes().all(|b| b.is_ascii_graphic() || b == b' '));
+    }
+
+    #[test]
+    fn remote_commands_survive_any_login_shell() {
+        let script = "printf '%s|' \"it's\" 'a\\b' \"$((1+1))\"\nprintf 'line2'";
+        let command = remote(script);
+        let mut tried = 0;
+        for shell in ["sh", "bash", "zsh", "fish", "tcsh", "csh"] {
+            let Ok(out) = std::process::Command::new(shell).arg("-c").arg(&command).output() else { continue };
+            tried += 1;
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(stdout.ends_with("it's|a\\b|2|line2"), "{shell}: {out:?}");
+        }
+        assert!(tried > 0);
     }
 }
 
@@ -390,7 +419,7 @@ struct Snapshot {
 }
 
 pub fn workspace_command(cwd: &str) -> String {
-    format!("python3 -c {} {}", quote(include_str!("ssh-workspace.py")), quote(cwd))
+    remote(&format!("exec python3 -c {} {}", quote(include_str!("ssh-workspace.py")), quote(cwd)))
 }
 
 pub fn parse_workspace(bytes: &[u8]) -> Result<Option<crate::project::Workspace>, String> {
@@ -418,13 +447,13 @@ pub fn parse_workspace(bytes: &[u8]) -> Result<Option<crate::project::Workspace>
 /// Validate symlink containment on the server, then exec a Bash task shell.
 pub fn task_command(root: &Path, task: &crate::project::Task) -> String {
     let code = "import os,sys\nr=os.path.realpath(sys.argv[1]);p=os.path.realpath(sys.argv[2])\nif os.path.commonpath([r,p])!=r or not os.path.isdir(p): raise ValueError('task cwd escapes workspace or does not exist')\nos.chdir(p)\nos.execvp('bash',['bash','-c',sys.argv[3]])";
-    format!(
-        "python3 -c {} {} {} {}",
+    remote(&format!(
+        "exec python3 -c {} {} {} {}",
         quote(code),
         quote(&root.to_string_lossy()),
         quote(&task.cwd.to_string_lossy()),
-        quote(&format!("exec {}", bash_command(None, Some(&task.command))))
-    )
+        quote(&bash_script(None, Some(&task.command)))
+    ))
 }
 
 /// A private SFTP batch file, retained until its pane is closed.

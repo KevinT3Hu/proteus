@@ -22,6 +22,33 @@ pub fn trusted_dir(path: &Path) -> io::Result<File> {
     directory(path, false, false)
 }
 
+/// A user private group (as created with umask 002 setups): named after the
+/// effective user, with no other members and no other user's primary group.
+fn is_private_group(gid: u32) -> bool {
+    static PRIVATE: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *PRIVATE.get_or_init(|| {
+        let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+        let group = std::fs::read_to_string("/etc/group").ok()?;
+        private_group_of(rustix::process::geteuid().as_raw(), &passwd, &group)
+    }) == Some(gid)
+}
+
+fn private_group_of(uid: u32, passwd: &str, group: &str) -> Option<u32> {
+    let users: Vec<Vec<&str>> =
+        passwd.lines().map(|l| l.split(':').collect()).filter(|f: &Vec<_>| f.len() >= 4).collect();
+    let me = users.iter().find(|f| f[2].parse() == Ok(uid))?;
+    let (name, gid) = (me[0], me[3].parse::<u32>().ok()?);
+    if users.iter().any(|f| f[0] != name && f[3].parse() == Ok(gid)) {
+        return None;
+    }
+    let entries: Vec<Vec<&str>> =
+        group.lines().map(|l| l.split(':').collect()).filter(|f: &Vec<_>| f.len() >= 4).collect();
+    let mut matching = entries.iter().filter(|f| f[2].parse() == Ok(gid));
+    let entry = matching.next()?;
+    let alone = entry[3].split(',').all(|m| m.is_empty() || m == name);
+    (entry[0] == name && alone && matching.next().is_none()).then_some(gid)
+}
+
 fn directory(path: &Path, migrate: bool, private_final: bool) -> io::Result<File> {
     if !path.is_absolute() {
         return Err(io::ErrorKind::InvalidInput.into());
@@ -49,9 +76,11 @@ fn directory(path: &Path, migrate: bool, private_final: bool) -> io::Result<File
             rustix::fs::fchmod(&fd, Mode::from_raw_mode(0o700))?;
         }
         let m = rustix::fs::fstat(&fd)?;
-        let private = m.st_uid == rustix::process::geteuid().as_raw() && m.st_mode & 0o077 == 0;
-        let safe_ancestor = (m.st_uid == 0 || m.st_uid == rustix::process::geteuid().as_raw())
-            && (m.st_mode & 0o022 == 0 || m.st_mode & 0o1000 != 0);
+        let uid = rustix::process::geteuid().as_raw();
+        let group_ok = |bits: u32| m.st_mode & bits == 0 || (m.st_uid == uid && is_private_group(m.st_gid));
+        let private = m.st_uid == uid && m.st_mode & 0o007 == 0 && group_ok(0o070);
+        let safe_ancestor = (m.st_uid == 0 || m.st_uid == uid)
+            && ((m.st_mode & 0o002 == 0 && group_ok(0o020)) || m.st_mode & 0o1000 != 0);
         if (final_dir && private_final && !private) || ((!final_dir || !private_final) && !safe_ancestor) {
             return Err(io::Error::new(io::ErrorKind::PermissionDenied, "untrusted application directory"));
         }
@@ -60,4 +89,22 @@ fn directory(path: &Path, migrate: bool, private_final: bool) -> io::Result<File
         return Err(io::ErrorKind::InvalidInput.into());
     }
     Ok(fd.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn private_groups_are_named_after_the_user_and_have_no_other_members() {
+        let passwd =
+            "root:x:0:0::/root:/bin/sh\nann:x:1000:1000::/home/ann:/bin/sh\nbob:x:1001:100::/home/bob:/bin/sh\n";
+        assert_eq!(private_group_of(1000, passwd, "ann:x:1000:\nusers:x:100:bob\n"), Some(1000));
+        assert_eq!(private_group_of(1000, passwd, "ann:x:1000:ann\n"), Some(1000));
+        assert_eq!(private_group_of(1000, passwd, "ann:x:1000:bob\n"), None, "other member");
+        assert_eq!(private_group_of(1000, passwd, "staff:x:1000:\n"), None, "not named after the user");
+        assert_eq!(private_group_of(1001, passwd, "users:x:100:\n"), None, "shared primary group");
+        let shared = format!("{passwd}eve:x:1002:1000::/home/eve:/bin/sh\n");
+        assert_eq!(private_group_of(1000, &shared, "ann:x:1000:\n"), None, "another user's primary group");
+    }
 }
