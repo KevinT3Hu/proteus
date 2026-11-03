@@ -16,10 +16,10 @@ enum Class {
 fn class(grid: &Grid, p: Point) -> Class {
     let Some(row) = grid.abs_row(p.line) else { return Class::Space };
     let Some(mut cell) = row.cells.get(p.col) else { return Class::Space };
-    if cell.flags.contains(CellFlags::WIDE_SPACER) && p.col > 0 {
+    if cell.flags().contains(CellFlags::WIDE_SPACER) && p.col > 0 {
         cell = &row.cells[p.col - 1];
     }
-    match cell.ch {
+    match cell.ch() {
         ' ' | '\t' | '\0' => Class::Space,
         c if c.is_alphanumeric() || c == '_' => Class::Word,
         _ => Class::Punct,
@@ -110,7 +110,7 @@ fn line_end(grid: &Grid, line: Line) -> usize {
     let Some(row) = grid.abs_row(line) else { return 0 };
     row.cells
         .iter()
-        .rposition(|c| !matches!(c.ch, ' ' | '\0') && !c.flags.contains(CellFlags::WIDE_SPACER))
+        .rposition(|c| !matches!(c.ch(), ' ' | '\0') && !c.flags().contains(CellFlags::WIDE_SPACER))
         .unwrap_or(0)
 }
 

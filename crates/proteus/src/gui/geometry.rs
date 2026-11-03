@@ -120,19 +120,39 @@ impl App {
     /// Fit every pane of every tab to its rectangle.
     pub(super) fn relayout(&mut self) {
         let (area, cell) = (self.area(), self.cell());
-        for t in &self.w.tabs {
+        for (i, t) in self.w.tabs.iter().enumerate() {
             let m = self.tab_metrics(t);
             let l = t.layout(area, m);
             for (id, r) in l.panes.into_iter().chain(l.floats.iter().map(|f| (f.id, f.content))) {
                 if let Some(p) = self.panes.get_mut(&id) {
                     let cols = (r.w / m.cell_w).max(2) as u16;
                     let rows = (r.h / m.cell_h).max(1) as u16;
-                    p.resize(cols, rows, cell, !self.w.defer_pty_resize);
+                    // Reflowing scrollback is costly; hidden tabs catch up when shown.
+                    if i != self.w.active && p.pty.is_some() {
+                        p.defer_resize(cols, rows, cell);
+                        self.w.resize_deferred |= p.has_deferred_resize();
+                    } else {
+                        p.resize(cols, rows, cell, !self.w.defer_pty_resize);
+                    }
                 }
             }
         }
         self.relayout_surfaces();
         self.w.dirty = true;
+    }
+
+    /// Resize the shown panes whose resize waited while their tab was hidden.
+    pub(super) fn apply_deferred_resizes(&mut self) {
+        let view = self.view();
+        let notify = !self.w.defer_pty_resize;
+        for id in view.panes.iter().map(|p| p.0).chain(view.floats.iter().map(|f| f.id)) {
+            if let Some(p) = self.panes.get_mut(&id) {
+                p.apply_deferred_resize(notify);
+            }
+        }
+        let panes = &self.panes;
+        self.w.resize_deferred =
+            self.w.tabs.iter().flat_map(|t| t.panes()).any(|id| panes.get(&id).is_some_and(Pane::has_deferred_resize));
     }
 
     pub(super) fn set_scale(&mut self, scale: f64) {

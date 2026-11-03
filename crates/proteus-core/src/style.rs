@@ -1,6 +1,7 @@
 //! Cell styles and hyperlinks, interned so each cell stores a small id.
 
 use std::collections::HashMap;
+use std::hash::BuildHasher;
 
 use bitflags::bitflags;
 
@@ -70,30 +71,45 @@ impl StyleId {
     pub const DEFAULT: StyleId = StyleId(0);
 }
 
-/// Intern table for styles. Ids are stable for the life of the terminal.
-#[derive(Debug)]
+/// Intern table for styles. Ids are stable until the terminal compacts it.
+/// The index holds only ids; styles are stored once.
 pub struct StyleTable {
     styles: Vec<Style>,
-    map: HashMap<Style, StyleId>,
+    index: hashbrown::HashTable<u32>,
+    /// Randomly seeded: styles come from application output.
+    hasher: foldhash::fast::RandomState,
+}
+
+impl std::fmt::Debug for StyleTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StyleTable").field("len", &self.styles.len()).finish()
+    }
 }
 
 impl Default for StyleTable {
     fn default() -> Self {
-        let mut map = HashMap::new();
-        map.insert(Style::default(), StyleId::DEFAULT);
-        Self { styles: vec![Style::default()], map }
+        let mut table = Self { styles: Vec::new(), index: hashbrown::HashTable::new(), hasher: Default::default() };
+        table.intern(&Style::default());
+        table
     }
 }
 
 impl StyleTable {
     pub fn intern(&mut self, style: &Style) -> StyleId {
-        if let Some(&id) = self.map.get(style) {
-            return id;
+        let hash = self.hasher.hash_one(style);
+        if let Some(&id) = self.index.find(hash, |&id| self.styles[id as usize] == *style) {
+            return StyleId(id);
         }
-        let id = StyleId(self.styles.len() as u32);
+        let id = self.styles.len() as u32;
         self.styles.push(style.clone());
-        self.map.insert(style.clone(), id);
-        id
+        let (styles, hasher) = (&self.styles, &self.hasher);
+        self.index.insert_unique(hash, id, |&id| hasher.hash_one(&styles[id as usize]));
+        StyleId(id)
+    }
+
+    /// All styles by id, consuming the table.
+    pub(crate) fn into_styles(self) -> Vec<Style> {
+        self.styles
     }
 
     pub fn get(&self, id: StyleId) -> &Style {

@@ -2,7 +2,7 @@
 
 mod graphics;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::ops::Range;
 use std::time::Instant;
 
@@ -37,6 +37,8 @@ const MAX_OSC52: usize = 8 << 20;
 const MAX_DCS: usize = 4096;
 const MAX_URI: usize = 2048;
 const MAX_GRAPHEME_EXTRA: usize = 32;
+/// Most parameters a control sequence carries (the parser's limit).
+const PARAMS: usize = 32;
 const STYLE_COMPACT_MIN: usize = 1 << 16;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -126,6 +128,12 @@ pub struct Terminal {
     cursor: Cursor,
     style_id: StyleId,
     erase_id: StyleId,
+    /// The cursor style `style_id`/`erase_id` were interned from.
+    synced_style: Option<Style>,
+    /// Bumped when compaction renumbers style ids.
+    style_generation: u64,
+    /// Bumped whenever the grids may have changed.
+    content_generation: u64,
     saved: Option<SavedCursor>,
     saved_inactive: Option<SavedCursor>,
     mode: TermMode,
@@ -170,6 +178,32 @@ fn default_tabs(cols: usize) -> Vec<bool> {
     (0..cols).map(|i| i % 8 == 0 && i != 0).collect()
 }
 
+fn next_generation() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Blank both halves of a wide char occupying column `x` of `row`.
+#[inline]
+fn clear_wide(row: &mut [Cell], x: usize, erase: StyleId) {
+    let Some(cell) = row.get(x) else { return };
+    let flags = cell.flags();
+    if flags.is_empty() {
+        return;
+    }
+    if flags.contains(CellFlags::WIDE) {
+        row[x] = Cell::blank(erase);
+        if x + 1 < row.len() {
+            row[x + 1] = Cell::blank(erase);
+        }
+    } else if flags.contains(CellFlags::WIDE_SPACER) {
+        row[x] = Cell::blank(erase);
+        if x > 0 {
+            row[x - 1] = Cell::blank(erase);
+        }
+    }
+}
+
 impl Terminal {
     pub fn new(cols: usize, lines: usize, config: Config) -> Self {
         let cols = cols.max(2);
@@ -186,6 +220,9 @@ impl Terminal {
             cursor: Cursor::default(),
             style_id: StyleId::DEFAULT,
             erase_id: StyleId::DEFAULT,
+            synced_style: None,
+            style_generation: next_generation(),
+            content_generation: next_generation(),
             saved: None,
             saved_inactive: None,
             mode,
@@ -227,11 +264,22 @@ impl Terminal {
 
     /// Feed bytes read from the PTY.
     pub fn advance(&mut self, bytes: &[u8]) {
-        self.bidi_cache.get_mut().clear();
+        self.content_generation = next_generation();
+        // Rows above the screen never change, so only layouts from the
+        // block holding the top screen row onwards can go stale.
+        let alt = self.is_alt_screen();
+        let stale = crate::bidi::Cache::block_start(&self.grid, self.grid.abs_line(0));
         self.poll_images();
         let mut parser = std::mem::take(&mut self.parser);
         self.feed(&mut parser, bytes);
         self.parser = parser;
+        let switched = alt != self.is_alt_screen();
+        let cache = self.bidi_cache.get_mut();
+        if switched {
+            cache.clear();
+        } else {
+            cache.invalidate_from(stale);
+        }
     }
 
     // --- accessors -------------------------------------------------------
@@ -255,7 +303,7 @@ impl Terminal {
     /// Logical storage stays intact; this map is shared by drawing and hit testing.
     pub fn visual_row(&self, line: Line) -> std::sync::Arc<crate::bidi::RowLayout> {
         if !self.bidi_enabled() {
-            return std::sync::Arc::new(crate::bidi::RowLayout::default());
+            return self.bidi_cache.borrow().identity();
         }
         self.bidi_cache.borrow_mut().row(&self.grid, line)
     }
@@ -312,6 +360,16 @@ impl Terminal {
     pub fn styles(&self) -> &StyleTable {
         &self.styles
     }
+    /// Changes whenever a style id may start to mean another style; unique
+    /// across terminals.
+    pub fn style_generation(&self) -> u64 {
+        self.style_generation
+    }
+    /// Changes whenever the text of the grids may have changed; unique
+    /// across terminals.
+    pub fn content_generation(&self) -> u64 {
+        self.content_generation
+    }
     pub fn style(&self, id: StyleId) -> &Style {
         self.styles.get(id)
     }
@@ -339,6 +397,24 @@ impl Terminal {
     /// Viewport rows changed since the last call. Cursor moves count as damage
     /// of the rows the cursor left and entered.
     pub fn take_damage(&mut self) -> Damage {
+        self.damage_cursor();
+        let lines = self.lines();
+        std::mem::replace(&mut self.damage, Damage { full: false, lines: vec![false; lines], images: false })
+    }
+
+    /// Whether anything is damaged; clears the damage like
+    /// [`Terminal::take_damage`] without allocating.
+    pub fn clear_damage(&mut self) -> bool {
+        self.damage_cursor();
+        let d = &mut self.damage;
+        let damaged = !d.is_empty();
+        d.full = false;
+        d.images = false;
+        d.lines.fill(false);
+        damaged
+    }
+
+    fn damage_cursor(&mut self) {
         let cur = (self.cursor.x, self.cursor.y, self.cursor_visible());
         if cur != self.last_cursor {
             let old = self.last_cursor.1;
@@ -348,8 +424,6 @@ impl Terminal {
             self.damage_line(cur.1);
             self.last_cursor = cur;
         }
-        let lines = self.lines();
-        std::mem::replace(&mut self.damage, Damage { full: false, lines: vec![false; lines], images: false })
     }
 
     /// Size of one cell in physical pixels (for pixel-size reports).
@@ -574,6 +648,7 @@ impl Terminal {
 
     /// Resize both screens. The primary screen reflows soft-wrapped lines.
     pub fn resize(&mut self, cols: usize, lines: usize) {
+        self.content_generation = next_generation();
         self.bidi_cache.get_mut().clear();
         let cols = cols.max(2);
         let lines = lines.max(1);
@@ -650,8 +725,13 @@ impl Terminal {
     }
 
     fn damage_range(&mut self, top: usize, bottom: usize) {
-        for y in top..=bottom {
-            self.damage_line(y);
+        if self.grid.display_offset() > 0 {
+            self.damage.full = true;
+            return;
+        }
+        let end = (bottom + 1).min(self.damage.lines.len());
+        if top < end {
+            self.damage.lines[top..end].fill(true);
         }
     }
 
@@ -665,22 +745,46 @@ impl Terminal {
         if self.styles.len() > self.style_limit {
             self.compact_styles();
         }
-        self.style_id = self.styles.intern(&self.cursor.style);
-        self.erase_id = self.styles.intern(&self.cursor.style.erased());
+        if self.synced_style.as_ref().is_some_and(|s| *s == self.cursor.style) {
+            return;
+        }
+        let style = &self.cursor.style;
+        self.style_id = if *style == Style::default() { StyleId::DEFAULT } else { self.styles.intern(style) };
+        // The erase style only depends on the background.
+        if self.synced_style.as_ref().is_none_or(|s| s.bg != style.bg) {
+            self.erase_id = self.styles.intern(&style.erased());
+        }
+        self.synced_style = Some(style.clone());
     }
 
     /// Rebuild the style table keeping only styles still referenced by cells.
     /// Keeps memory bounded under true-color animations.
     fn compact_styles(&mut self) {
-        let old = std::mem::take(&mut self.styles);
-        let mut map: HashMap<StyleId, StyleId> = HashMap::new();
+        let old = std::mem::take(&mut self.styles).into_styles();
+        self.synced_style = None;
+        self.style_generation = next_generation();
+        let mut remap = vec![u32::MAX; old.len()];
+        let fallback = Style::default();
         for grid in [&mut self.grid, &mut self.inactive] {
             for row in grid.rows_mut() {
                 for cell in &mut row.cells {
-                    cell.style = *map.entry(cell.style).or_insert_with(|| self.styles.intern(old.get(cell.style)));
+                    let i = cell.style.0 as usize;
+                    let id = match remap.get(i) {
+                        Some(&id) if id != u32::MAX => id,
+                        _ => {
+                            let id = self.styles.intern(old.get(i).unwrap_or(&fallback)).0;
+                            if let Some(slot) = remap.get_mut(i) {
+                                *slot = id;
+                            }
+                            id
+                        }
+                    };
+                    cell.style = StyleId(id);
                 }
             }
         }
+        drop(remap);
+        drop(old);
         self.style_limit = STYLE_COMPACT_MIN.max(self.styles.len() * 2);
         let mut live = std::collections::HashSet::new();
         for style in (0..self.styles.len()).map(|i| self.styles.get(StyleId(i as u32))) {
@@ -702,7 +806,13 @@ impl Terminal {
     // --- printing --------------------------------------------------------
 
     fn print_char(&mut self, c: char) {
-        let c = match self.cursor.charsets[self.cursor.gl] {
+        let charset = self.cursor.charsets[self.cursor.gl];
+        if charset == Charset::Ascii && (' '..='~').contains(&c) {
+            self.last_char = Some((c, 1));
+            self.put_char(c, 1);
+            return;
+        }
+        let c = match charset {
             Charset::DecSpecial => text::dec_special(c),
             Charset::Ascii => c,
         };
@@ -710,11 +820,9 @@ impl Terminal {
         let width = if c == PLACEHOLDER { 1 } else { text::char_width(c, self.config.ambiguous_wide) };
         if crate::bidi::is_control(c) && self.prev_cell().is_none() {
             let cell = self.grid.cell_mut(self.cursor.x, self.cursor.y);
-            let mut prefix = cell.prefix.take().map(String::from).unwrap_or_default();
-            if prefix.len() < MAX_GRAPHEME_EXTRA {
-                prefix.push(c);
+            if cell.prefix().map_or(0, str::len) < MAX_GRAPHEME_EXTRA {
+                cell.push_prefix(c);
             }
-            cell.prefix = Some(prefix.into_boxed_str());
             self.damage_line(self.cursor.y);
             return;
         }
@@ -731,7 +839,7 @@ impl Terminal {
         let y = self.cursor.y;
         let x = if self.cursor.pending_wrap { self.cursor.x } else { self.cursor.x.checked_sub(1)? };
         let row = self.grid.row(y);
-        if x > 0 && row.cells[x].flags.contains(CellFlags::WIDE_SPACER) { Some((x - 1, y)) } else { Some((x, y)) }
+        if x > 0 && row.cells[x].flags().contains(CellFlags::WIDE_SPACER) { Some((x - 1, y)) } else { Some((x, y)) }
     }
 
     /// With mode 2027, a printable char that continues the previous grapheme
@@ -757,11 +865,11 @@ impl Terminal {
         let grapheme = self.mode.contains(TermMode::GRAPHEME_CLUSTERING);
         let cols = self.cols();
         let cell = self.grid.cell_mut(x, y);
-        if cell.extra.as_ref().is_some_and(|e| e.len() >= MAX_GRAPHEME_EXTRA) {
+        if cell.extra().is_some_and(|e| e.len() >= MAX_GRAPHEME_EXTRA) {
             return;
         }
         cell.push_extra(c);
-        let widen = grapheme && !cell.flags.contains(CellFlags::WIDE) && {
+        let widen = grapheme && !cell.flags().contains(CellFlags::WIDE) && {
             let mut s = String::new();
             cell.push_text(&mut s);
             text::str_width(&s, amb) == 2
@@ -771,9 +879,8 @@ impl Terminal {
         // e.g. U+2764 + VS16: the cluster becomes emoji presentation, two columns.
         if widen && x + 1 < cols && !self.cursor.pending_wrap && self.cursor.x == x + 1 {
             self.clear_wide(x + 1, y);
-            self.grid.cell_mut(x, y).flags.insert(CellFlags::WIDE);
-            *self.grid.cell_mut(x + 1, y) =
-                Cell { ch: ' ', style, flags: CellFlags::WIDE_SPACER, extra: None, prefix: None };
+            self.grid.cell_mut(x, y).insert_flags(CellFlags::WIDE);
+            *self.grid.cell_mut(x + 1, y) = Cell::new(' ', style, CellFlags::WIDE_SPACER);
             if x + 2 >= cols {
                 self.cursor.x = cols - 1;
                 self.cursor.pending_wrap = self.mode.contains(TermMode::AUTOWRAP);
@@ -785,20 +892,7 @@ impl Terminal {
 
     /// Blank both halves of a wide char occupying column `x`.
     fn clear_wide(&mut self, x: usize, y: usize) {
-        let erase = self.erase_id;
-        let row = &mut self.grid.row_mut(y).cells;
-        let Some(cell) = row.get(x) else { return };
-        if cell.flags.contains(CellFlags::WIDE) {
-            row[x] = Cell::blank(erase);
-            if x + 1 < row.len() {
-                row[x + 1] = Cell::blank(erase);
-            }
-        } else if cell.flags.contains(CellFlags::WIDE_SPACER) {
-            row[x] = Cell::blank(erase);
-            if x > 0 {
-                row[x - 1] = Cell::blank(erase);
-            }
-        }
+        clear_wide(&mut self.grid.row_mut(y).cells, x, self.erase_id);
     }
 
     fn put_char(&mut self, c: char, width: usize) {
@@ -811,9 +905,7 @@ impl Terminal {
             if autowrap {
                 let (x, y) = (self.cursor.x, self.cursor.y);
                 self.clear_wide(x, y);
-                let pad = self.grid.cell_mut(x, y);
-                *pad = Cell::blank(self.style_id);
-                pad.flags = CellFlags::LEADING_WIDE_SPACER;
+                *self.grid.cell_mut(x, y) = Cell::new(' ', self.style_id, CellFlags::LEADING_WIDE_SPACER);
                 self.wrap();
             } else {
                 self.cursor.x = cols - 2;
@@ -823,18 +915,24 @@ impl Terminal {
             self.insert_blank(width);
         }
         let (x, y) = (self.cursor.x, self.cursor.y);
-        let prefix = if self.grid.row(y).cells[x].ch == ' ' { self.grid.cell_mut(x, y).prefix.take() } else { None };
-        self.clear_wide(x, y);
-        let style = self.style_id;
-        if width == 2 {
-            self.clear_wide(x + 1, y);
-            *self.grid.cell_mut(x, y) = Cell { ch: c, style, flags: CellFlags::WIDE, extra: None, prefix: None };
-            *self.grid.cell_mut(x + 1, y) =
-                Cell { ch: ' ', style, flags: CellFlags::WIDE_SPACER, extra: None, prefix: None };
+        let (style, erase) = (self.style_id, self.erase_id);
+        let row = &mut self.grid.row_mut(y).cells;
+        if width == 1 && row[x].flags().is_empty() && !row[x].has_text() {
+            row[x] = Cell::new(c, style, CellFlags::empty());
         } else {
-            *self.grid.cell_mut(x, y) = Cell { ch: c, style, flags: CellFlags::empty(), extra: None, prefix: None };
+            let prefix = if row[x].ch() == ' ' { row[x].take_prefix() } else { None };
+            clear_wide(row, x, erase);
+            if width == 2 {
+                clear_wide(row, x + 1, erase);
+                row[x] = Cell::new(c, style, CellFlags::WIDE);
+                row[x + 1] = Cell::new(' ', style, CellFlags::WIDE_SPACER);
+            } else {
+                row[x] = Cell::new(c, style, CellFlags::empty());
+            }
+            if prefix.is_some() {
+                row[x].set_prefix(prefix);
+            }
         }
-        self.grid.cell_mut(x, y).prefix = prefix;
         self.damage_line(y);
         if x + width >= cols {
             self.cursor.x = cols - 1;
@@ -1072,7 +1170,7 @@ impl Terminal {
         let n = n.min(cols - x);
         // Inserting before a lead cell moves the entire character. Only
         // insertion inside its spacer splits the pair.
-        if self.grid.row(y).cells[x].flags.contains(CellFlags::WIDE_SPACER) {
+        if self.grid.row(y).cells[x].flags().contains(CellFlags::WIDE_SPACER) {
             self.clear_wide(x, y);
         }
         let erase = self.erase_id;
@@ -1082,7 +1180,7 @@ impl Terminal {
             *c = Cell::blank(erase);
         }
         // A wide char pushed into the last column lost its spacer.
-        if cells[cols - 1].flags.contains(CellFlags::WIDE) {
+        if cells[cols - 1].flags().contains(CellFlags::WIDE) {
             cells[cols - 1] = Cell::blank(erase);
         }
         self.cursor.pending_wrap = false;
@@ -1233,10 +1331,8 @@ impl Terminal {
         self.mode.remove(TermMode::ORIGIN);
         for y in 0..self.lines() {
             let row = self.grid.row_mut(y);
-            row.clear(StyleId::DEFAULT);
-            for c in &mut row.cells {
-                c.ch = 'E';
-            }
+            row.cells.fill(Cell::new('E', StyleId::DEFAULT, CellFlags::empty()));
+            row.wrapped = false;
         }
         self.goto(0, 0);
         self.damage_all();
@@ -1480,7 +1576,13 @@ impl Terminal {
     // --- SGR -------------------------------------------------------------
 
     fn sgr(&mut self, params: &Params) {
-        let ps: Vec<&[u16]> = params.iter().collect();
+        let mut buf: [&[u16]; PARAMS] = [&[]; PARAMS];
+        let mut n = 0;
+        for p in params.iter().take(PARAMS) {
+            buf[n] = p;
+            n += 1;
+        }
+        let ps = &buf[..n];
         let st = &mut self.cursor.style;
         if ps.is_empty() {
             let link = st.hyperlink;
@@ -1531,7 +1633,7 @@ impl Terminal {
                 55 => st.attrs.remove(Attrs::OVERLINE),
 
                 38 | 48 | 58 => {
-                    let (color, used) = parse_extended_color(&ps, i);
+                    let (color, used) = parse_extended_color(ps, i);
                     i += used;
                     if let Some(c) = color {
                         match p[0] {
@@ -2036,7 +2138,13 @@ impl Perform for Terminal {
         if ignore {
             return;
         }
-        let args: Vec<u16> = params.iter().map(|p| p[0]).collect();
+        let mut argbuf = [0u16; PARAMS];
+        let mut n = 0;
+        for p in params.iter().take(PARAMS) {
+            argbuf[n] = p[0];
+            n += 1;
+        }
+        let args = &argbuf[..n];
         // Most parameters treat 0 like "missing".
         let arg = |i: usize, d: usize| match args.get(i) {
             None | Some(0) => d,
@@ -2085,10 +2193,10 @@ impl Perform for Terminal {
                 _ => {}
             },
 
-            ([], 'h') => self.set_ansi_modes(&args, true),
-            ([], 'l') => self.set_ansi_modes(&args, false),
-            ([b'?'], 'h') => self.set_private_modes(&args, true),
-            ([b'?'], 'l') => self.set_private_modes(&args, false),
+            ([], 'h') => self.set_ansi_modes(args, true),
+            ([], 'l') => self.set_ansi_modes(args, false),
+            ([b'?'], 'h') => self.set_private_modes(args, true),
+            ([b'?'], 'l') => self.set_private_modes(args, false),
             ([], 'm') => self.sgr(params),
             ([], 'n') => self.device_status(raw(0), false),
             ([b'?'], 'n') => self.device_status(raw(0), true),

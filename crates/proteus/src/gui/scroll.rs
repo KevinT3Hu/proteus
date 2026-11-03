@@ -45,6 +45,16 @@ pub struct SearchState {
     /// Where incremental search measures "nearest" from.
     pub origin: (PaneId, Point),
     pub error: Option<String>,
+    /// What `matches` were found for, to narrow them as the query grows.
+    pub searched: Option<Searched>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Searched {
+    query: String,
+    output: bool,
+    /// Searched panes and their content generations.
+    panes: Vec<(PaneId, u64)>,
 }
 
 impl SearchState {
@@ -363,6 +373,7 @@ impl App {
             current: None,
             origin: (pane, origin),
             error: None,
+            searched: None,
         });
         self.search_update();
     }
@@ -384,6 +395,14 @@ impl App {
         };
         let panes = self.search_panes(s);
         let opts = SearchOptions { regex: s.regex, ..SearchOptions::default() };
+        let generations: Vec<(PaneId, u64)> =
+            panes.iter().filter_map(|id| Some((*id, self.panes.get(id)?.term.content_generation()))).collect();
+        // A literal query that grew only matches where its prefix did, if
+        // nothing changed since: look again there instead of everywhere.
+        let narrow = !s.regex
+            && s.searched.as_ref().is_some_and(|p| {
+                !p.query.is_empty() && s.query.starts_with(&p.query) && p.output == s.output && p.panes == generations
+            });
         let (mut matches, mut error) = (Vec::new(), None);
         if !s.query.is_empty() {
             match Searcher::new(&s.query, &opts) {
@@ -393,10 +412,26 @@ impl App {
                             continue;
                         };
                         let t = &p.term;
-                        let found = match (s.output, t.is_alt_screen()) {
-                            (false, _) => re.find_all(t.grid()),
-                            (true, false) => re.find_in_ranges(t.grid(), &t.output_ranges()),
-                            (true, true) => Vec::new(),
+                        let found = if narrow {
+                            let mut starts: Vec<_> = s
+                                .matches
+                                .iter()
+                                .filter(|(pane, _)| *pane == id)
+                                .map(|(_, m)| proteus_core::text::logical_start(t.grid(), m.start.line))
+                                .collect();
+                            starts.dedup();
+                            let ranges = if s.output { t.output_ranges() } else { Vec::new() };
+                            starts
+                                .into_iter()
+                                .flat_map(|l| re.find(t.grid(), l..l + 1))
+                                .filter(|m| !s.output || ranges.iter().any(|r| r.contains(&m.start.line)))
+                                .collect()
+                        } else {
+                            match (s.output, t.is_alt_screen()) {
+                                (false, _) => re.find_all(t.grid()),
+                                (true, false) => re.find_in_ranges(t.grid(), &t.output_ranges()),
+                                (true, true) => Vec::new(),
+                            }
                         };
                         matches.extend(found.into_iter().map(|m| (id, m)));
                     }
@@ -406,6 +441,11 @@ impl App {
         }
         if let Some(s) = self.w.search.as_mut() {
             s.matches = matches;
+            s.searched = (error.is_none() && !s.regex).then(|| Searched {
+                query: s.query.clone(),
+                output: s.output,
+                panes: generations,
+            });
             s.error = error;
         }
     }

@@ -70,7 +70,7 @@ pub enum Color {
 
 /// Terminal palette: 256 indexed colors plus special colors. The base is the
 /// theme; OSC sequences apply overrides on top that can be reset individually.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct Palette {
     base: [Rgb; 256],
     base_fg: Rgb,

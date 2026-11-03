@@ -72,7 +72,11 @@ impl WindowHandler for App {
         }
         let first = !self.w.configured;
         self.w.configured = true;
-        self.apply_size();
+        if first {
+            self.apply_size();
+        } else {
+            self.w.size_pending = true;
+        }
         if first && self.w.id == 1 {
             self.run_env_actions();
         }

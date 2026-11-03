@@ -89,8 +89,45 @@ pub struct ShapedGlyph {
     pub y: f32,
 }
 
-/// Bound on cached shaped runs before the cache is reset.
+/// Bound on each generation of cached shaped runs.
 const SHAPE_CACHE: usize = 8192;
+
+/// Shaped text by string, in two generations: when the recent one fills
+/// up it becomes the old one, and entries used again move back. Text on
+/// screen therefore survives a turnover instead of being reshaped at once.
+#[derive(Default)]
+struct ShapeCache {
+    recent: foldhash::HashMap<String, Rc<[ShapedGlyph]>>,
+    old: foldhash::HashMap<String, Rc<[ShapedGlyph]>>,
+}
+
+impl ShapeCache {
+    fn get(&mut self, text: &str) -> Option<Rc<[ShapedGlyph]>> {
+        if let Some(r) = self.recent.get(text) {
+            return Some(r.clone());
+        }
+        let (key, glyphs) = self.old.remove_entry(text)?;
+        self.make_room();
+        self.recent.insert(key, glyphs.clone());
+        Some(glyphs)
+    }
+
+    fn insert(&mut self, text: &str, glyphs: Rc<[ShapedGlyph]>) {
+        self.make_room();
+        self.recent.insert(text.to_owned(), glyphs);
+    }
+
+    fn make_room(&mut self) {
+        if self.recent.len() >= SHAPE_CACHE {
+            self.old = std::mem::take(&mut self.recent);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.recent.clear();
+        self.old.clear();
+    }
+}
 
 struct FcConfig(*mut fc::FcConfig);
 
@@ -196,9 +233,9 @@ pub struct Fonts {
     glyphs: HashMap<(char, u8), Option<GlyphRef>>,
     ctx: ScaleContext,
     /// Shaped runs per style.
-    shaped: [HashMap<String, Rc<[ShapedGlyph]>>; STYLES * 4],
+    shaped: [ShapeCache; STYLES * 4],
     /// Shaped grapheme clusters (combining sequences, emoji) per style.
-    clusters: [HashMap<String, Rc<[ShapedGlyph]>>; STYLES],
+    clusters: [ShapeCache; STYLES],
     /// Color emoji face, looked up on first use.
     emoji: Option<Option<usize>>,
     metrics: Metrics,
@@ -388,7 +425,7 @@ impl Fonts {
         self.size_pt = size_pt;
         self.scale = scale;
         self.update_metrics();
-        self.shaped.iter_mut().chain(&mut self.clusters).for_each(HashMap::clear);
+        self.shaped.iter_mut().chain(&mut self.clusters).for_each(ShapeCache::clear);
         true
     }
 
@@ -487,7 +524,7 @@ impl Fonts {
     pub fn shape_directional(&mut self, text: &str, style: u8, rtl: bool, ligatures: bool) -> Rc<[ShapedGlyph]> {
         let index = style as usize + usize::from(rtl) * STYLES + usize::from(!ligatures) * STYLES * 2;
         if let Some(r) = self.shaped[index].get(text) {
-            return r.clone();
+            return r;
         }
         let chars: Vec<_> =
             text.chars().filter(|&c| !invisible(c)).map(|c| if rtl { c.mirror().unwrap_or(c) } else { c }).collect();
@@ -500,11 +537,7 @@ impl Fonts {
         let mut out = self.shape_with_face(face, text, style, rtl, ligatures);
         out.retain(|g| g.glyph.glyph != 0);
         let out: Rc<[ShapedGlyph]> = out.into();
-        let cache = &mut self.shaped[index];
-        if cache.len() >= SHAPE_CACHE {
-            cache.clear();
-        }
-        cache.insert(text.to_owned(), out.clone());
+        self.shaped[index].insert(text, out.clone());
         out
     }
 
@@ -514,14 +547,10 @@ impl Fonts {
     /// glyphs have `src == 0`.
     pub fn shape_cluster(&mut self, text: &str, style: u8, wide: bool) -> Rc<[ShapedGlyph]> {
         if let Some(r) = self.clusters[style as usize].get(text) {
-            return r.clone();
+            return r;
         }
         let out: Rc<[ShapedGlyph]> = self.shape_cluster_uncached(text, style, wide).into();
-        let cache = &mut self.clusters[style as usize];
-        if cache.len() >= SHAPE_CACHE {
-            cache.clear();
-        }
-        cache.insert(text.to_string(), out.clone());
+        self.clusters[style as usize].insert(text, out.clone());
         out
     }
 

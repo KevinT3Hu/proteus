@@ -86,14 +86,14 @@ pub fn runs(row: &Row, styles: &StyleTable) -> Vec<Run> {
     let mut out: Vec<Run> = Vec::new();
     let mut prev: Option<Prev> = None;
     for (x, cell) in row.cells.iter().enumerate() {
-        if cell.ch != PLACEHOLDER {
+        if cell.ch() != PLACEHOLDER {
             continue;
         }
         let style = styles.get(cell.style);
         let (fg, ul) = (color_id(style.fg), color_id(style.underline_color));
         let mut d = [0u32; 3];
         let mut n = 0;
-        for c in cell.extra.as_deref().unwrap_or("").chars() {
+        for c in cell.extra().unwrap_or("").chars() {
             match diacritic_value(c) {
                 Some(v) if n < 3 => {
                     d[n] = v;

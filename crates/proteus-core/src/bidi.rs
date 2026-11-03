@@ -45,6 +45,32 @@ impl RowLayout {
     }
 }
 
+/// Characters that can give text a right-to-left level in a left-to-right
+/// paragraph: strong R/AL, Arabic digits and RTL formatting characters.
+/// Text without any of them always lays out in logical order.
+fn may_be_rtl(c: char) -> bool {
+    matches!(c,
+        '\u{0590}'..='\u{08ff}'
+        | '\u{fb1d}'..='\u{fdff}'
+        | '\u{fe70}'..='\u{feff}'
+        | '\u{10800}'..='\u{10fff}'
+        | '\u{1e800}'..='\u{1efff}'
+        | '\u{200f}' | '\u{202b}' | '\u{202e}' | '\u{2067}' | '\u{2068}')
+}
+
+fn row_may_be_rtl(row: &crate::cell::Row) -> bool {
+    row.cells.iter().any(|c| {
+        !c.ch().is_ascii() && may_be_rtl(c.ch())
+            || c.has_text() && c.extra().into_iter().chain(c.prefix()).flat_map(str::chars).any(may_be_rtl)
+    })
+}
+
+/// Soft-wrapped lines longer than this many rows are laid out in blocks
+/// of this size, so a huge wrapped line costs a bounded amount per frame.
+const CHUNK_ROWS: Line = 128;
+/// Bound on cached row layouts before the cache is reset.
+const CACHE_ROWS: usize = 4096;
+
 struct Atom {
     col: usize,
     width: usize,
@@ -59,72 +85,81 @@ struct Row {
 #[derive(Default)]
 pub(crate) struct Cache {
     rows: HashMap<Line, Arc<RowLayout>>,
+    identity: Arc<RowLayout>,
 }
 impl Cache {
     pub fn clear(&mut self) {
         self.rows.clear();
     }
-    pub fn row(&mut self, grid: &Grid, line: Line) -> Arc<RowLayout> {
-        if let Some(row) = self.rows.get(&line) {
-            return row.clone();
-        }
-        let Some(target) = grid.abs_row(line) else {
-            return Arc::default();
-        };
-        // Most output never needs bidi, including ordinary ASCII full-screen applications.
-        if !target.wrapped
-            && (line == grid.first_line() || !grid.abs_row(line - 1).is_some_and(|r| r.wrapped))
-            && target.cells.iter().all(|c| c.ch.is_ascii() && c.extra.is_none() && c.prefix.is_none())
-        {
-            let map = Arc::default();
-            self.rows.insert(line, Arc::clone(&map));
-            return map;
-        }
+    /// The shared layout of rows shown in logical order.
+    pub fn identity(&self) -> Arc<RowLayout> {
+        Arc::clone(&self.identity)
+    }
+    /// First line of the layout block containing `line`.
+    pub fn block_start(grid: &Grid, line: Line) -> Line {
         let mut first = line;
         while first > grid.first_line() && grid.abs_row(first - 1).is_some_and(|r| r.wrapped) {
             first -= 1;
         }
-        let mut last = line;
-        while grid.abs_row(last).is_some_and(|r| r.wrapped) && grid.abs_row(last + 1).is_some() {
+        first + (line - first) / CHUNK_ROWS * CHUNK_ROWS
+    }
+    /// Forget layouts of `from` and later lines (their content may change).
+    pub fn invalidate_from(&mut self, from: Line) {
+        self.rows.retain(|&l, _| l < from);
+    }
+    pub fn row(&mut self, grid: &Grid, line: Line) -> Arc<RowLayout> {
+        if let Some(row) = self.rows.get(&line) {
+            return row.clone();
+        }
+        if grid.abs_row(line).is_none() {
+            return self.identity();
+        }
+        let first = Self::block_start(grid, line);
+        let mut last = first;
+        while last + 1 < first + CHUNK_ROWS
+            && grid.abs_row(last).is_some_and(|r| r.wrapped)
+            && grid.abs_row(last + 1).is_some()
+        {
             last += 1;
+        }
+        if self.rows.len() + (last - first + 1) as usize > CACHE_ROWS {
+            self.rows.clear();
+        }
+        // Most output never needs bidi, including ordinary full-screen applications.
+        if !(first..=last).any(|l| grid.abs_row(l).is_some_and(row_may_be_rtl)) {
+            for l in first..=last {
+                self.rows.insert(l, self.identity());
+            }
+            return self.identity();
         }
         let mut text = String::new();
         let mut rows = Vec::new();
-        // Resolve the whole soft-wrapped paragraph, but cache only a bounded window.
-        let window = line.saturating_sub(64)..=line.saturating_add(64);
         for line in first..=last {
             let row = grid.abs_row(line).unwrap();
             let start = text.len();
             let mut atoms = Vec::new();
             for (col, cell) in row.cells.iter().enumerate() {
-                if cell.flags.contains(CellFlags::WIDE_SPACER) {
+                if cell.flags().contains(CellFlags::WIDE_SPACER) {
                     continue;
                 }
-                if let Some(prefix) = &cell.prefix {
+                if let Some(prefix) = cell.prefix() {
                     text.push_str(prefix);
                 }
                 let byte = text.len();
-                text.push(cell.ch);
-                if let Some(extra) = &cell.extra {
+                text.push(cell.ch());
+                if let Some(extra) = cell.extra() {
                     text.push_str(extra);
                 }
-                if window.contains(&line) {
-                    atoms.push(Atom { col, width: if cell.flags.contains(CellFlags::WIDE) { 2 } else { 1 }, byte });
-                }
+                atoms.push(Atom { col, width: cell.width().max(1), byte });
             }
-            if window.contains(&line) {
-                rows.push(Row { line, start, end: text.len(), atoms });
-            }
+            rows.push(Row { line, start, end: text.len(), atoms });
         }
         let info = BidiInfo::new(&text, Some(Level::ltr()));
         if !info.has_rtl() {
-            if self.rows.len() + rows.len() > 256 {
-                self.rows.clear();
-            }
             for row in rows {
-                self.rows.insert(row.line, Arc::default());
+                self.rows.insert(row.line, self.identity());
             }
-            return self.rows.get(&line).cloned().unwrap_or_default();
+            return self.identity();
         }
         let mut maps = Vec::new();
         for row in rows {
@@ -141,8 +176,8 @@ impl Cache {
                 row.atoms.iter().map(|a| levels.get(a.byte).copied().unwrap_or(Level::ltr())).collect();
             let mut map = RowLayout::default();
             if atom_levels.iter().any(|l| l.is_rtl()) {
-                map.visual = vec![0; grid.cols()];
-                map.logical = vec![0; grid.cols()];
+                map.visual = (0..grid.cols()).collect();
+                map.logical = (0..grid.cols()).collect();
                 map.levels = vec![0; grid.cols()];
                 let mut visual = 0;
                 for index in BidiInfo::reorder_visual(&atom_levels) {
@@ -157,11 +192,8 @@ impl Cache {
             }
             maps.push((row.line, Arc::new(map)));
         }
-        if self.rows.len() + maps.len() > 256 {
-            self.rows.clear();
-        }
         self.rows.extend(maps);
-        self.rows.get(&line).cloned().unwrap_or_default()
+        self.rows.get(&line).cloned().unwrap_or_else(|| self.identity())
     }
 }
 

@@ -74,8 +74,7 @@ fn terminal_text(
     for y in 0..t.lines() {
         let row = t.grid().row(y);
         let layout = t.visual_row(t.grid().abs_line(y));
-        let used =
-            row.cells.iter().rposition(|c| c.ch != ' ' || c.extra.is_some() || c.prefix.is_some()).map_or(0, |i| i + 1);
+        let used = row.cells.iter().rposition(|c| c.ch() != ' ' || c.has_text()).map_or(0, |i| i + 1);
         let cursor_col =
             if t.cursor().x > 0 && row.cells[t.cursor().x].is_spacer() { t.cursor().x - 1 } else { t.cursor().x };
         let end = if y == t.cursor().y { used.max(cursor_col + 1) } else { used };

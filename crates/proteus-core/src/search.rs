@@ -52,8 +52,14 @@ impl Searcher {
         let mut out = Vec::new();
         let end = lines.end.min(grid.end_line());
         let mut l = text::logical_start(grid, lines.start.max(grid.first_line()));
+        let mut ll = text::LogicalLine::default();
         while l < end {
-            let ll = text::logical_line(grid, l);
+            // Blank lines hold no non-empty match.
+            if grid.abs_row(l).is_some_and(|r| !r.wrapped && r.is_blank()) {
+                l += 1;
+                continue;
+            }
+            text::logical_line_into(grid, l, &mut ll);
             for m in self.re.find_iter(&ll.text) {
                 if m.is_empty() {
                     continue;

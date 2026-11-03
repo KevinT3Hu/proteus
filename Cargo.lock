@@ -2321,6 +2321,7 @@ dependencies = [
  "base64 0.22.1",
  "bytemuck",
  "clap",
+ "foldhash",
  "harfrust",
  "image",
  "miniz_oxide 0.9.1",
@@ -2356,6 +2357,8 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "bitflags",
+ "foldhash",
+ "hashbrown 0.17.1",
  "image",
  "miniz_oxide 0.9.1",
  "regex",

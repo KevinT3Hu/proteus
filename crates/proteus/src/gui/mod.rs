@@ -435,6 +435,10 @@ struct Win {
     mouse: Mouse,
     /// A divider is being dragged: PTY resizes wait for the release.
     defer_pty_resize: bool,
+    /// A configure changed the window; applied before the next frame.
+    size_pending: bool,
+    /// A hidden tab's pane waits for its resize (see `App::relayout`).
+    resize_deferred: bool,
     /// Block whose gutter mark the pointer is over.
     hover: Option<(PaneId, proteus_core::blocks::BlockId)>,
     /// Hint mode: labels are shown and keys pick one.
@@ -550,6 +554,42 @@ struct App {
     sc: scripting::Scripting,
     /// WASM plugins and their surfaces.
     pl: plugins::Plugins,
+    /// PTY output waiting for idle processing, merged per pane, with the
+    /// budget permits that hold its readers back until then.
+    pty_pending: Vec<PendingOutput>,
+}
+
+struct PendingOutput {
+    pane: PaneId,
+    bytes: Vec<u8>,
+    permits: Vec<(proteus_pty::budget::Permit, proteus_pty::budget::Permit)>,
+}
+
+impl App {
+    fn queue_pty_output(
+        &mut self,
+        pane: PaneId,
+        bytes: Vec<u8>,
+        permits: (proteus_pty::budget::Permit, proteus_pty::budget::Permit),
+    ) {
+        if self.pty_pending.is_empty() {
+            self.handle.insert_idle(App::flush_pty_output);
+        }
+        match self.pty_pending.iter_mut().find(|p| p.pane == pane) {
+            Some(p) => {
+                p.bytes.extend_from_slice(&bytes);
+                p.permits.push(permits);
+            }
+            None => self.pty_pending.push(PendingOutput { pane, bytes, permits: vec![permits] }),
+        }
+    }
+
+    fn flush_pty_output(&mut self) {
+        for p in std::mem::take(&mut self.pty_pending) {
+            self.pty_output(p.pane, &p.bytes);
+            drop(p.permits);
+        }
+    }
 }
 
 /// Wayland and GPU objects of a new window.
@@ -643,6 +683,8 @@ fn make_win(
         window_title: String::new(),
         mouse: Mouse::default(),
         defer_pty_resize: false,
+        size_pending: false,
+        resize_deferred: false,
         hover: None,
         hints: None,
         viewer: None,
@@ -729,10 +771,7 @@ pub fn run(
             channel::Event::Msg(Msg::Pty(id, bytes, permits)) => {
                 // Retain permits until idle processing: producers cannot
                 // continuously refill this source and starve input/rendering.
-                app.handle.insert_idle(move |app| {
-                    app.pty_output(id, &bytes);
-                    drop(permits);
-                });
+                app.queue_pty_output(id, bytes, permits);
             }
             channel::Event::Msg(Msg::PtyClosed(id)) => {
                 app.handle.insert_idle(move |app| app.ssh_closed(id));
@@ -818,6 +857,7 @@ pub fn run(
         exit: false,
         sc: scripting::Scripting::default(),
         pl: plugins::Plugins::default(),
+        pty_pending: Vec::new(),
     };
     let _ipc_server = if let Some(path) = listen.or_else(|| app.cfg.ipc_socket.clone()) {
         let path = if path.is_absolute() { path } else { std::env::current_dir()?.join(path) };

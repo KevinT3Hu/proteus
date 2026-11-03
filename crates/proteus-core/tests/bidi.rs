@@ -20,8 +20,8 @@ fn display(t: &Terminal, row: usize) -> String {
         if c.is_spacer() {
             continue;
         }
-        out.push(c.ch);
-        if let Some(extra) = &c.extra {
+        out.push(c.ch());
+        if let Some(extra) = c.extra() {
             out.extend(extra.chars().filter(|&c| !proteus_core::bidi::is_control(c)));
         }
     }
@@ -101,4 +101,35 @@ fn modes_resize_and_output_invalidate_presentation_without_mutating_storage() {
     );
     assert_eq!(display(&t, 0), "גבא");
     assert_eq!(display(&t, 1), "הד");
+}
+
+#[test]
+fn cached_layouts_follow_new_output_and_scrollback_keeps_its_layout() {
+    let mut t = term("abc", 20);
+    let first = t.grid().abs_line(0);
+    assert!(!t.visual_row(first).has_rtl());
+    t.advance("\r\u{05d0}\u{05d1} x".as_bytes());
+    assert!(t.visual_row(first).has_rtl());
+    let order = |t: &Terminal| {
+        let layout = t.visual_row(first);
+        (0..20).map(|x| layout.logical(x)).collect::<Vec<_>>()
+    };
+    let shown = order(&t);
+    t.advance(b"\r\n1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7");
+    assert!(t.grid().screen_y(first).is_none(), "the line scrolled into history");
+    assert_eq!(order(&t), shown);
+}
+
+#[test]
+fn long_soft_wrapped_lines_are_laid_out_in_blocks() {
+    let mut t = Terminal::new(10, 4, Config::default());
+    let mut text = "\u{05d0}".repeat(10);
+    text.push_str(&"a".repeat(10 * 300));
+    t.advance(text.as_bytes());
+    let first = t.grid().first_line();
+    assert!(t.grid().abs_row(first).unwrap().wrapped);
+    assert!(t.visual_row(first).has_rtl());
+    // Rows far from the RTL text do not pay for resolving it.
+    let far = t.grid().end_line() - 1;
+    assert!(!t.visual_row(far).has_rtl());
 }

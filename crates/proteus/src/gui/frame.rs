@@ -407,6 +407,13 @@ impl App {
     }
 
     pub(super) fn draw(&mut self) {
+        // Configures are applied once per event loop turn, not once per event.
+        if std::mem::take(&mut self.w.size_pending) {
+            self.apply_size();
+        }
+        if self.w.resize_deferred {
+            self.apply_deferred_resizes();
+        }
         if !self.w.configured || self.w.suspended || self.w.frame_pending || self.exit {
             return;
         }
@@ -439,7 +446,7 @@ impl App {
         for id in &mine {
             // Hidden panes' damage is dropped: they redraw fully when shown.
             if let Some(p) = self.panes.get_mut(id)
-                && !p.term.take_damage().is_empty()
+                && p.term.clear_damage()
                 && visible.contains(id)
             {
                 changed = true;

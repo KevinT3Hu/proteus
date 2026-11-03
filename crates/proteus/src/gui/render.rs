@@ -2,6 +2,7 @@
 //! a coverage atlas and a color (emoji) atlas, and curly underlines.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -19,7 +20,10 @@ use super::images::{self, Layer, TextureCache};
 use super::ime::Preedit;
 use super::rows::{Row, Rows};
 
+/// Initial glyph atlas size; an atlas that fills up grows to `MAX_ATLAS`
+/// (as far as the device allows) before glyphs are evicted.
 const ATLAS: u32 = 2048;
+const MAX_ATLAS: u32 = 4096;
 /// GPU memory for image textures before the least recently drawn are freed.
 pub const DEFAULT_TEXTURE_BUDGET: usize = 512 << 20;
 
@@ -55,25 +59,27 @@ struct Globals {
 struct Shelves {
     shelves: Vec<(u32, u32, u32)>, // (y, height, used width)
     next_y: u32,
+    size: u32,
 }
 
 impl Shelves {
-    fn new() -> Self {
-        Self { shelves: Vec::new(), next_y: 0 }
+    fn new(size: u32) -> Self {
+        Self { shelves: Vec::new(), next_y: 0, size }
     }
     fn alloc(&mut self, w: u32, h: u32) -> Option<(u32, u32)> {
         let (w, h) = (w + 1, h + 1); // 1px gutter against bleeding
-        if w > ATLAS || h > ATLAS {
+        let size = self.size;
+        if w > size || h > size {
             return None;
         }
         for s in &mut self.shelves {
-            if h <= s.1 && h * 4 >= s.1 * 3 && s.2 + w <= ATLAS {
+            if h <= s.1 && h * 4 >= s.1 * 3 && s.2 + w <= size {
                 let x = s.2;
                 s.2 += w;
                 return Some((x, s.0));
             }
         }
-        if self.next_y + h > ATLAS {
+        if self.next_y + h > size {
             return None;
         }
         let y = self.next_y;
@@ -81,6 +87,18 @@ impl Shelves {
         self.shelves.push((y, h, w));
         Some((0, y))
     }
+}
+
+/// The instances one grid row produced, reused while everything they were
+/// built from hashes to `key` (cell content, colors, cursor, selection,
+/// marks, geometry, glyph atlas).
+#[derive(Default)]
+struct CachedRow {
+    key: u64,
+    /// Frame that last drew it; rows not drawn in a frame are dropped.
+    used: u64,
+    bg: Vec<Instance>,
+    fg: Vec<Instance>,
 }
 
 #[derive(Clone, Copy)]
@@ -225,6 +243,16 @@ pub struct Renderer {
     linear: bool,
     mask_shelves: Shelves,
     color_shelves: Shelves,
+    /// Largest atlas side the device takes (capped at `MAX_ATLAS`).
+    max_atlas: u32,
+    atlas_layout: wgpu::BindGroupLayout,
+    samplers: [wgpu::Sampler; 2],
+    /// Changes whenever atlas positions of cached glyphs become invalid.
+    glyph_epoch: u64,
+    /// Instances of grid rows from earlier frames, by (terminal, viewport row).
+    row_cache: HashMap<(usize, usize), CachedRow>,
+    row_hasher: foldhash::fast::RandomState,
+    frame_no: u64,
     glyphs: HashMap<GlyphRef, Option<AtlasGlyph>>,
     scratch: Vec<Instance>,
     /// Glyphs drawn after backgrounds.
@@ -242,6 +270,42 @@ pub struct Renderer {
 
 fn rgba(c: Rgb, a: f32) -> [f32; 4] {
     [c.r as f32 / 255.0, c.g as f32 / 255.0, c.b as f32 / 255.0, a]
+}
+
+fn atlas_texture(device: &wgpu::Device, label: &str, format: wgpu::TextureFormat, size: u32) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    })
+}
+
+fn atlas_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    globals: &wgpu::Buffer,
+    mask: &wgpu::Texture,
+    color: &wgpu::Texture,
+    [nearest, smooth]: &[wgpu::Sampler; 2],
+) -> wgpu::BindGroup {
+    let mask_view = mask.create_view(&Default::default());
+    let color_view = color.create_view(&Default::default());
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: globals.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&mask_view) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&color_view) },
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(nearest) },
+            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(smooth) },
+        ],
+    })
 }
 
 impl Renderer {
@@ -298,20 +362,8 @@ impl Renderer {
             label: Some("proteus shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
         });
-        let tex = |label, format| {
-            device.create_texture(&wgpu::TextureDescriptor {
-                label: Some(label),
-                size: wgpu::Extent3d { width: ATLAS, height: ATLAS, depth_or_array_layers: 1 },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            })
-        };
-        let mask = tex("mask atlas", wgpu::TextureFormat::R8Unorm);
-        let color = tex("color atlas", wgpu::TextureFormat::Rgba8Unorm);
+        let mask = atlas_texture(&device, "mask atlas", wgpu::TextureFormat::R8Unorm, ATLAS);
+        let color = atlas_texture(&device, "color atlas", wgpu::TextureFormat::Rgba8Unorm, ATLAS);
         let sampler = |filter| {
             device.create_sampler(&wgpu::SamplerDescriptor {
                 mag_filter: filter,
@@ -355,19 +407,8 @@ impl Renderer {
                 entry(4, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
             ],
         });
-        let mask_view = mask.create_view(&Default::default());
-        let color_view = color.create_view(&Default::default());
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: globals.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&mask_view) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&color_view) },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&nearest) },
-                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&smooth) },
-            ],
-        });
+        let samplers = [nearest, smooth];
+        let bind_group = atlas_bind_group(&device, &layout, &globals, &mask, &color, &samplers);
         let images = TextureCache::new(&device, &queue, DEFAULT_TEXTURE_BUDGET);
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
@@ -421,8 +462,15 @@ impl Renderer {
             color,
             instances,
             capacity,
-            mask_shelves: Shelves::new(),
-            color_shelves: Shelves::new(),
+            mask_shelves: Shelves::new(ATLAS),
+            color_shelves: Shelves::new(ATLAS),
+            max_atlas: adapter.limits().max_texture_dimension_2d.min(MAX_ATLAS),
+            atlas_layout: layout,
+            samplers,
+            glyph_epoch: 0,
+            row_cache: HashMap::default(),
+            row_hasher: Default::default(),
+            frame_no: 0,
             glyphs: HashMap::new(),
             scratch: Vec::new(),
             fg: Vec::new(),
@@ -491,51 +539,75 @@ impl Renderer {
     /// Forget all cached glyphs (font or size changed, or atlas full).
     pub fn clear_glyphs(&mut self) {
         self.glyphs.clear();
-        self.mask_shelves = Shelves::new();
-        self.color_shelves = Shelves::new();
+        self.mask_shelves = Shelves::new(self.mask_shelves.size);
+        self.color_shelves = Shelves::new(self.color_shelves.size);
+        self.glyph_epoch += 1;
+    }
+
+    /// The mask or color atlas is full: grow it if the device allows,
+    /// else start it over. Either way its glyphs re-rasterize as needed.
+    fn atlas_full(&mut self, color: bool) {
+        self.redraw_needed = true;
+        self.glyph_epoch += 1;
+        self.glyphs.retain(|_, v| v.is_none_or(|a| a.color != color));
+        let size = if color { self.color_shelves.size } else { self.mask_shelves.size };
+        let size = if size < self.max_atlas { size * 2 } else { size };
+        if color {
+            self.color_shelves = Shelves::new(size);
+            if size != self.color.width() {
+                self.color = atlas_texture(&self.device, "color atlas", wgpu::TextureFormat::Rgba8Unorm, size);
+            }
+        } else {
+            self.mask_shelves = Shelves::new(size);
+            if size != self.mask.width() {
+                self.mask = atlas_texture(&self.device, "mask atlas", wgpu::TextureFormat::R8Unorm, size);
+            }
+        }
+        self.bind_group =
+            atlas_bind_group(&self.device, &self.atlas_layout, &self.globals, &self.mask, &self.color, &self.samplers);
     }
 
     fn glyph(&mut self, fonts: &mut Fonts, g: GlyphRef) -> Option<AtlasGlyph> {
         if let Some(&a) = self.glyphs.get(&g) {
             return a;
         }
-        let entry = fonts.rasterize(g).and_then(|r| {
-            let shelves = if r.color { &mut self.color_shelves } else { &mut self.mask_shelves };
-            let (x, y) = match shelves.alloc(r.width, r.height) {
-                Some(p) => p,
-                None => {
-                    // Atlas full: start over; glyphs re-rasterize as needed.
-                    *shelves = Shelves::new();
-                    self.redraw_needed = true;
-                    self.glyphs.retain(|_, v| v.is_none_or(|a| a.color != r.color));
-                    let shelves = if r.color { &mut self.color_shelves } else { &mut self.mask_shelves };
-                    shelves.alloc(r.width, r.height)?
-                }
-            };
-            let (tex, bpp) = if r.color { (&self.color, 4) } else { (&self.mask, 1) };
-            self.queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: tex,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d { x, y, z: 0 },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &r.data,
-                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(r.width * bpp), rows_per_image: None },
-                wgpu::Extent3d { width: r.width, height: r.height, depth_or_array_layers: 1 },
-            );
-            let a = ATLAS as f32;
-            Some(AtlasGlyph {
-                color: r.color,
-                uv: [x as f32 / a, y as f32 / a, (x + r.width) as f32 / a, (y + r.height) as f32 / a],
-                left: r.left,
-                top: r.top,
-                w: r.width,
-                h: r.height,
-            })
-        });
+        let entry = self.upload_glyph(fonts, g);
         self.glyphs.insert(g, entry);
         entry
+    }
+
+    fn upload_glyph(&mut self, fonts: &mut Fonts, g: GlyphRef) -> Option<AtlasGlyph> {
+        let r = fonts.rasterize(g)?;
+        let shelves = if r.color { &mut self.color_shelves } else { &mut self.mask_shelves };
+        let (x, y) = match shelves.alloc(r.width, r.height) {
+            Some(p) => p,
+            None => {
+                self.atlas_full(r.color);
+                let shelves = if r.color { &mut self.color_shelves } else { &mut self.mask_shelves };
+                shelves.alloc(r.width, r.height)?
+            }
+        };
+        let (tex, bpp) = if r.color { (&self.color, 4) } else { (&self.mask, 1) };
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x, y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &r.data,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(r.width * bpp), rows_per_image: None },
+            wgpu::Extent3d { width: r.width, height: r.height, depth_or_array_layers: 1 },
+        );
+        let a = tex.width() as f32;
+        Some(AtlasGlyph {
+            color: r.color,
+            uv: [x as f32 / a, y as f32 / a, (x + r.width) as f32 / a, (y + r.height) as f32 / a],
+            left: r.left,
+            top: r.top,
+            w: r.width,
+            h: r.height,
+        })
     }
 
     /// Render one frame. Returns false if the surface was not available
@@ -623,6 +695,9 @@ impl Renderer {
         self.out.clear();
         self.images.begin();
         self.build(fonts, info, m);
+        let frame = self.frame_no;
+        self.row_cache.retain(|_, c| c.used == frame);
+        self.frame_no += 1;
         self.flush_layer();
         let mut all = std::mem::take(&mut self.out);
         if all.len() > self.capacity {
@@ -787,6 +862,19 @@ impl Renderer {
             images::place(t.visible_images(), &p.rows, grid.viewport_line(0), cols, cell, t.cell_pixel_size(), skip);
         self.pane_images(fonts, &views, Layer::UnderBackground, (px, py), pal.foreground(), m);
         self.pane_images(fonts, &views, Layer::UnderText, (px, py), pal.foreground(), m);
+        // Everything besides a row's own content that its instances depend on.
+        let context = {
+            let mut h = self.row_hasher.build_hasher();
+            (self.glyph_epoch, t.style_generation(), pal, reverse, show_cursor, p.focused).hash(&mut h);
+            (std::mem::discriminant(&cursor_shape), cursor.x, cols, px.to_bits(), py.to_bits()).hash(&mut h);
+            (m.cell_w, m.cell_h, m.baseline, m.offset_x.to_bits(), m.underline_y, m.underline_h, m.strike_y)
+                .hash(&mut h);
+            let c = &info.theme.colors;
+            (info.ligatures, info.theme.accent, info.theme.bg, c.selection_foreground, c.selection_background)
+                .hash(&mut h);
+            (c.search_current_background, c.search_background, c.search_foreground, c.cursor_text).hash(&mut h);
+            h.finish()
+        };
         for (y, r) in p.rows.0.iter().enumerate().skip(skip) {
             let top = py + y as f32 * ch;
             let line = match *r {
@@ -804,15 +892,48 @@ impl Renderer {
             let Some(row) = grid.abs_row(line) else { continue };
             let is_cursor_row = cursor_row == Some(y);
             let layout = t.visual_row(line);
+            let key = {
+                let mut h = self.row_hasher.build_hasher();
+                (context, y, line, &row.cells, is_cursor_row).hash(&mut h);
+                if let Some(r) = selection.filter(|r| r.start.line <= line && line <= r.end.line) {
+                    (r.start, r.end, r.rect).hash(&mut h);
+                }
+                for m in marks.iter().filter(|m| m.start.line <= line && line <= m.end.line) {
+                    (m.start, m.end, m.kind as u8).hash(&mut h);
+                }
+                if let Some((cx, cy)) = p.copy_cursor
+                    && cy == y
+                {
+                    cx.hash(&mut h);
+                }
+                if layout.has_rtl() {
+                    for x in 0..cols {
+                        (layout.visual(x), layout.rtl(x)).hash(&mut h);
+                    }
+                }
+                h.finish()
+            };
+            let slot = (std::ptr::from_ref(t) as usize, y);
+            if let Some(c) = self.row_cache.get_mut(&slot)
+                && c.key == key
+            {
+                c.used = self.frame_no;
+                self.scratch.extend_from_slice(&c.bg);
+                self.fg.extend_from_slice(&c.fg);
+                continue;
+            }
+            let (bg_start, fg_start, epoch) = (self.scratch.len(), self.fg.len(), self.glyph_epoch);
             let mut run = Run::default();
             let mut cell_buf = String::new();
             // Run-length merge of backgrounds on this row.
             let mut bg_run: Option<(usize, Rgb)> = None;
             let mut x = 0;
-            while x < row.cells.len() {
-                let cell = &row.cells[x];
-                let width = if cell.flags.contains(CellFlags::WIDE) { 2 } else { 1 };
-                if cell.flags.contains(CellFlags::WIDE_SPACER) {
+            // History rows do not store trailing blanks.
+            while x < cols {
+                let cell = row.cells.get(x).unwrap_or(&BLANK_CELL);
+                let flags = cell.flags();
+                let width = if flags.contains(CellFlags::WIDE) { 2 } else { 1 };
+                if flags.contains(CellFlags::WIDE_SPACER) {
                     x += 1;
                     continue;
                 }
@@ -888,11 +1009,12 @@ impl Renderer {
                 // positioning); other clusters (wide, emoji, fallback fonts)
                 // are shaped on their own.
                 let hidden = style.attrs.contains(Attrs::HIDDEN);
-                let blank = cell.ch == ' ' || cell.flags.contains(CellFlags::LEADING_WIDE_SPACER);
+                let base = cell.ch();
+                let blank = base == ' ' || flags.contains(CellFlags::LEADING_WIDE_SPACER);
                 let color = rgba(fg, alpha);
                 let st = (style.attrs.contains(Attrs::BOLD) as u8 * BOLD)
                     | (style.attrs.contains(Attrs::ITALIC) as u8 * ITALIC);
-                let drawable = !hidden && !blank && cell.ch != proteus_core::graphics::placeholder::PLACEHOLDER;
+                let drawable = !hidden && !blank && base != proteus_core::graphics::placeholder::PLACEHOLDER;
                 let text = cell_text(cell, &mut cell_buf);
                 let wide = width == 2;
                 let emoji = drawable && font::emoji_presentation(text, wide);
@@ -920,10 +1042,8 @@ impl Renderer {
                 } else if drawable {
                     let left = px + vx as f32 * cw;
                     let box_w = width as f32 * cw;
-                    if cell.extra.is_none() && !emoji {
-                        if let Some(g) =
-                            fonts.glyph(if rtl { cell.ch.mirror().unwrap_or(cell.ch) } else { cell.ch }, st)
-                        {
+                    if cell.extra().is_none() && !emoji {
+                        if let Some(g) = fonts.glyph(if rtl { base.mirror().unwrap_or(base) } else { base }, st) {
                             self.place_glyph(fonts, g, left, top, box_w, 0.0, 0.0, m, color);
                         }
                     } else {
@@ -1015,7 +1135,17 @@ impl Renderer {
             }
             self.flush_run(fonts, &mut run, m, cw);
             if let Some((start, c)) = bg_run {
-                self.rect(px + start as f32 * cw, top, (row.cells.len() - start) as f32 * cw, ch, rgba(c, 1.0));
+                self.rect(px + start as f32 * cw, top, (cols - start) as f32 * cw, ch, rgba(c, 1.0));
+            }
+            // A glyph atlas reset mid-row leaves stale positions: not reusable.
+            if self.glyph_epoch == epoch {
+                let c = self.row_cache.entry(slot).or_default();
+                c.key = key;
+                c.used = self.frame_no;
+                c.bg.clear();
+                c.bg.extend_from_slice(&self.scratch[bg_start..]);
+                c.fg.clear();
+                c.fg.extend_from_slice(&self.fg[fg_start..]);
             }
         }
         self.pane_images(fonts, &views, Layer::OverText, (px, py), pal.foreground(), m);
@@ -1390,21 +1520,16 @@ impl Run {
     }
 }
 
+static BLANK_CELL: proteus_core::cell::Cell = proteus_core::cell::Cell::blank(proteus_core::style::StyleId::DEFAULT);
+
 /// A cell's full text: the base char plus combining/joined extras.
 fn cell_text<'a>(cell: &'a proteus_core::cell::Cell, buf: &'a mut String) -> &'a str {
-    match &cell.extra {
-        None => {
-            buf.clear();
-            buf.push(cell.ch);
-            buf
-        }
-        Some(extra) => {
-            buf.clear();
-            buf.push(cell.ch);
-            buf.push_str(extra);
-            buf
-        }
+    buf.clear();
+    buf.push(cell.ch());
+    if let Some(extra) = cell.extra() {
+        buf.push_str(extra);
     }
+    buf
 }
 
 /// `12345` → `12,345`.
@@ -1446,14 +1571,16 @@ mod tests {
 
     #[test]
     fn shelf_packing() {
-        let mut s = Shelves::new();
+        let mut s = Shelves::new(ATLAS);
         assert_eq!(s.alloc(10, 20), Some((0, 0)));
         assert_eq!(s.alloc(10, 18), Some((11, 0)));
         // Much shorter glyphs open a new shelf.
         assert_eq!(s.alloc(10, 5), Some((0, 21)));
         assert_eq!(s.alloc(ATLAS + 1, 1), None);
-        let mut full = Shelves::new();
+        let mut full = Shelves::new(ATLAS);
         while full.alloc(1000, 1000).is_some() {}
         assert!(full.alloc(1000, 1000).is_none());
+        // A grown atlas takes what did not fit.
+        assert!(Shelves::new(MAX_ATLAS).alloc(ATLAS + 1, 1).is_some());
     }
 }

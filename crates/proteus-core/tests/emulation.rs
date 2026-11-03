@@ -40,10 +40,10 @@ fn wide_char_wraps_with_spacer() {
     let mut t = term(5, 3);
     feed(&mut t, "abcd中");
     assert_eq!(t.row_text(0), "abcd");
-    assert!(t.grid().row(0).cells[4].flags.contains(CellFlags::LEADING_WIDE_SPACER));
+    assert!(t.grid().row(0).cells[4].flags().contains(CellFlags::LEADING_WIDE_SPACER));
     assert_eq!(t.row_text(1), "中");
-    assert!(t.grid().row(1).cells[0].flags.contains(CellFlags::WIDE));
-    assert!(t.grid().row(1).cells[1].flags.contains(CellFlags::WIDE_SPACER));
+    assert!(t.grid().row(1).cells[0].flags().contains(CellFlags::WIDE));
+    assert!(t.grid().row(1).cells[1].flags().contains(CellFlags::WIDE_SPACER));
     assert_eq!(t.cursor().x, 2);
 }
 
@@ -60,9 +60,9 @@ fn combining_marks_join_cell() {
     let mut t = term(10, 2);
     feed(&mut t, "e\u{301}x");
     let row = &t.grid().row(0).cells;
-    assert_eq!(row[0].ch, 'e');
-    assert_eq!(row[0].extra.as_deref(), Some("\u{301}"));
-    assert_eq!(row[1].ch, 'x');
+    assert_eq!(row[0].ch(), 'e');
+    assert_eq!(row[0].extra(), Some("\u{301}"));
+    assert_eq!(row[1].ch(), 'x');
 }
 
 #[test]
@@ -70,13 +70,13 @@ fn grapheme_mode_vs16_widens() {
     let mut t = term(10, 2);
     feed(&mut t, "\x1b[?2027h\u{2764}\u{fe0f}x");
     let row = &t.grid().row(0).cells;
-    assert!(row[0].flags.contains(CellFlags::WIDE));
-    assert_eq!(row[2].ch, 'x');
+    assert!(row[0].flags().contains(CellFlags::WIDE));
+    assert_eq!(row[2].ch(), 'x');
     // ZWJ family is one cluster.
     feed(&mut t, "\r\n\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}y");
     let row = &t.grid().row(1).cells;
-    assert_eq!(row[0].extra.as_deref(), Some("\u{200D}\u{1F469}\u{200D}\u{1F467}"));
-    assert_eq!(row[2].ch, 'y');
+    assert_eq!(row[0].extra(), Some("\u{200D}\u{1F469}\u{200D}\u{1F467}"));
+    assert_eq!(row[2].ch(), 'y');
 }
 
 #[test]
@@ -426,4 +426,30 @@ fn theme_reload_preserves_osc_and_reset_restores_configured_palette() {
     feed(&mut t, "\x1bc");
     assert_eq!(t.palette().indexed(255), bg);
     assert_eq!(t.palette().cursor(), Some(fg));
+}
+
+#[test]
+fn style_compaction_keeps_cell_styles() {
+    let mut t = Terminal::new(64, 4, Config { scrollback: 10, ..Config::default() });
+    // More distinct true colors than the table holds before compacting.
+    let mut s = String::new();
+    for i in 0..70_000u32 {
+        let (r, g, b) = (i >> 16, (i >> 8) & 0xff, i & 0xff);
+        s.push_str(&format!("\x1b[38;2;{r};{g};{b}m#"));
+    }
+    s.push_str("\x1b[0;1;48;5;4mX\x1b[0m");
+    feed(&mut t, &s);
+    assert!(t.styles().len() < 70_000);
+    let (x, y) = (t.cursor().x - 1, t.cursor().y);
+    let st = t.style(t.grid().row(y).cells[x].style);
+    assert_eq!((st.attrs, st.bg), (Attrs::BOLD, Color::Indexed(4)));
+    let prev = t.style(t.grid().row(y).cells[x - 1].style);
+    assert_eq!(prev.fg, Color::Rgb(Rgb::new(1, 17, 111)));
+    // History keeps only the text of its rows, never their trailing blanks.
+    feed(&mut t, "\x1b[0m\r\nshort\r\n\r\n\r\n\r\n");
+    let row = (t.grid().first_line()..t.grid().end_line())
+        .filter_map(|l| t.grid().abs_row(l))
+        .find(|r| r.text(0..64).trim_end() == "short")
+        .unwrap();
+    assert_eq!(row.len(), 5);
 }

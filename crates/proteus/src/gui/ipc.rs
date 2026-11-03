@@ -58,7 +58,7 @@ impl App {
                         continue;
                     };
                     for cell in &row.cells {
-                        bytes = bytes.saturating_add(cell.ch.len_utf8() + cell.extra.as_ref().map_or(0, |s| s.len()));
+                        bytes = bytes.saturating_add(cell.ch().len_utf8() + cell.extra().map_or(0, str::len));
                     }
                     bytes = bytes.saturating_add(1);
                     if bytes > 2 << 20 {

@@ -50,6 +50,8 @@ pub struct Pane {
     pub surface: Option<u32>,
     /// A plugin's pane from a layout (or to save in one): plugin id, args.
     pub plugin: Option<(String, String)>,
+    /// Size (cols, rows, cell) to apply once its hidden tab is shown.
+    deferred_size: Option<(u16, u16, (u32, u32))>,
 }
 
 impl Pane {
@@ -122,6 +124,7 @@ impl Pane {
             private: false,
             surface: None,
             plugin: None,
+            deferred_size: None,
         };
         pane.refresh_proc_title();
         Ok(pane)
@@ -146,6 +149,7 @@ impl Pane {
             private: false,
             surface: Some(surface),
             plugin: None,
+            deferred_size: None,
         }
     }
 
@@ -184,7 +188,28 @@ impl Pane {
 
     /// Fit the grid to `cols` × `rows`. The PTY hears about real changes
     /// only, and only with `notify` (off while a divider is dragged).
+    /// A pane's place changed while its tab is hidden: reflowing it waits
+    /// until it is shown (see [`Pane::apply_deferred_resize`]).
+    pub fn defer_resize(&mut self, cols: u16, rows: u16, cell: (u32, u32)) {
+        let same = cols as usize == self.term.cols() && rows as usize == self.term.lines();
+        self.deferred_size = (!same).then_some((cols, rows, cell));
+        if same {
+            self.term.set_cell_pixel_size(cell.0, cell.1);
+        }
+    }
+
+    pub fn has_deferred_resize(&self) -> bool {
+        self.deferred_size.is_some()
+    }
+
+    pub fn apply_deferred_resize(&mut self, notify: bool) {
+        if let Some((cols, rows, cell)) = self.deferred_size {
+            self.resize(cols, rows, cell, notify);
+        }
+    }
+
     pub fn resize(&mut self, cols: u16, rows: u16, cell: (u32, u32), notify: bool) {
+        self.deferred_size = None;
         self.term.set_cell_pixel_size(cell.0, cell.1);
         if cols as usize != self.term.cols() || rows as usize != self.term.lines() {
             self.term.resize(cols as usize, rows as usize);

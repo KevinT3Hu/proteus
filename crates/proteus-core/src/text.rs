@@ -89,7 +89,7 @@ pub fn extract(grid: &Grid, start: Point, end: Point, rect: bool) -> String {
 }
 
 /// A logical (unwrapped) line with a byte → grid point index.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct LogicalLine {
     pub text: String,
     /// `(byte offset, point)` for every character, in order.
@@ -122,8 +122,16 @@ pub fn logical_start(grid: &Grid, mut line: Line) -> Line {
 
 /// Build the logical line starting at `line`. Trailing blanks of the last row are dropped.
 pub fn logical_line(grid: &Grid, line: Line) -> LogicalLine {
-    let mut text = String::new();
-    let mut index = Vec::new();
+    let mut out = LogicalLine::default();
+    logical_line_into(grid, line, &mut out);
+    out
+}
+
+/// [`logical_line`] into `out`, reusing its buffers.
+pub fn logical_line_into(grid: &Grid, line: Line, out: &mut LogicalLine) {
+    out.text.clear();
+    out.index.clear();
+    out.start = line;
     let mut l = line;
     while let Some(row) = grid.abs_row(l) {
         let len = if row.wrapped { row.len() } else { row.content_len() };
@@ -131,15 +139,15 @@ pub fn logical_line(grid: &Grid, line: Line) -> LogicalLine {
             if cell.is_spacer() {
                 continue;
             }
-            index.push((text.len(), Point::new(l, col)));
-            cell.push_text(&mut text);
+            out.index.push((out.text.len(), Point::new(l, col)));
+            cell.push_text(&mut out.text);
         }
         l += 1;
         if !row.wrapped {
             break;
         }
     }
-    LogicalLine { text, index, start: line, end: l }
+    out.end = l;
 }
 
 pub(crate) fn percent_decode(s: &str) -> String {
