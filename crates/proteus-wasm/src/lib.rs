@@ -20,3 +20,26 @@ pub mod storage;
 pub use manifest::{FsGrant, Manifest, Permissions};
 pub use runtime::{Answer, Call, FromPlugin, Handle, Key, Pixels, Reply, Responder, Runtime, Sink, Spec, types};
 pub use source::{Cache, Resolved, Source};
+
+/// Characters that would let plugin-supplied text hide or reorder what the
+/// user reads: controls, bidi overrides and isolates, and invisible format
+/// characters (Unicode `Cf` that renders as nothing).
+pub fn is_deceptive(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{00ad}'
+                | '\u{061c}'
+                | '\u{115f}'
+                | '\u{1160}'
+                | '\u{180e}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{206f}'
+                | '\u{3164}'
+                | '\u{feff}'
+                | '\u{ffa0}'
+                | '\u{fff9}'..='\u{fffb}'
+                | '\u{e0000}'..='\u{e007f}'
+        )
+}

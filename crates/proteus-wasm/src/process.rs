@@ -1,4 +1,5 @@
-//! Programs a plugin runs (permission `run-command`): looked up in `PATH`,
+//! Programs a plugin runs (permission `run-command`): looked up in
+//! [`TRUSTED_PATH`],
 //! checked against the manifest's list, started without a shell in their
 //! own process group (so stopping kills what they started too).
 
@@ -26,6 +27,11 @@ fn executable(p: &Path) -> bool {
     std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
+/// Where bare program names are looked up, and the `PATH` children get.
+/// The user's own `PATH` usually holds directories a plugin may be able to
+/// write (`~/.local/bin`), which would let it substitute an allowed program.
+pub const TRUSTED_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+
 /// The program to start for `name`, if the manifest lists it.
 pub fn resolve(allowed: &[String], name: &str) -> Result<PathBuf, String> {
     if !allowed.iter().any(|a| a == name) {
@@ -34,12 +40,10 @@ pub fn resolve(allowed: &[String], name: &str) -> Result<PathBuf, String> {
     if name.starts_with('/') {
         return if executable(Path::new(name)) { Ok(name.into()) } else { Err(format!("{name}: not found")) };
     }
-    let path = std::env::var_os("PATH").unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".into());
-    std::env::split_paths(&path)
-        .filter(|d| d.is_absolute())
+    std::env::split_paths(TRUSTED_PATH)
         .map(|d| d.join(name))
         .find(|p| executable(p))
-        .ok_or_else(|| format!("{name}: not found in PATH"))
+        .ok_or_else(|| format!("{name}: not found in {TRUSTED_PATH}"))
 }
 
 fn build(program: &Path, cmd: &Command, cwd: &Path) -> Result<std::process::Command, String> {
@@ -50,6 +54,7 @@ fn build(program: &Path, cmd: &Command, cwd: &Path) -> Result<std::process::Comm
     c.arg0(&cmd.argv[0]).args(&cmd.argv[1..]).current_dir(cwd).process_group(0);
     c.env_clear();
     c.envs(std::env::vars_os().filter(|(k, _)| k.to_str().is_some_and(inherited)));
+    c.env("PATH", TRUSTED_PATH);
     c.envs(cmd.env.iter().map(|(k, v)| (k, v)));
     c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     Ok(c)
@@ -58,7 +63,7 @@ fn build(program: &Path, cmd: &Command, cwd: &Path) -> Result<std::process::Comm
 /// Variables a child gets from the terminal's environment; everything else
 /// (tokens, agent sockets, loader settings) stays with the terminal.
 fn inherited(name: &str) -> bool {
-    matches!(name, "PATH" | "HOME" | "USER" | "LOGNAME" | "LANG" | "LANGUAGE" | "TERM" | "TZ" | "TMPDIR")
+    matches!(name, "HOME" | "USER" | "LOGNAME" | "LANG" | "LANGUAGE" | "TERM" | "TZ" | "TMPDIR")
         || name.starts_with("LC_")
 }
 
@@ -395,12 +400,10 @@ mod tests {
                 .unwrap();
         let out = String::from_utf8(o.stdout).unwrap();
         assert!(out.lines().any(|l| l == "PROTEUS_MODE=x"));
+        assert!(out.lines().any(|l| l == format!("PATH={TRUSTED_PATH}")));
         for line in out.lines() {
             let name = line.split('=').next().unwrap();
-            assert!(
-                inherited(name) || name == "PROTEUS_MODE" || name == "PWD" || name == "SHLVL" || name == "_",
-                "{line}"
-            );
+            assert!(inherited(name) || ["PATH", "PROTEUS_MODE", "PWD", "SHLVL", "_"].contains(&name), "{line}");
         }
         for bad in ["LD_PRELOAD", "GIT_SSH_COMMAND", "PATH", "BASH_ENV", "HOME", "proteus_x", "PROTEUS_"] {
             let e = run(&sh, &env(vec![(bad.into(), "x".into())]), Path::new("/"), vec![], DEFAULT_TIMEOUT, &stop);

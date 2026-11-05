@@ -249,6 +249,11 @@ fn runtime(msg: impl Into<String>) -> mlua::Error {
 
 impl Script {
     /// A fresh state; `require` resolves inside `dir`.
+    ///
+    /// Lua is the user's own configuration, as trusted as their shell rc
+    /// files: it gets `io`, `os` and `package` and runs unsandboxed. Code
+    /// from anyone else belongs in a WASM plugin, which runs only with the
+    /// permissions the user approved.
     pub fn new(dir: Option<&Path>) -> Result<Script, String> {
         let lua = Lua::new_with(StdLib::ALL_SAFE, LuaOptions::default()).map_err(|e| e.to_string())?;
         let reg = Rc::new(RefCell::new(Registry::default()));

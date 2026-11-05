@@ -829,7 +829,8 @@ impl App {
             }
             Call::Notify { text, error } => {
                 let name = self.name_of(&key.id);
-                let text: String = text.chars().filter(|c| !c.is_control() || *c == '\n').take(1000).collect();
+                let text: String =
+                    text.chars().filter(|&c| !proteus_wasm::is_deceptive(c) || c == '\n').take(1000).collect();
                 self.toast(format!("{name}: {text}"), error, None);
                 Ok(Reply::Unit)
             }

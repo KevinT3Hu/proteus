@@ -23,7 +23,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Check the URL against the allowed hosts.
 pub fn check(allowed: &[String], url: &str) -> Result<http::Uri, String> {
     let uri: http::Uri = url.parse().map_err(|e| format!("{url}: {e}"))?;
-    let port = match uri.scheme_str() {
+    let default_port = match uri.scheme_str() {
         Some("https") => 443,
         Some("http") => 80,
         _ => return Err(format!("{url}: only http and https URLs")),
@@ -32,8 +32,8 @@ pub fn check(allowed: &[String], url: &str) -> Result<http::Uri, String> {
     if uri.authority().is_some_and(|a| a.as_str().contains('@')) {
         return Err(format!("{url}: user names in URLs are not allowed"));
     }
-    let port = uri.port_u16().unwrap_or(port);
-    if !host_allowed(allowed, host, port) {
+    let port = uri.port_u16().unwrap_or(default_port);
+    if !host_allowed(allowed, host, port, default_port) {
         return Err(format!("permission denied: network:{host}"));
     }
     Ok(uri)
@@ -44,6 +44,7 @@ fn agent(global: Option<Duration>, response: Option<Duration>) -> ureq::Agent {
     ureq::Agent::config_builder()
         .http_status_as_error(false)
         .max_redirects(0)
+        .proxy(None)
         .allow_non_standard_methods(true)
         .timeout_global(global)
         .timeout_recv_response(response)
@@ -57,10 +58,34 @@ fn agent(global: Option<Duration>, response: Option<Duration>) -> ureq::Agent {
         .new_agent()
 }
 
+/// Headers that would route the request elsewhere than the checked URL,
+/// authenticate to a proxy, or change the framing the client produces.
+const RESERVED_HEADERS: &[&str] = &[
+    "host",
+    "connection",
+    "keep-alive",
+    "transfer-encoding",
+    "content-length",
+    "te",
+    "trailer",
+    "upgrade",
+    "expect",
+    "forwarded",
+    "via",
+];
+
+fn header_allowed(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    !RESERVED_HEADERS.contains(&name.as_str()) && !name.starts_with("proxy-") && !name.starts_with(':')
+}
+
 fn send(agent: &ureq::Agent, uri: http::Uri, req: HttpRequest) -> Result<http::Response<ureq::Body>, String> {
     let method = http::Method::from_bytes(req.method.to_ascii_uppercase().as_bytes()).map_err(|e| e.to_string())?;
     let mut b = http::Request::builder().method(method).uri(uri);
     for (k, v) in &req.headers {
+        if !header_allowed(k) {
+            return Err(format!("header {k} is not allowed"));
+        }
         b = b.header(k, v);
     }
     let r = if req.body.is_empty() {
@@ -210,12 +235,31 @@ mod tests {
             "fd00::1",
             "fe80::1",
             "::ffff:127.0.0.1",
+            "::10.0.0.1",
+            "64:ff9b::7f00:1",
+            "2002:a00:1::1",
+            "fec0::1",
+            "ff02::1",
+            "198.18.0.1",
+            "192.0.0.8",
+            "224.0.0.1",
+            "240.0.0.1",
         ];
         for a in local {
             assert!(transport::local_address(a.parse::<IpAddr>().unwrap()), "{a}");
         }
-        for a in ["93.184.216.34", "1.1.1.1", "2606:4700::1111", "172.32.0.1"] {
+        for a in ["93.184.216.34", "1.1.1.1", "2606:4700::1111", "172.32.0.1", "64:ff9b::101:101", "2002:101:101::1"] {
             assert!(!transport::local_address(a.parse::<IpAddr>().unwrap()), "{a}");
+        }
+    }
+
+    #[test]
+    fn routing_and_framing_headers_are_reserved() {
+        for h in ["Host", "proxy-authorization", "Transfer-Encoding", "connection", "Content-Length", "Forwarded"] {
+            assert!(!header_allowed(h), "{h}");
+        }
+        for h in ["Authorization", "Accept", "content-type", "user-agent", "x-api-key"] {
+            assert!(header_allowed(h), "{h}");
         }
     }
 

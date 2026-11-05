@@ -933,17 +933,26 @@ impl proteus::plugin::host::Host for State {
                 return Err("open: not a valid URL".into());
             }
             // A browser fetches the URL: the same hosts as `network`.
-            if !lower.starts_with("mailto:") {
+            if lower.starts_with("mailto:") {
+                mailto_allowed(&path_or_url)?;
+            } else {
                 crate::net::check(&self.granted.network, &path_or_url)?;
             }
             (path_or_url, None)
         } else {
             use std::os::fd::AsRawFd;
+            use std::os::unix::fs::PermissionsExt;
             let pinned = self.access.pin(&path_or_url, false, true)?;
             // Files the plugin wrote itself are not handed to other programs.
             let data = self.access.data_dir.clone();
             if pinned.original.starts_with(&data) {
                 return Err("open: files in the plugin's data directory cannot be opened".into());
+            }
+            // Openers launch these instead of showing them.
+            let meta = pinned.file.metadata().map_err(|e| format!("open: {e}"))?;
+            let launcher = pinned.original.extension().is_some_and(|e| e.eq_ignore_ascii_case("desktop"));
+            if meta.is_file() && (meta.permissions().mode() & 0o111 != 0 || launcher) {
+                return Err("open: executable files and launchers cannot be opened".into());
             }
             (format!("/proc/{}/fd/{}", std::process::id(), pinned.file.as_raw_fd()), Some(pinned.file))
         };
@@ -1041,6 +1050,19 @@ fn allowed(e: &Event, p: &Permissions) -> bool {
 
 fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
+}
+
+/// `mailto:` with only addressing and text fields: some mail clients honour
+/// `attach=` and similar, which would mail local files the plugin cannot read.
+fn mailto_allowed(url: &str) -> Result<(), String> {
+    let query = url.split_once('?').map_or("", |(_, q)| q);
+    for field in query.split('&').filter(|f| !f.is_empty()) {
+        let name = field.split_once('=').map_or(field, |(n, _)| n).to_ascii_lowercase();
+        if !matches!(name.as_str(), "to" | "cc" | "bcc" | "subject" | "body" | "in-reply-to") {
+            return Err(format!("open: mailto field {name} is not allowed"));
+        }
+    }
+    Ok(())
 }
 
 /// A trap's message: the reason first, without the wasm backtrace.
@@ -1301,6 +1323,14 @@ mod tests {
         assert!(matches!(next_wake(&rx, &timers), Wake::Message(0)));
         timers.insert(2, (Instant::now(), Some(Duration::from_millis(10))));
         assert!(matches!(next_wake(&rx, &timers), Wake::Timers(ids) if ids == [2]));
+    }
+
+    #[test]
+    fn mailto_keeps_only_addressing_and_text() {
+        assert!(mailto_allowed("mailto:a@b.c").is_ok());
+        assert!(mailto_allowed("mailto:a@b.c?subject=hi&body=x&cc=d@e.f").is_ok());
+        assert!(mailto_allowed("mailto:a@b.c?attach=/home/u/.ssh/id_ed25519").is_err());
+        assert!(mailto_allowed("mailto:a@b.c?subject=x&ATTACHMENT=file").is_err());
     }
 
     #[test]

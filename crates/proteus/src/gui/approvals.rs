@@ -1,7 +1,10 @@
 //! Permissions a plugin requests in its manifest are only granted after the
 //! user approves them (unless the config grants permissions explicitly).
-//! Approvals are remembered per plugin ID, source and exact permission set,
-//! so a plugin asking for more is asked about again.
+//! An approval covers one plugin ID, source, artifact hash and exact
+//! permission set: changed code or a changed request is asked about again.
+//! Approved permissions are the only trust a plugin ever gets; source
+//! availability or an audit informs the user's decision but never widens
+//! what the sandbox enforces.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -19,6 +22,9 @@ struct Approval {
     source: String,
     rev: Option<String>,
     subdir: Option<PathBuf>,
+    /// Approvals saved before hashes were recorded have none and match nothing.
+    #[serde(default)]
+    hash: String,
     permissions: Permissions,
 }
 
@@ -29,6 +35,7 @@ impl Approval {
             source: e.source.source.clone(),
             rev: e.source.rev.clone(),
             subdir: e.source.subdir.clone(),
+            hash: e.hash.clone(),
             permissions: e.granted.clone(),
         }
     }
@@ -92,7 +99,9 @@ pub(super) fn describe(p: &Permissions) -> Vec<String> {
     out.extend(p.fs.iter().map(|g| format!("fs: {} ({})", g.path, if g.write { "rw" } else { "r" })));
     out.extend(p.run_command.iter().map(|c| format!("run-command: {c}")));
     out.extend(p.network.iter().map(|h| format!("network: {h}")));
-    out.into_iter().map(|l| l.chars().map(|c| if c.is_control() { '\u{fffd}' } else { c }).collect()).collect()
+    out.into_iter()
+        .map(|l| l.chars().map(|c| if proteus_wasm::is_deceptive(c) { '\u{fffd}' } else { c }).collect())
+        .collect()
 }
 
 #[cfg(test)]
@@ -104,14 +113,14 @@ mod tests {
         let p = Permissions {
             ui: true,
             write_pty: true,
-            fs: vec![proteus_wasm::FsGrant { path: "/home/a\x1b[2J".into(), write: true }],
+            fs: vec![proteus_wasm::FsGrant { path: "/home/a\x1b[2J\u{202e}".into(), write: true }],
             run_command: vec!["git".into()],
             network: vec!["*.example.com".into()],
             ..Default::default()
         };
         assert_eq!(
             describe(&p),
-            ["ui", "write-pty", "fs: /home/a\u{fffd}[2J (rw)", "run-command: git", "network: *.example.com"]
+            ["ui", "write-pty", "fs: /home/a\u{fffd}[2J\u{fffd} (rw)", "run-command: git", "network: *.example.com"]
         );
         assert!(describe(&Permissions::default()).is_empty());
     }
@@ -142,7 +151,9 @@ mod tests {
         a.approve(&e).unwrap();
         assert!(!a.needs_approval(&e) && a.denied.is_empty());
         e.hash = "updated".into();
-        assert!(!a.needs_approval(&e), "same request after an update");
+        assert!(a.needs_approval(&e), "changed code asks again");
+        a.approve(&e).unwrap();
+        assert_eq!(a.entries.len(), 1, "an approval replaces the previous one");
         e.granted.network = vec!["example.com".into()];
         assert!(a.needs_approval(&e), "more permissions ask again");
         e.source.permissions = Some(e.granted.clone());

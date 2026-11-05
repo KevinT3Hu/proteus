@@ -17,25 +17,43 @@ pub(super) struct StreamConnector {
     pub allow_private: bool,
 }
 
-/// Loopback, private, link-local, shared and unspecified addresses.
+/// Loopback, private, link-local, shared, reserved, multicast and
+/// unspecified addresses, including IPv4 addresses embedded in IPv6.
 pub(super) fn local_address(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            let [a, b, ..] = v4.octets();
+            let [a, b, c, _] = v4.octets();
             v4.is_loopback()
                 || v4.is_private()
                 || v4.is_link_local()
                 || v4.is_unspecified()
                 || v4.is_broadcast()
+                || v4.is_multicast()
                 || (a == 100 && (64..128).contains(&b))
+                || (a == 198 && (18..20).contains(&b))
+                || (a == 192 && b == 0 && c == 0)
                 || a == 0
+                || a >= 240
         }
         IpAddr::V6(v6) => {
+            let s = v6.segments();
+            let embedded = |hi: u16, lo: u16| IpAddr::V4(std::net::Ipv4Addr::from(((hi as u32) << 16) | lo as u32));
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return local_address(IpAddr::V4(v4));
             }
-            let first = v6.segments()[0];
-            v6.is_loopback() || v6.is_unspecified() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
+            if s[..6] == [0; 6] || (s[0] == 0x64 && s[1] == 0xff9b) {
+                return local_address(embedded(s[6], s[7]));
+            }
+            if s[0] == 0x2002 {
+                return local_address(embedded(s[1], s[2]));
+            }
+            let first = s[0];
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (first & 0xfe00) == 0xfc00
+                || (first & 0xffc0) == 0xfe80
+                || (first & 0xffc0) == 0xfec0
         }
     }
 }

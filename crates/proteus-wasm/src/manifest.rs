@@ -158,16 +158,16 @@ fn valid_host_pattern(h: &str) -> bool {
             .all(|l| !l.is_empty() && l.len() <= 63 && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
 }
 
-/// Does `host` (lowercase, `port` explicit or the scheme's default) match a
-/// `network` entry?
-pub fn host_allowed(patterns: &[String], host: &str, port: u16) -> bool {
+/// Does `host` (lowercase) on `port` match a `network` entry? An entry
+/// without a port allows only the scheme's `default_port`.
+pub fn host_allowed(patterns: &[String], host: &str, port: u16, default_port: u16) -> bool {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     patterns.iter().any(|p| {
         let (name, want_port) = match p.rsplit_once(':') {
             Some((n, pp)) => (n, pp.parse::<u16>().ok()),
             None => (p.as_str(), None),
         };
-        if want_port.is_some_and(|w| w != port) {
+        if want_port.unwrap_or(default_port) != port {
             return false;
         }
         match name.strip_prefix("*.") {
@@ -209,6 +209,40 @@ impl Permissions {
             }
         }
         Ok(())
+    }
+
+    /// Writable grants that reach the user's startup files or Proteus's own
+    /// config, state and plugin data: through them a plugin can edit
+    /// `.bashrc` or `init.lua`, or its own approval, and so run any code as
+    /// the user. WASI cannot carve exceptions out of a grant, so this is
+    /// stated in the approval question rather than silently half-enforced.
+    pub fn writes_startup_files(&self) -> bool {
+        let home = std::env::var_os("HOME").map(PathBuf::from).filter(|h| h.is_absolute());
+        let xdg = |var: &str, fallback: &str| {
+            std::env::var_os(var)
+                .map(PathBuf::from)
+                .filter(|p| p.is_absolute())
+                .or_else(|| home.as_ref().map(|h| h.join(fallback)))
+        };
+        let protected: Vec<PathBuf> = [
+            xdg("XDG_CONFIG_HOME", ".config"),
+            xdg("XDG_STATE_HOME", ".local/state"),
+            xdg("XDG_DATA_HOME", ".local/share"),
+            std::env::var_os("PROTEUS_DATA_DIR").map(PathBuf::from),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        self.fs.iter().filter(|g| g.write).filter_map(|g| g.host_path().ok()).any(|g| {
+            let dotfile = home.as_ref().is_some_and(|h| {
+                h.starts_with(&g)
+                    || g.strip_prefix(h)
+                        .ok()
+                        .and_then(|r| r.components().next())
+                        .is_some_and(|c| c.as_os_str().as_encoded_bytes().starts_with(b"."))
+            });
+            dotfile || protected.iter().any(|p| p.starts_with(&g) || g.starts_with(p))
+        })
     }
 
     /// One plain-language line per permission, for the approval question.
@@ -462,13 +496,15 @@ mod tests {
         assert_eq!(p.run_command, ["git", "/usr/bin/rg"]);
         assert!(p.clipboard_read && !p.clipboard_write && p.secrets);
         assert_eq!(p.describe().len(), 8);
-        assert!(host_allowed(&p.network, "api.example.com", 443));
-        assert!(host_allowed(&p.network, "a.b.x.org", 80));
-        assert!(!host_allowed(&p.network, "x.org", 80));
-        assert!(!host_allowed(&p.network, "evilx.org", 80));
-        assert!(host_allowed(&p.network, "localhost", 11434));
-        assert!(!host_allowed(&p.network, "localhost", 80));
-        assert!(!host_allowed(&p.network, "example.com", 443));
+        assert!(host_allowed(&p.network, "api.example.com", 443, 443));
+        assert!(!host_allowed(&p.network, "api.example.com", 6379, 443), "only the default port");
+        assert!(!host_allowed(&p.network, "api.example.com", 443, 80), "not https on the http port");
+        assert!(host_allowed(&p.network, "a.b.x.org", 80, 80));
+        assert!(!host_allowed(&p.network, "x.org", 80, 80));
+        assert!(!host_allowed(&p.network, "evilx.org", 80, 80));
+        assert!(host_allowed(&p.network, "localhost", 11434, 80));
+        assert!(!host_allowed(&p.network, "localhost", 80, 80));
+        assert!(!host_allowed(&p.network, "example.com", 443, 443));
     }
 
     #[test]
@@ -480,6 +516,20 @@ mod tests {
         assert!(p(&["/srv:rw", "/srv/secret:r"]).validate_fs_nesting().is_err());
         assert!(p(&["/srv:r", "/srv/notes:rw"]).validate_fs_nesting().is_ok());
         assert!(p(&["/srv:rw", "/srvx:r"]).validate_fs_nesting().is_ok());
+    }
+
+    #[test]
+    fn writable_startup_files_are_recognised() {
+        let p = |g: &[&str]| Permissions {
+            fs: g.iter().map(|g| FsGrant::parse(g).unwrap()).collect(),
+            ..Default::default()
+        };
+        for g in ["~:rw", "~/.config:rw", "~/.config/proteus:rw", "~/.local/share:rw", "~/.ssh:rw", "/:rw"] {
+            assert!(p(&[g]).writes_startup_files(), "{g}");
+        }
+        for g in ["~:r", "~/notes:rw", "/srv:rw", "/:r"] {
+            assert!(!p(&[g]).writes_startup_files(), "{g}");
+        }
     }
 
     #[test]

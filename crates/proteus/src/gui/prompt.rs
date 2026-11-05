@@ -173,11 +173,26 @@ impl Prompt {
                 Overlay { title: q.clone(), detail: None, keys: catalog.t("prompt-confirm-keys", &[]) }
             }
             Prompt::PluginPermissions(e) => {
-                let name: String = e.name.chars().filter(|c| !c.is_control()).take(80).collect();
-                let source: String = e.source.source.chars().filter(|c| !c.is_control()).take(200).collect();
+                let name: String = e.name.chars().filter(|&c| !proteus_wasm::is_deceptive(c)).take(80).collect();
+                let mut source: String =
+                    e.source.source.chars().filter(|&c| !proteus_wasm::is_deceptive(c)).take(200).collect();
+                if let Some(rev) = &e.source.rev {
+                    source
+                        .extend(" @ ".chars().chain(rev.chars().filter(|&c| !proteus_wasm::is_deceptive(c)).take(64)));
+                }
+                source.push_str(&format!(" (sha256 {})", e.hash.get(..16).unwrap_or(&e.hash)));
+                let mut detail = approvals::describe(&e.granted).join(", ");
+                if !e.granted.run_command.is_empty() {
+                    detail.push_str(". ");
+                    detail.push_str(&catalog.t("prompt-plugin-run-command-warning", &[]));
+                }
+                if e.granted.writes_startup_files() {
+                    detail.push_str(". ");
+                    detail.push_str(&catalog.t("prompt-plugin-startup-files-warning", &[]));
+                }
                 Overlay {
                     title: catalog.t("prompt-plugin-permissions", &[("plugin", &name), ("source", &source)]),
-                    detail: Some(approvals::describe(&e.granted).join(", ")),
+                    detail: Some(detail),
                     keys: catalog.t("prompt-plugin-permissions-keys", &[]),
                 }
             }
