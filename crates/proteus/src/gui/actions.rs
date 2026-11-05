@@ -267,8 +267,11 @@ impl App {
         if after <= 0.0 {
             return run(self);
         }
+        let Ok(after) = Duration::try_from_secs_f64(after) else {
+            return eprintln!("proteus: PROTEUS_ACTIONS: invalid delay {after}");
+        };
         let mut run = Some(run);
-        let _ = self.handle.insert_source(Timer::from_duration(Duration::from_secs_f64(after)), move |_, _, app| {
+        let _ = self.handle.insert_source(Timer::from_duration(after), move |_, _, app| {
             if let Some(f) = run.take() {
                 f(app);
             }

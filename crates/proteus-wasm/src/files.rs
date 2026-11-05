@@ -51,9 +51,11 @@ impl Access {
     pub fn new(data_dir: PathBuf, fs: &[FsGrant]) -> Result<Self, String> {
         use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, openat2};
         let mut roots = Vec::new();
-        for (path, write) in
-            std::iter::once((data_dir.clone(), true)).chain(fs.iter().map(|g| (g.host_path(), g.write)))
-        {
+        let mut grants = vec![(data_dir.clone(), true)];
+        for g in fs {
+            grants.push((g.host_path()?, g.write));
+        }
+        for (path, write) in grants {
             if !path.exists() {
                 continue;
             }
@@ -85,7 +87,13 @@ impl Access {
             return if host.starts_with(&data) { Ok(host) } else { Err(denied()) };
         }
         let host = real(&p, follow).ok_or_else(|| format!("{path}: not found"))?;
-        let ok = self.roots.iter().any(|(root, _, writable)| host.starts_with(root) && (*writable || !write));
+        // The innermost grant decides, so `~:r` plus `~/notes:rw` allows writing notes only.
+        let ok = self
+            .roots
+            .iter()
+            .filter(|(root, _, _)| host.starts_with(root))
+            .max_by_key(|(root, _, _)| root.components().count())
+            .is_some_and(|(_, _, writable)| *writable || !write);
         if ok { Ok(host) } else { Err(denied()) }
     }
 }
@@ -118,8 +126,9 @@ impl Access {
         let (root, base, _) = self
             .roots
             .iter()
+            .filter(|(r, _, _)| host.starts_with(r))
+            .max_by_key(|(r, _, _)| r.components().count())
             .filter(|(_, _, writable)| !write || *writable)
-            .find(|(r, _, _)| host.starts_with(r))
             .ok_or("filesystem grant disappeared")?;
         let relative = host.strip_prefix(root).map_err(|e| e.to_string())?;
         let target = if follow { relative } else { relative.parent().unwrap_or(Path::new("")) };

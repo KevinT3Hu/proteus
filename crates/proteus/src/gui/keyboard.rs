@@ -41,6 +41,10 @@ impl App {
             if !self.w.prompts.is_empty() {
                 self.consume(event.raw_code);
                 if action == KeyAction::Press {
+                    let key = match (key, shifted) {
+                        (input::Key::Char(_), Some(c)) if mods.contains(input::Mods::SHIFT) => input::Key::Char(c),
+                        _ => key,
+                    };
                     self.answer_prompt(key);
                 }
                 return;

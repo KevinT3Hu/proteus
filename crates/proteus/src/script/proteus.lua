@@ -167,7 +167,7 @@ function Timer:stop() end
 ---@field clipboard { osc52_read: ("ask"|"allow"|"deny")?, osc52_write: boolean?, paste_protection: boolean? }?
 ---@field shell { command: (string|string[])?, integration: boolean?, term: string? }?
 ---@field scrollback integer?
----@field ui { hint_bar: ("in-mode"|"always"|"never")?, tab_bar: ("auto"|"always"|"never")?, pane_titles: ("auto"|"always"|"never")?, gutter: number?, padding: (number|{horizontal: number?, vertical: number?})?, pane_gap: (number|false)?, border_width: number? }?
+---@field ui { hint_bar: ("in-mode"|"always"|"never")?, tab_bar: ("auto"|"always"|"never")?, pane_titles: ("auto"|"always"|"never")?, gutter: number?, sticky_command: boolean?, padding: (number|{horizontal: number?, vertical: number?})?, pane_gap: (number|false)?, border_width: number? }?
 ---@field panes { confirm_close: boolean?, confirm_close_ignore: string[]?, keep_last_shell: boolean? }?
 ---@field session { restore: ("ask"|"always"|"never")?, restore_commands: string[]? }?
 ---@field notify { min_duration: (number|false)?, osc: boolean? }?

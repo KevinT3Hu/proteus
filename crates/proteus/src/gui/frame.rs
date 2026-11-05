@@ -67,7 +67,7 @@ impl App {
             skip,
             floating,
             backdrop: self.gutter_marks(id, r, &rows, skip, theme),
-            labels: Vec::new(),
+            labels: self.sticky_labels(id, r, &rows, skip, theme),
             rows,
             flash: pane.and_then(|p| p.flash_until).is_some_and(|t| Instant::now() < t),
         }

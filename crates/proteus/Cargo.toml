@@ -12,9 +12,9 @@ name = "proteus"
 path = "src/main.rs"
 
 [dependencies]
-harfrust = "=0.15.0"
-accesskit = "=0.25.1"
-accesskit_unix = "=0.24.0"
+harfrust = "0.15.0"
+accesskit = "0.25.1"
+accesskit_unix = "0.24.0"
 proteus-i18n = { path = "../proteus-i18n" }
 proteus-core.workspace = true
 proteus-pty.workspace = true
@@ -46,7 +46,7 @@ miniz_oxide.workspace = true
 foldhash.workspace = true
 
 [dev-dependencies]
-naga = { version = "=30.0.1", features = ["wgsl-in"] }
+naga = { version = "30.0.1", features = ["wgsl-in"] }
 
 [lints]
 workspace = true

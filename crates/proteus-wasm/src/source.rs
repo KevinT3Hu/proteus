@@ -63,6 +63,38 @@ impl Cache {
     pub fn storage_path(&self, id: &str) -> PathBuf {
         self.data.join("plugin-data").join(format!("{id}.storage.toml"))
     }
+
+    /// Bind plugin ID `id`'s data, storage and secrets to `source`. Plugins
+    /// name their own IDs, so a different source declaring a used ID must
+    /// not inherit them.
+    pub fn claim(&self, id: &str, source: &Source) -> Result<(), String> {
+        use std::io::Write;
+        let owner = format!(
+            "{}\n{}\n",
+            source.source,
+            source.subdir.as_deref().map(|p| p.display().to_string()).unwrap_or_default()
+        );
+        let dir = self.data.join("plugin-owners");
+        let path = dir.join(id);
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut f) => f.write_all(owner.as_bytes()).map_err(|e| format!("{}: {e}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let existing = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+                if existing == owner {
+                    return Ok(());
+                }
+                let previous = existing.lines().next().unwrap_or_default();
+                Err(format!(
+                    "the data and secrets of plugin ID `{id}` belong to `{previous}`, not `{}`; \
+                     delete {} to hand them to this source",
+                    source.source,
+                    path.display()
+                ))
+            }
+            Err(e) => Err(format!("{}: {e}", path.display())),
+        }
+    }
     pub fn compiled_dir(&self) -> PathBuf {
         self.root.join("compiled")
     }
@@ -180,6 +212,7 @@ impl Cache {
         for grant in &granted.fs {
             grant.validate_directory()?;
         }
+        granted.validate_fs_nesting()?;
         let artifact = if direct {
             path
         } else if dir.join("Cargo.toml").is_file() {
@@ -325,6 +358,20 @@ mod tests {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
+    #[test]
+    fn an_id_stays_with_the_source_that_first_used_it() {
+        let t = Temp::new();
+        let cache = t.cache();
+        let a = Source { source: "/plugins/a".into(), ..Default::default() };
+        let b = Source { source: "/plugins/b".into(), ..Default::default() };
+        cache.claim("t.demo", &a).unwrap();
+        cache.claim("t.demo", &a).unwrap();
+        assert!(cache.claim("t.demo", &b).unwrap_err().contains("belong to `/plugins/a`"));
+        let sub = Source { subdir: Some("x".into()), ..a.clone() };
+        assert!(cache.claim("t.demo", &sub).is_err());
+        cache.claim("t.other", &b).unwrap();
+    }
+
     #[test]
     fn pinned_artifacts_reject_changes_and_malformed_checksums() {
         let t = Temp::new();

@@ -36,6 +36,10 @@ const MAX_KBD_STACK: usize = 16;
 const MAX_OSC52: usize = 8 << 20;
 const MAX_DCS: usize = 4096;
 const MAX_URI: usize = 2048;
+/// Longest OSC 8 `id=`.
+const MAX_LINK_ID: usize = 250;
+/// Longest notification title or body, command line and OSC 7 URL.
+const MAX_TEXT: usize = 4096;
 const MAX_GRAPHEME_EXTRA: usize = 32;
 /// Most parameters a control sequence carries (the parser's limit).
 const PARAMS: usize = 32;
@@ -170,6 +174,11 @@ pub struct Terminal {
     apc: graphics::Apc,
     apc_buf: Vec<u8>,
     apc_overflow: bool,
+    osc_len: usize,
+    /// The first bytes of the OSC string being read (its number).
+    osc_head: Vec<u8>,
+    osc_drop: bool,
+    local: bool,
     iterm_multipart: Option<(String, Vec<u8>)>,
     decodes: graphics::Decodes,
 }
@@ -257,6 +266,10 @@ impl Terminal {
             apc: graphics::Apc::Ground,
             apc_buf: Vec::new(),
             apc_overflow: false,
+            osc_len: 0,
+            osc_head: Vec::with_capacity(5),
+            osc_drop: false,
+            local: true,
             iterm_multipart: None,
             decodes: Default::default(),
         }
@@ -1694,6 +1707,17 @@ fn join_params(params: &[&[u8]], from: usize) -> String {
     lossy(&parts.join(&b';'))
 }
 
+fn truncated(mut s: String, max: usize) -> String {
+    if s.len() > max {
+        let mut end = max;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
+    s
+}
+
 // --- OSC handlers ---------------------------------------------------------
 
 impl Terminal {
@@ -1725,7 +1749,10 @@ impl Terminal {
                 self.damage_all();
             }
             b"7" => {
-                if let Some(cwd) = text::parse_cwd_url(&join_params(params, 1)) {
+                let url = join_params(params, 1);
+                if url.len() <= MAX_TEXT
+                    && let Some(cwd) = text::parse_cwd_url(&url)
+                {
                     if self.cwd.as_ref() != Some(&cwd) {
                         self.events.push(Event::CwdChanged(cwd.clone()));
                     }
@@ -1797,7 +1824,8 @@ impl Terminal {
         } else {
             let id = params
                 .get(1)
-                .and_then(|p| lossy(p).split(':').find_map(|kv| kv.strip_prefix("id=").map(str::to_string)));
+                .and_then(|p| lossy(p).split(':').find_map(|kv| kv.strip_prefix("id=").map(str::to_string)))
+                .filter(|id| id.len() <= MAX_LINK_ID);
             Some(self.links.intern(Hyperlink { id, uri }))
         };
         self.sync_style();
@@ -1833,7 +1861,8 @@ impl Terminal {
             return;
         }
         self.notify_times.push_back(now);
-        self.events.push(Event::Notification { title, body });
+        let title = title.map(|t| truncated(t, MAX_TEXT));
+        self.events.push(Event::Notification { title, body: truncated(body, MAX_TEXT) });
     }
 
     /// OSC 133 (FinalTerm) and OSC 633 (VS Code) shell-integration marks.
@@ -1849,7 +1878,7 @@ impl Terminal {
             b'B' => self.mark_input(),
             b'C' => {
                 let cmd = kv("cmdline_url=").map(|s| text::percent_decode(&s)).or_else(|| kv("cmdline="));
-                self.mark_output(cmd);
+                self.mark_output(cmd.map(|c| truncated(c, MAX_TEXT)));
             }
             b'D' => {
                 let code = params.get(2).and_then(|p| lossy(p).trim().parse::<i32>().ok());
@@ -1859,7 +1888,7 @@ impl Terminal {
                 let cmd = join_params(params, 2);
                 // Only the first `;` separates the nonce; VS Code escapes the rest.
                 let cmd = cmd.split(';').next().unwrap_or_default();
-                self.pending_command = Some(cmd.replace("\\x3b", ";").replace("\\\\", "\\"));
+                self.pending_command = Some(truncated(cmd.replace("\\x3b", ";").replace("\\\\", "\\"), MAX_TEXT));
             }
             _ => {}
         }
@@ -2041,6 +2070,10 @@ impl Terminal {
             DcsKind::Sixel => {}
             DcsKind::XtGetTcap => {
                 for hex in data.split(';') {
+                    if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                        self.reply("\x1bP0+r\x1b\\");
+                        continue;
+                    }
                     let cap = hex_decode(hex).and_then(|n| termcap(&n));
                     match cap {
                         Some(Some(v)) => self.reply(&format!("\x1bP1+r{hex}={}\x1b\\", hex_encode(v))),
@@ -2225,6 +2258,9 @@ impl Perform for Terminal {
     }
 
     fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
+        if std::mem::take(&mut self.osc_drop) {
+            return;
+        }
         let term = if bell_terminated { Terminator::Bel } else { Terminator::St };
         self.osc(params, term);
     }

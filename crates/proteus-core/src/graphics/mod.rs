@@ -12,7 +12,7 @@ pub(crate) mod media;
 pub mod placeholder;
 pub(crate) mod sixel;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
@@ -29,6 +29,10 @@ pub const MIB: usize = 1 << 20;
 pub const FALLBACK_CELL_PX: (u32, u32) = (8, 16);
 /// Maximum chain length of relative placements.
 pub const MAX_RELATIVE_DEPTH: usize = 8;
+/// Most images one screen holds; the least recently displayed go first.
+pub const MAX_IMAGES: usize = 4096;
+/// Most placements one screen holds; the oldest go first.
+pub const MAX_PLACEMENTS: usize = 4096;
 
 /// Graphics policy and resource limits.
 #[derive(Debug, Clone)]
@@ -545,18 +549,23 @@ impl ImageStore {
                 self.bytes += need;
                 return Ok(());
             }
+            let placed = self.placed_keys();
             let victim = self
                 .images
                 .values()
                 .filter(|i| !i.evicted && Some(i.key) != protect && i.bytes() > 0)
-                .min_by_key(|i| (self.has_placements(i.key), i.last_used.load(Ordering::Relaxed)))
-                .map(|i| (i.key, self.has_placements(i.key)));
+                .min_by_key(|i| (placed.contains(&i.key), i.last_used.load(Ordering::Relaxed)))
+                .map(|i| (i.key, placed.contains(&i.key)));
             match victim {
                 Some((key, false)) => self.remove_image(key),
                 Some((key, true)) => self.evict(key),
                 None => return Err(kitty::err("ENOSPC", "Image storage quota exceeded")),
             }
         }
+    }
+
+    fn placed_keys(&self) -> HashSet<u64> {
+        self.placements.iter().map(|p| p.image).collect()
     }
 
     pub(crate) fn release(&mut self, n: usize) {
@@ -575,6 +584,17 @@ impl ImageStore {
         {
             self.remove_image(old);
             self.by_id.insert(image.id, key);
+        }
+        if !self.images.contains_key(&key) && self.images.len() >= MAX_IMAGES {
+            let placed = self.placed_keys();
+            let victim = self
+                .images
+                .values()
+                .min_by_key(|i| (placed.contains(&i.key), i.last_used.load(Ordering::Relaxed)))
+                .map(|i| i.key);
+            if let Some(victim) = victim {
+                self.remove_image(victim);
+            }
         }
         self.images.insert(key, image);
         key
@@ -609,6 +629,11 @@ impl ImageStore {
             *old = p;
             return;
         }
+        if self.placements.len() >= MAX_PLACEMENTS
+            && let Some(oldest) = self.placements.iter().map(|q| q.seq).min()
+        {
+            self.remove_placements(|q| q.seq == oldest);
+        }
         self.placements.push(p);
     }
 
@@ -630,15 +655,17 @@ impl ImageStore {
         });
         // Cascade to orphaned relative placements.
         loop {
-            let alive = |k: u64, id: u32, ps: &[Placement]| ps.iter().any(|q| q.image == k && q.id == id);
-            let orphans: Vec<usize> = (0..self.placements.len())
-                .filter(|&i| self.placements[i].parent.is_some_and(|(k, id)| !alive(k, id, &self.placements)))
-                .collect();
-            if orphans.is_empty() {
+            let alive: HashSet<(u64, u32)> = self.placements.iter().map(|q| (q.image, q.id)).collect();
+            let before = self.placements.len();
+            self.placements.retain(|p| {
+                let orphan = p.parent.is_some_and(|parent| !alive.contains(&parent));
+                if orphan {
+                    affected.push(p.image);
+                }
+                !orphan
+            });
+            if self.placements.len() == before {
                 break;
-            }
-            for &i in orphans.iter().rev() {
-                affected.push(self.placements.remove(i).image);
             }
         }
         affected.sort_unstable();

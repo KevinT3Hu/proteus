@@ -9,7 +9,7 @@
 //!   clipboard = { osc52_read = "ask", paste_protection = true },
 //!   shell = { command = { "fish", "-l" }, integration = true },
 //!   scrollback = 20000,
-//!   ui = { hint_bar = "in-mode", tab_bar = "auto", pane_titles = "never", gutter = 0.5 },
+//!   ui = { hint_bar = "in-mode", tab_bar = "auto", pane_titles = "never", gutter = 0.5, sticky_command = true },
 //!   panes = { confirm_close = true, confirm_close_ignore = { "less", "man" } },
 //!   session = { restore = "ask", restore_commands = { "nvim", "htop" } },
 //!   notify = { min_duration = 10, osc = true },  -- min_duration = false: never
@@ -133,6 +133,8 @@ pub struct Config {
     pub restore_commands: Vec<String>,
     /// Width of the command-block gutter left of each pane, in cells (0: none).
     pub gutter: f32,
+    /// Pin the command of the block whose output is at the top of a pane.
+    pub sticky_command: bool,
     /// Desktop notification when a command that ran at least this long
     /// finishes in a pane without focus (`None`: never).
     pub notify_after: Option<std::time::Duration>,
@@ -268,6 +270,7 @@ impl Default for Config {
             restore: Restore::Ask,
             restore_commands: ["nvim", "vim", "hx", "less", "htop", "btop", "top", "man"].map(String::from).to_vec(),
             gutter: 0.5,
+            sticky_command: true,
             notify_after: Some(std::time::Duration::from_secs(10)),
             notify_osc: true,
             visual_bell: true,
@@ -717,6 +720,7 @@ fn apply(c: &mut Config, t: &Table, reg: &Registrar) -> Result<(), String> {
                     "pane_gap" => c.pane_gap = optional_number(v, "ui.pane_gap", 0.0, 256.0)?,
                     "border_width" => c.border_width = bounded(v, "ui.border_width", 0.0, 32.0)?,
                     "gutter" => c.gutter = number(v, "ui.gutter")?.clamp(0.0, 2.0) as f32,
+                    "sticky_command" => c.sticky_command = boolean(v, "ui.sticky_command")?,
                     _ => return Err(unknown("ui", k)),
                 }
                 Ok(())
@@ -778,7 +782,13 @@ fn apply(c: &mut Config, t: &Table, reg: &Registrar) -> Result<(), String> {
                     "min_duration" => {
                         c.notify_after = match v {
                             Value::Boolean(false) => None,
-                            _ => Some(std::time::Duration::from_secs_f64(number(v, "notify.min_duration")?.max(0.0))),
+                            _ => {
+                                let secs = number(v, "notify.min_duration")?.max(0.0);
+                                Some(
+                                    std::time::Duration::try_from_secs_f64(secs)
+                                        .map_err(|_| "notify.min_duration: expected a number of seconds".to_string())?,
+                                )
+                            }
                         }
                     }
                     "osc" => c.notify_osc = boolean(v, "notify.osc")?,
@@ -1461,13 +1471,14 @@ files = { $count ->
     #[test]
     fn shell_integration_config() {
         let c = ev(r#"require("proteus").config {
-            ui = { gutter = 1 },
+            ui = { gutter = 1, sticky_command = false },
             notify = { min_duration = 3.5, osc = false },
             bell = { visual = false },
             hints = { alphabet = "jkl", patterns = { { name = "jira", regex = "[A-Z]+-\\d+", url = "https://j/{}" }, { regex = "x+" } } },
         }"#)
         .unwrap();
         assert_eq!(c.gutter, 1.0);
+        assert!(!c.sticky_command && Config::default().sticky_command);
         assert_eq!(c.notify_after, Some(std::time::Duration::from_millis(3500)));
         assert!(!c.notify_osc && !c.visual_bell);
         assert_eq!(c.hint_alphabet, "jkl");
@@ -1478,6 +1489,10 @@ files = { $count ->
             ev(r#"require("proteus").config { notify = { min_duration = false } }"#).unwrap().notify_after,
             None
         );
+        for huge in ["math.huge", "1e300"] {
+            let e = ev(&format!(r#"require("proteus").config {{ notify = {{ min_duration = {huge} }} }}"#));
+            assert!(e.is_err(), "{huge}");
+        }
         for (src, want) in [
             (r#"hints = { alphabet = "a" }"#, "hints.alphabet"),
             (r#"hints = { patterns = { { regex = "(" } } }"#, "hints.patterns[1].regex"),

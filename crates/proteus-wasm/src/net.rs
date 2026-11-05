@@ -84,12 +84,27 @@ fn timeout(ms: u32) -> Duration {
 
 /// The whole response (blocking).
 pub fn fetch(uri: http::Uri, req: HttpRequest) -> Result<HttpResponse, String> {
-    let agent = agent(Some(timeout(req.timeout_ms)), None);
+    let agent = guarded(agent(Some(timeout(req.timeout_ms)), None), &uri, Arc::default(), timeout(req.timeout_ms));
     let mut r = send(&agent, uri, req)?;
     let status = r.status().as_u16();
     let headers = headers(&r);
     let body = r.body_mut().with_config().limit(MAX_BODY).read_to_vec().map_err(|e| e.to_string())?;
     Ok(HttpResponse { status, headers, body })
+}
+
+/// `base` with the cancellable transport that also refuses loopback and
+/// private addresses unless the URL names `localhost` or an IP address:
+/// otherwise an allowed name could resolve to the user's local services.
+fn guarded(base: ureq::Agent, uri: &http::Uri, cancel: Arc<AtomicBool>, idle: Duration) -> ureq::Agent {
+    use ureq::unversioned::resolver::DefaultResolver;
+    use ureq::unversioned::transport::{ConnectProxyConnector, Connector, RustlsConnector};
+    let host = uri.host().unwrap_or_default().trim_start_matches('[').trim_end_matches(']');
+    let allow_private = host.eq_ignore_ascii_case("localhost") || host.parse::<std::net::IpAddr>().is_ok();
+    let config = base.config().clone();
+    let connector =
+        ().chain(ConnectProxyConnector::default()).chain(transport::StreamConnector { cancel, idle, allow_private });
+    let connector = connector.chain(RustlsConnector::default());
+    ureq::Agent::with_parts(config, connector, DefaultResolver::default())
 }
 
 /// Streaming requests of one plugin. Dropping it cancels them.
@@ -113,16 +128,8 @@ impl Streams {
             .name("plugin-http".into())
             .spawn(move || {
                 let result = (|| {
-                    use ureq::unversioned::resolver::DefaultResolver;
-                    use ureq::unversioned::transport::{ConnectProxyConnector, Connector, RustlsConnector};
                     let idle = timeout(req.timeout_ms);
-                    let base = agent(None, Some(idle));
-                    let config = base.config().clone();
-                    let connector =
-                        ().chain(ConnectProxyConnector::default())
-                            .chain(transport::StreamConnector { cancel: cancel.clone(), idle })
-                            .chain(RustlsConnector::default());
-                    let agent = ureq::Agent::with_parts(config, connector, DefaultResolver::default());
+                    let agent = guarded(agent(None, Some(idle)), &uri, cancel.clone(), idle);
                     let r = send(&agent, uri, req)?;
                     let head = HttpHead { id, status: r.status().as_u16(), headers: headers(&r) };
                     if !post.event(Event::HttpResponse(head)) {
@@ -185,6 +192,31 @@ mod tests {
         assert!(check(&allowed, "https://user@api.example.com/").is_err());
         assert!(check(&allowed, "ftp://api.example.com/").is_err());
         assert!(check(&allowed, "file:///etc/passwd").is_err());
+    }
+
+    #[test]
+    fn names_may_not_lead_to_local_addresses() {
+        use std::net::IpAddr;
+        let local = [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "::1",
+            "::",
+            "fd00::1",
+            "fe80::1",
+            "::ffff:127.0.0.1",
+        ];
+        for a in local {
+            assert!(transport::local_address(a.parse::<IpAddr>().unwrap()), "{a}");
+        }
+        for a in ["93.184.216.34", "1.1.1.1", "2606:4700::1111", "172.32.0.1"] {
+            assert!(!transport::local_address(a.parse::<IpAddr>().unwrap()), "{a}");
+        }
     }
 
     #[test]

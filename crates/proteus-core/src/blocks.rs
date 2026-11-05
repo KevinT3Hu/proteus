@@ -25,6 +25,9 @@ impl Point {
 
 pub type BlockId = u64;
 
+/// Most blocks kept per screen; the oldest are forgotten first.
+pub const MAX_BLOCKS: usize = 10_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockState {
     /// Prompt is being drawn (after `A`).
@@ -143,6 +146,9 @@ impl Blocks {
         let id = self.next_id;
         self.next_id += 1;
         self.list.push_back(Block::new(id, line));
+        if self.list.len() > MAX_BLOCKS {
+            self.list.pop_front();
+        }
         self.list.back_mut().expect("just pushed")
     }
 
@@ -166,7 +172,9 @@ impl Blocks {
     /// clamp the ones that are partially gone.
     pub(crate) fn prune(&mut self, first_line: Line) {
         while let Some(b) = self.list.front() {
-            let end = b.end.map_or(Line::MAX, |p| p.line + 1);
+            // A block finished without `D` lasts until the next prompt.
+            let next = self.list.get(1).map_or(Line::MAX, |n| n.prompt_line);
+            let end = b.end.map_or(next, |p| p.line + 1);
             if end <= first_line && b.state == BlockState::Finished {
                 self.list.pop_front();
             } else {

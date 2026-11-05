@@ -45,7 +45,9 @@ impl Guest for Fixture {
                     loop {}
                 }
                 "host-flood" => {
-                    for _ in 0..100_000 { host::log("queued payload"); }
+                    for _ in 0..100_000 {
+                        host::log("queued payload");
+                    }
                 }
                 "storage-set" => report("storage-set", host::storage_set("key", "persisted")),
                 "storage-read" => host::notify(&format!("storage: {:?}", host::storage_get("key")), false),
@@ -68,6 +70,7 @@ impl Guest for Fixture {
                     report("etc", std::fs::read_to_string("/etc/hostname").map(|_| ()).map_err(|e| e.kind()));
                 }
                 "work" => std::thread::sleep(std::time::Duration::from_millis(5)),
+                "sleep" => std::thread::sleep(std::time::Duration::from_secs(3600)),
                 "sentinel" => host::notify("sentinel", false),
                 "modes" => {
                     host::create_private("/data/private", false).unwrap();

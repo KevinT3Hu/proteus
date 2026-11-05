@@ -39,6 +39,9 @@ fn resolve(medium: Medium, name: &str) -> Result<(PathBuf, bool), ReadFailed> {
                 return Err(ReadFailed);
             }
             let path = Path::new("/dev/shm").join(rest);
+            if !rest.contains(TEMP_MARKER) {
+                return Err(ReadFailed);
+            }
             // Never follow symlinks out of the shm directory.
             let meta = fs::symlink_metadata(&path).map_err(|_| ReadFailed)?;
             if !meta.file_type().is_file() {
@@ -63,7 +66,7 @@ fn resolve(medium: Medium, name: &str) -> Result<(PathBuf, bool), ReadFailed> {
             }
             if temp {
                 let in_temp = temp_dirs().iter().any(|d| canon.starts_with(d));
-                let marked = name.contains(TEMP_MARKER) || canon.to_string_lossy().contains(TEMP_MARKER);
+                let marked = canon.file_name().is_some_and(|n| n.to_string_lossy().contains(TEMP_MARKER));
                 if !in_temp || !marked {
                     return Err(ReadFailed);
                 }
@@ -170,5 +173,28 @@ mod tests {
         fs::write(&temp, b"abc").unwrap();
         assert_eq!(read(Medium::TempFile, temp.to_str().unwrap().as_bytes(), 0, 0, 100).unwrap(), b"abc");
         assert!(!temp.exists());
+    }
+
+    #[test]
+    fn only_marked_names_are_deleted() {
+        let dir = std::env::temp_dir().join(format!("tty-graphics-protocol-dir-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let victim = std::env::temp_dir().join(format!("proteus-victim-{}", std::process::id()));
+        fs::write(&victim, b"keep").unwrap();
+        // The marker in a directory name does not mark the file `..` leads to.
+        let sneaky = format!("{}/../{}", dir.display(), victim.file_name().unwrap().to_str().unwrap());
+        assert_eq!(read(Medium::TempFile, sneaky.as_bytes(), 0, 0, 100), Err(ReadFailed));
+        assert!(victim.exists());
+        fs::remove_file(&victim).unwrap();
+        fs::remove_dir(&dir).unwrap();
+
+        let shm = Path::new("/dev/shm");
+        if shm.is_dir() {
+            let name = format!("proteus-shm-{}", std::process::id());
+            fs::write(shm.join(&name), b"keep").unwrap();
+            assert_eq!(read(Medium::SharedMemory, format!("/{name}").as_bytes(), 0, 0, 100), Err(ReadFailed));
+            assert!(shm.join(&name).exists());
+            fs::remove_file(shm.join(&name)).unwrap();
+        }
     }
 }

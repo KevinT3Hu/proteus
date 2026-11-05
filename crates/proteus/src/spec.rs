@@ -118,6 +118,30 @@ impl LayoutSpec {
         self.windows.iter().flatten()
     }
 
+    /// The commands opening this layout runs: each pane's `cmd` and `run`.
+    pub fn commands(&self) -> Vec<String> {
+        fn walk(n: &NodeSpec, out: &mut Vec<String>) {
+            match n {
+                NodeSpec::Pane(p) => pane(p, out),
+                NodeSpec::Split { children, .. } => children.iter().for_each(|c| walk(c, out)),
+            }
+        }
+        fn pane(p: &PaneSpec, out: &mut Vec<String>) {
+            match &p.cmd {
+                Some(Cmd::Shell(s)) => out.push(s.clone()),
+                Some(Cmd::Argv(v)) => out.push(v.join(" ")),
+                None => {}
+            }
+            out.extend(p.run.iter().filter(|r| !r.trim().is_empty()).cloned());
+        }
+        let mut out = Vec::new();
+        for t in self.tabs() {
+            walk(&t.root, &mut out);
+            t.floating.iter().for_each(|f| pane(&f.pane, &mut out));
+        }
+        out
+    }
+
     /// One window of tabs.
     pub fn single(tabs: Vec<TabSpec>) -> Self {
         Self { windows: vec![tabs], clean: None }
@@ -505,7 +529,7 @@ fn quote(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 || c == '\x7f' => out.push_str(&format!("\\{}", c as u32)),
+            c if (c as u32) < 0x20 || c == '\x7f' => out.push_str(&format!("\\{:03}", c as u32)),
             c => out.push(c),
         }
     }
@@ -565,7 +589,7 @@ fn write_node(n: &NodeSpec, indent: usize, keys: Vec<String>, tab_cwd: Option<&P
                 keys.push("stacked = true".into());
             }
             if let Some(r) = ratio {
-                keys.push(format!("ratio = {}", (r * 1000.0).round() / 1000.0));
+                keys.push(format!("ratio = {}", ((r * 1000.0).round() / 1000.0).clamp(0.001, 0.999)));
             }
             out.push_str(&format!("{pad}{{ {},\n", keys.join(", ")));
             for c in children {
@@ -802,6 +826,19 @@ mod tests {
         let src = to_lua(&multi);
         assert!(src.contains("windows = {"), "{src}");
         assert_eq!(parse(&src, "m").unwrap(), multi, "{src}");
+    }
+
+    #[test]
+    fn control_characters_before_digits_and_extreme_ratios_survive_saving() {
+        let mut s = parse("return { tabs = { { split = 'vertical', ratio = 0.5, {}, {} } } }", "t").unwrap();
+        if let NodeSpec::Split { ratio, children, .. } = &mut s.windows[0][0].root {
+            *ratio = Some(0.9996);
+            children[0] = NodeSpec::Pane(PaneSpec { name: Some("\x0123".into()), ..PaneSpec::default() });
+        }
+        let back = parse(&to_lua(&s), "again").unwrap();
+        let NodeSpec::Split { ratio, children, .. } = &back.windows[0][0].root else { panic!() };
+        assert_eq!(*ratio, Some(0.999));
+        assert!(matches!(&children[0], NodeSpec::Pane(p) if p.name.as_deref() == Some("\x0123")));
     }
 
     #[test]

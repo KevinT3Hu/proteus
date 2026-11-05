@@ -137,15 +137,9 @@ impl SessionStore {
     }
 }
 
-/// `argv` as a shell command line.
+/// `argv` as a shell command line (see [`super::hint::shell_quote`]).
 pub fn shell_join(argv: &[String]) -> String {
-    argv.iter()
-        .map(|a| {
-            let safe = !a.is_empty() && a.chars().all(|c| c.is_ascii_alphanumeric() || "_-./=:,+@%".contains(c));
-            if safe { a.clone() } else { format!("'{}'", a.replace('\'', "'\\''")) }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    argv.iter().map(|a| super::hint::shell_quote(a)).collect::<Vec<_>>().join(" ")
 }
 
 impl App {
@@ -172,8 +166,13 @@ impl App {
         pane.name = p.name.clone();
         pane.cmd = p.cmd.clone();
         if let Some(run) = p.run.as_deref().filter(|r| !r.trim().is_empty()) {
-            pane.queue_run(run.to_string());
-            self.watch_runs();
+            if run.chars().any(char::is_control) {
+                self.notice(format!("not running {run:?}: it contains control characters"));
+            } else {
+                let pane = self.panes.get_mut(&id).expect("just spawned");
+                pane.queue_run(run.to_string());
+                self.watch_runs();
+            }
         }
         Ok(id)
     }
@@ -291,6 +290,8 @@ impl App {
         let run = p
             .foreground_command()
             .filter(|(name, _)| self.cfg.restore_commands.contains(name))
+            // Typed into a shell later: control characters could edit or end the line.
+            .filter(|(_, argv)| !argv.iter().any(|a| a.chars().any(char::is_control)))
             .map(|(_, argv)| shell_join(&argv));
         if p.plugin.is_some() {
             return PaneSpec { plugin: p.plugin.clone(), name: p.name.clone(), focus, ..PaneSpec::default() };
@@ -520,7 +521,7 @@ mod tests {
     #[test]
     fn quoting() {
         let argv = ["nvim", "my file.txt", "it's", "-c", "set nu"].map(String::from);
-        assert_eq!(shell_join(&argv), r#"nvim 'my file.txt' 'it'\''s' -c 'set nu'"#);
+        assert_eq!(shell_join(&argv), r#"nvim 'my file.txt' 'it'"'"'s' -c 'set nu'"#);
         assert_eq!(shell_join(&["".to_string()]), "''");
     }
 }

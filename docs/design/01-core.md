@@ -63,6 +63,7 @@
   - re-run command,
   - send block to AI (if AI enabled).
 - Duration and exit code stored per block and shown on hover or in a block info popup.
+- While a block's output fills the top row of a pane and its prompt is scrolled off, its command is pinned over that row with its status (running time, exit code). Clicking it scrolls back to the prompt. `ui.sticky_command = false` turns this off; it is not drawn in alt screen.
 - Default keys in Scroll mode: `c`/`o`/`a` copy command/output/all, `C`/`O`/`A` select them, `z` fold, `Z` unfold all, `r` re-run, `i` info, `[`/`]` previous/next prompt. Without a Scroll cursor the actions use the last command. Clicking a gutter mark folds its block; clicking a fold marker unfolds it.
 
 ## Search

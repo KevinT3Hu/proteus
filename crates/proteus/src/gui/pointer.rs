@@ -143,6 +143,13 @@ impl App {
                     self.toggle_fold(id, block);
                     return;
                 }
+                // The pinned command scrolls back to its prompt.
+                if b == MouseButton::Left
+                    && let Some((id, block)) = self.sticky_hit(ev.position)
+                {
+                    self.reveal_prompt(id, block);
+                    return;
+                }
                 let Some((id, part)) = self.hit_at(ev.position) else { return };
                 // Ctrl+click on an image opens the viewer.
                 if b == MouseButton::Left

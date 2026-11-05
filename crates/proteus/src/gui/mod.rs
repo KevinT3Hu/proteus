@@ -913,8 +913,12 @@ pub fn run(
 
     // Debug aid: PROTEUS_SNAPSHOT_AFTER=secs ends the session after that
     // long, so the snapshot shows a running (e.g. full-screen) program.
-    if let Some(secs) = std::env::var("PROTEUS_SNAPSHOT_AFTER").ok().and_then(|s| s.parse::<f64>().ok()) {
-        let _ = app.handle.insert_source(Timer::from_duration(Duration::from_secs_f64(secs)), |_, _, app| {
+    if let Some(secs) = std::env::var("PROTEUS_SNAPSHOT_AFTER")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .and_then(|s| Duration::try_from_secs_f64(s).ok())
+    {
+        let _ = app.handle.insert_source(Timer::from_duration(secs), |_, _, app| {
             app.exit = true;
             TimeoutAction::Drop
         });

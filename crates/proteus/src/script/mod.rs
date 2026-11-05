@@ -324,7 +324,8 @@ impl Script {
                 if !secs.is_finite() || secs < 0.0 {
                     return Err(runtime("timer: expected a number of seconds"));
                 }
-                let after = Duration::from_secs_f64(secs.max(MIN_TIMER));
+                let after = Duration::try_from_secs_f64(secs.max(MIN_TIMER))
+                    .map_err(|_| runtime("timer: expected a number of seconds"))?;
                 let mut r = r.borrow_mut();
                 let fid = r.add(f)?;
                 r.next_timer += 1;

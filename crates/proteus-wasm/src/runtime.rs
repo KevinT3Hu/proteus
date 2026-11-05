@@ -48,6 +48,11 @@ const MAX_TIMERS: usize = 64;
 const MIN_TIMER: Duration = Duration::from_millis(10);
 /// Decoded image pixels one plugin may hold.
 pub const MAX_IMAGE_BYTES: usize = 64 << 20;
+/// WASI resources (open files, streams, pollables) one plugin may hold, so
+/// it cannot use up the terminal's file descriptors.
+const MAX_RESOURCES: usize = 256;
+/// Host calls per second whose time is not charged to the plugin.
+const FREE_HOST_CALLS: usize = 200;
 const MAX_TASKS: usize = 16;
 /// Output (processes, HTTP bodies) queued for a plugin before the
 /// producers wait for it.
@@ -361,6 +366,8 @@ struct State {
     next_request: RequestId,
     rate_window: Instant,
     rate_calls: usize,
+    free_window: Instant,
+    free_calls: usize,
 }
 
 impl WasiView for State {
@@ -378,8 +385,26 @@ impl State {
         if ok { Ok(()) } else { Err(denied(name)) }
     }
 
-    /// Run `f` without charging its time to the plugin.
+    /// Run `f` without charging its time to the plugin, for up to
+    /// `FREE_HOST_CALLS` calls a second; beyond that the time counts, so a
+    /// loop of (say) storage writes still meets the call time limit.
     fn excluded<T>(&mut self, f: impl FnOnce(&mut State) -> T) -> T {
+        if self.free_window.elapsed() >= Duration::from_secs(1) {
+            self.free_window = Instant::now();
+            self.free_calls = 0;
+        }
+        self.free_calls += 1;
+        let free = self.free_calls <= FREE_HOST_CALLS;
+        let t = Instant::now();
+        let r = f(self);
+        if free {
+            self.call_start += t.elapsed();
+        }
+        r
+    }
+
+    /// Waiting for the terminal is never charged (calls are rate limited).
+    fn uncharged<T>(&mut self, f: impl FnOnce(&mut State) -> T) -> T {
         let t = Instant::now();
         let r = f(self);
         self.call_start += t.elapsed();
@@ -425,7 +450,7 @@ impl State {
         // logging. A plugin can have only one host message in flight.
         let (tx, rx) = mpsc::channel();
         (self.sink)(self.key.clone(), FromPlugin::Call(call, Some(tx)));
-        self.excluded(|s| {
+        self.uncharged(|s| {
             loop {
                 match rx.recv_timeout(Duration::from_millis(50)) {
                     Ok(answer) => break answer,
@@ -901,16 +926,25 @@ impl proteus::plugin::host::Host for State {
     }
 
     fn open(&mut self, path_or_url: String) -> Result<(), String> {
+        self.need(self.granted.ui, "ui")?;
         let lower = path_or_url.to_ascii_lowercase();
         let target = if ["http://", "https://", "mailto:"].iter().any(|p| lower.starts_with(p)) {
-            self.need(self.granted.ui, "ui")?;
             if path_or_url.chars().any(|c| c.is_control() || c.is_whitespace()) {
                 return Err("open: not a valid URL".into());
+            }
+            // A browser fetches the URL: the same hosts as `network`.
+            if !lower.starts_with("mailto:") {
+                crate::net::check(&self.granted.network, &path_or_url)?;
             }
             (path_or_url, None)
         } else {
             use std::os::fd::AsRawFd;
             let pinned = self.access.pin(&path_or_url, false, true)?;
+            // Files the plugin wrote itself are not handed to other programs.
+            let data = self.access.data_dir.clone();
+            if pinned.original.starts_with(&data) {
+                return Err("open: files in the plugin's data directory cannot be opened".into());
+            }
             (format!("/proc/{}/fd/{}", std::process::id(), pinned.file.as_raw_fd()), Some(pinned.file))
         };
         self.rpc(Call::Open(target.0, target.1)).map(|_| ())
@@ -1010,6 +1044,56 @@ fn err(e: impl std::fmt::Display) -> String {
 }
 
 /// A trap's message: the reason first, without the wasm backtrace.
+/// Replace WASI's blocking `poll` and `pollable.block` with versions that
+/// give up when the plugin is stopped or its call runs out of time. Epoch
+/// interruption only reaches running WASM code, not a guest asleep in the host.
+fn interruptible_poll(linker: &mut Linker<State>) -> wasmtime::Result<()> {
+    use wasmtime::StoreContextMut;
+    use wasmtime::component::Resource;
+    use wasmtime_wasi::p2::DynPollable;
+    use wasmtime_wasi::p2::bindings::io::poll::{Host, HostPollable};
+    linker.allow_shadowing(true);
+    let mut poll = linker.instance("wasi:io/poll@0.2.12")?;
+    poll.func_wrap("poll", |mut cx: StoreContextMut<'_, State>, (list,): (Vec<Resource<DynPollable>>,)| {
+        let s = cx.data_mut();
+        let (stop, deadline) = (s.stop.clone(), s.call_start + CALL_LIMIT);
+        let table = &mut s.table;
+        wasmtime_wasi::runtime::in_tokio(until_stopped(stop, deadline, Host::poll(table, list))).map(|r| (r,))
+    })?;
+    poll.func_wrap("[method]pollable.block", |mut cx: StoreContextMut<'_, State>, (p,): (Resource<DynPollable>,)| {
+        let s = cx.data_mut();
+        let (stop, deadline) = (s.stop.clone(), s.call_start + CALL_LIMIT);
+        let table = &mut s.table;
+        wasmtime_wasi::runtime::in_tokio(until_stopped(stop, deadline, HostPollable::block(table, p)))
+    })?;
+    linker.allow_shadowing(false);
+    Ok(())
+}
+
+/// `f`, unless `stop` is set or `deadline` passes first.
+async fn until_stopped<T>(
+    stop: Arc<AtomicBool>,
+    deadline: Instant,
+    f: impl std::future::Future<Output = wasmtime::Result<T>>,
+) -> wasmtime::Result<T> {
+    use std::task::Poll;
+    let mut f = std::pin::pin!(f);
+    loop {
+        let mut tick = std::pin::pin!(tokio::time::sleep(TICK));
+        let done = std::future::poll_fn(|cx| match f.as_mut().poll(cx) {
+            Poll::Ready(v) => Poll::Ready(Some(v)),
+            Poll::Pending => tick.as_mut().poll(cx).map(|_| None),
+        })
+        .await;
+        if let Some(v) = done {
+            return v;
+        }
+        if stop.load(Ordering::Relaxed) || Instant::now() >= deadline {
+            return Err(wasmtime::Trap::Interrupt.into());
+        }
+    }
+}
+
 fn trap_message(e: &wasmtime::Error, state: &State) -> String {
     if state.stop.load(Ordering::Relaxed) {
         return "stopped".into();
@@ -1080,6 +1164,7 @@ fn run(
     };
     let mut linker: Linker<State> = Linker::new(engine);
     wasmtime_wasi::p2::add_to_linker_sync(&mut linker).map_err(err)?;
+    interruptible_poll(&mut linker).map_err(err)?;
     Plugin::add_to_linker::<State, HasSelf<State>>(&mut linker, |s| s).map_err(err)?;
 
     let mut wasi = WasiCtxBuilder::new();
@@ -1096,7 +1181,7 @@ fn run(
     for f in &spec.granted.fs {
         f.validate_directory()?;
         let perms = if f.write { FsPerms::ReadWrite } else { FsPerms::ReadOnly };
-        let host = f.host_path();
+        let host = f.host_path()?;
         // Seen at its real path. Missing directories are left out (the
         // plugin gets "not found").
         if host.is_dir() {
@@ -1111,7 +1196,11 @@ fn run(
         granted: spec.granted.clone(),
         sink: sink.clone(),
         wasi: wasi.build(),
-        table: ResourceTable::new(),
+        table: {
+            let mut table = ResourceTable::new();
+            table.set_max_capacity(MAX_RESOURCES);
+            table
+        },
         limits: Limits::new(spec.memory),
         call_start: Instant::now(),
         stop: post.stop.clone(),
@@ -1131,6 +1220,8 @@ fn run(
         next_request: 0,
         rate_window: Instant::now(),
         rate_calls: 0,
+        free_window: Instant::now(),
+        free_calls: 0,
     };
     let mut store = Store::new(engine, state);
     store.limiter(|s| &mut s.limits);
@@ -1250,6 +1341,8 @@ mod tests {
             next_request: 0,
             rate_window: Instant::now(),
             rate_calls: 0,
+            free_window: Instant::now(),
+            free_calls: 0,
         };
         state.create_private("/data/staged".into(), false).unwrap();
         assert_eq!(state.file_mode("/data/staged".into()).unwrap(), 0o600);

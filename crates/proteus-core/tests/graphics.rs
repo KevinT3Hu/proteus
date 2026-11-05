@@ -446,11 +446,13 @@ fn background_iterm_gif_animates() {
 
 #[test]
 fn frame_commands_wait_for_decodes() {
-    let (c, _) = background();
+    let (c, woken) = background();
     let mut t = term_with(20, 10, c);
     feed(&mut t, &apc("a=t,f=100,i=5,q=2", &png(4, 4, [0, 0, 0, 255])));
-    // Adding a frame needs the decoded root frame.
+    // Adding a frame needs the decoded root frame; it runs once that is ready.
     feed(&mut t, &apc("a=f,i=5,f=32,s=4,v=4", &rgba(4, 4, [9, 9, 9, 255])));
-    assert_eq!(out(&mut t), "\x1b_Gi=5;OK\x1b\\");
-    assert_eq!(t.images().image_by_id(5).unwrap().frame_count(), 2);
+    feed(&mut t, &apc("a=f,i=5,f=32,s=4,v=4", &rgba(4, 4, [8, 8, 8, 255])));
+    settle(&mut t, &woken, 1);
+    assert_eq!(out(&mut t), "\x1b_Gi=5;OK\x1b\\\x1b_Gi=5;OK\x1b\\");
+    assert_eq!(t.images().image_by_id(5).unwrap().frame_count(), 3);
 }

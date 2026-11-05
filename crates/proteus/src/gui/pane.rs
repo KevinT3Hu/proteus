@@ -52,7 +52,35 @@ pub struct Pane {
     pub plugin: Option<(String, String)>,
     /// Size (cols, rows, cell) to apply once its hidden tab is shown.
     deferred_size: Option<(u16, u16, (u32, u32))>,
+    /// Foreground process group and whether it runs on this machine.
+    fg_local: Option<(i32, bool)>,
 }
+
+/// Foreground programs whose output comes from another machine.
+const REMOTE_PROGRAMS: &[&str] = &[
+    "ssh",
+    "autossh",
+    "sshpass",
+    "mosh",
+    "mosh-client",
+    "et",
+    "telnet",
+    "rlogin",
+    "nc",
+    "ncat",
+    "socat",
+    "docker",
+    "podman",
+    "kubectl",
+    "lxc",
+    "incus",
+    "machinectl",
+    "toolbox",
+    "distrobox",
+    "vagrant",
+    "minicom",
+    "picocom",
+];
 
 impl Pane {
     pub fn spawn(
@@ -125,6 +153,7 @@ impl Pane {
             surface: None,
             plugin: None,
             deferred_size: None,
+            fg_local: None,
         };
         pane.refresh_proc_title();
         Ok(pane)
@@ -150,6 +179,7 @@ impl Pane {
             surface: Some(surface),
             plugin: None,
             deferred_size: None,
+            fg_local: None,
         }
     }
 
@@ -272,9 +302,29 @@ impl Pane {
         (!argv.is_empty()).then_some((name, argv))
     }
 
+    /// Tell the terminal whether its output comes from this machine: SSH
+    /// panes and remote-access programs in the foreground do not.
+    pub fn update_locality(&mut self) {
+        let local = self.remote.is_none()
+            && match self.pty.as_ref().and_then(|p| p.foreground_pgrp()) {
+                None => false,
+                Some(pgrp) => match self.fg_local {
+                    Some((cached, local)) if cached == pgrp => local,
+                    _ => {
+                        let comm = std::fs::read_to_string(format!("/proc/{pgrp}/comm"));
+                        let local = comm.is_ok_and(|c| !REMOTE_PROGRAMS.contains(&c.trim_end()));
+                        self.fg_local = Some((pgrp, local));
+                        local
+                    }
+                },
+            };
+        self.term.set_local(local);
+    }
+
     /// Re-read the foreground process on the next refresh.
     pub fn expire_proc_title(&mut self) {
         self.proc_checked = None;
+        self.fg_local = None;
     }
 
     /// Re-read the foreground process at most once a second. Returns true

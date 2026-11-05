@@ -64,21 +64,22 @@ impl FsGrant {
         Ok(FsGrant { path: path.to_string(), write })
     }
 
-    /// The directory on this machine.
-    pub fn host_path(&self) -> PathBuf {
+    /// The directory on this machine. `~` needs an absolute `HOME`.
+    pub fn host_path(&self) -> Result<PathBuf, String> {
         match self.path.strip_prefix('~') {
             Some(rest) => {
-                let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| "/".into());
-                home.join(rest.trim_start_matches('/'))
+                let home = std::env::var_os("HOME").map(PathBuf::from).filter(|h| h.is_absolute());
+                let home = home.ok_or_else(|| format!("fs: `{}`: HOME is not set to an absolute path", self.path))?;
+                Ok(home.join(rest.trim_start_matches('/')))
             }
-            None => PathBuf::from(&self.path),
+            None => Ok(PathBuf::from(&self.path)),
         }
     }
 
     /// WASI preopens directories, not individual files. Missing directories
     /// may be mounted on a later start; existing files must not be ignored.
     pub fn validate_directory(&self) -> Result<(), String> {
-        match std::fs::metadata(self.host_path()) {
+        match std::fs::metadata(self.host_path()?) {
             Ok(m) if !m.is_dir() => {
                 Err(format!("fs: `{}`: expected a directory; single-file grants are not supported", self.path))
             }
@@ -193,6 +194,23 @@ mod fs_list {
 }
 
 impl Permissions {
+    /// A read-only directory inside a read-write one cannot be enforced:
+    /// the plugin reaches it through the outer grant.
+    pub fn validate_fs_nesting(&self) -> Result<(), String> {
+        for inner in self.fs.iter().filter(|g| !g.write) {
+            let inner_path = inner.host_path()?;
+            for outer in self.fs.iter().filter(|g| g.write) {
+                if inner_path.starts_with(outer.host_path()?) {
+                    return Err(format!(
+                        "fs: `{}` is read-only but inside the read-write `{}`; the plugin could still write it",
+                        inner.path, outer.path
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// One plain-language line per permission, for the approval question.
     pub fn describe(&self) -> Vec<String> {
         let mut v = Vec::new();
@@ -451,6 +469,17 @@ mod tests {
         assert!(host_allowed(&p.network, "localhost", 11434));
         assert!(!host_allowed(&p.network, "localhost", 80));
         assert!(!host_allowed(&p.network, "example.com", 443));
+    }
+
+    #[test]
+    fn read_only_grants_inside_writable_ones_are_rejected() {
+        let p = |g: &[&str]| Permissions {
+            fs: g.iter().map(|g| FsGrant::parse(g).unwrap()).collect(),
+            ..Default::default()
+        };
+        assert!(p(&["/srv:rw", "/srv/secret:r"]).validate_fs_nesting().is_err());
+        assert!(p(&["/srv:r", "/srv/notes:rw"]).validate_fs_nesting().is_ok());
+        assert!(p(&["/srv:rw", "/srvx:r"]).validate_fs_nesting().is_ok());
     }
 
     #[test]

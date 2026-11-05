@@ -4,7 +4,7 @@ description = "Example Proteus plugin: a sidebar listing every pane"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-rust-version = "1.97"
+rust-version = "1.98"
 publish = false
 
 [lib]

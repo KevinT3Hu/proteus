@@ -39,14 +39,24 @@ pub fn patterns(custom: &[HintPatternConfig]) -> Vec<HintPattern> {
     v
 }
 
-/// `text` quoted for a POSIX shell if it needs it.
+/// `text` quoted if it needs it, the same way for sh, bash, zsh and fish:
+/// fish treats `\` and `'` specially even inside single quotes, so those two
+/// go in double quotes, where every one of these shells reads them literally.
 pub fn shell_quote(text: &str) -> String {
-    let safe = |c: char| c.is_alphanumeric() || "-_./~:@%+=,".contains(c);
-    if !text.is_empty() && text.chars().all(safe) {
-        text.to_string()
-    } else {
-        format!("'{}'", text.replace('\'', r"'\''"))
+    let safe = |c: char| c.is_alphanumeric() || "-_./:@%+=,".contains(c);
+    if !text.is_empty() && text.chars().all(safe) && !text.starts_with('=') {
+        return text.to_string();
     }
+    let mut out = String::from("'");
+    for c in text.chars() {
+        match c {
+            '\'' => out.push_str(r#"'"'"'"#),
+            '\\' => out.push_str(r#"'"\\"'"#),
+            c => out.push(c),
+        }
+    }
+    out.push('\'');
+    out
 }
 
 /// `text` percent-encoded for use inside a URL (RFC 3986 unreserved kept).
@@ -360,7 +370,10 @@ mod tests {
     fn quoting() {
         assert_eq!(shell_quote("src/a.rs:12"), "src/a.rs:12");
         assert_eq!(shell_quote("my file"), "'my file'");
-        assert_eq!(shell_quote("it's"), r"'it'\''s'");
+        assert_eq!(shell_quote("it's"), r#"'it'"'"'s'"#);
+        assert_eq!(shell_quote(r"x\' ;touch pwned;#"), r#"'x'"\\"''"'"' ;touch pwned;#'"#);
+        assert_eq!(shell_quote("~/x"), "'~/x'");
+        assert_eq!(shell_quote("=ls"), "'=ls'");
         assert_eq!(shell_quote("https://x/?a=1&b=2"), "'https://x/?a=1&b=2'");
     }
 

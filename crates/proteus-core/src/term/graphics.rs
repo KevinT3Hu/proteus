@@ -17,17 +17,30 @@ use crate::graphics::{
 use crate::modes::TermMode;
 use base64::Engine as _;
 
-/// State of the APC pre-filter (vte discards APC strings).
+/// State of the string pre-filter: vte discards APC strings and buffers OSC
+/// strings without a limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) enum Apc {
     #[default]
     Ground,
-    /// Saw ESC outside an APC string.
+    /// Saw ESC outside a string.
     Esc,
     Body,
     /// Saw ESC inside an APC string.
     BodyEsc,
+    /// Inside an OSC string that vte is buffering.
+    Osc,
+    /// Saw ESC inside an OSC string.
+    OscEsc,
+    /// Dropping the rest of an oversized OSC string.
+    OscDiscard,
+    /// Saw ESC while dropping an oversized OSC string.
+    OscDiscardEsc,
 }
+
+/// OSC strings larger than this make the parser be replaced afterwards, so
+/// its buffer does not keep the peak allocation.
+const OSC_SHRINK: usize = 64 << 10;
 
 /// Largest GIF frame delay treated as "as fast as possible" (browser convention).
 const MIN_GIF_DELAY_MS: u32 = 10;
@@ -58,12 +71,17 @@ pub(super) struct Decodes {
     tx: Sender<Decoded>,
     rx: Receiver<Decoded>,
     pending: usize,
+    /// Frame and animation commands waiting for their image to decode.
+    deferred: Vec<(u64, Command)>,
 }
+
+/// Most commands held back until an image decodes.
+const MAX_DEFERRED: usize = 64;
 
 impl Default for Decodes {
     fn default() -> Self {
         let (tx, rx) = channel();
-        Self { tx, rx, pending: 0 }
+        Self { tx, rx, pending: 0, deferred: Vec::new() }
     }
 }
 
@@ -136,8 +154,73 @@ impl Terminal {
                         self.apc = Apc::Body;
                         self.apc_buf.clear();
                         self.apc_overflow = false;
+                    } else if b == b']' {
+                        self.apc = Apc::Osc;
+                        self.osc_len = 0;
+                        self.osc_head.clear();
                     } else if b != 0x1b {
                         self.apc = Apc::Ground;
+                    }
+                }
+                Apc::Osc => {
+                    let rest = &bytes[i..];
+                    let end = rest.iter().position(|&b| matches!(b, 0x07 | 0x18 | 0x1a | 0x1b));
+                    let len = end.unwrap_or(rest.len());
+                    let head = self.osc_head.len();
+                    if head < 5 {
+                        self.osc_head.extend_from_slice(&rest[..len.min(5 - head)]);
+                    }
+                    if self.osc_len + len > self.max_osc() {
+                        self.advance_parser(parser, &bytes[start..i]);
+                        self.osc_drop = true;
+                        self.advance_parser(parser, b"\x07");
+                        *parser = vte::Parser::new();
+                        self.apc = Apc::OscDiscard;
+                        start = bytes.len();
+                        continue;
+                    }
+                    self.osc_len += len;
+                    let Some(off) = end else { break };
+                    i += off;
+                    if bytes[i] == 0x1b {
+                        self.advance_parser(parser, &bytes[start..i]);
+                        start = i + 1;
+                        self.apc = Apc::OscEsc;
+                    } else {
+                        self.advance_parser(parser, &bytes[start..=i]);
+                        start = i + 1;
+                        self.osc_finished(parser);
+                    }
+                }
+                Apc::OscEsc => {
+                    if bytes[i] == b'\\' {
+                        self.advance_parser(parser, b"\x1b\\");
+                        start = i + 1;
+                        self.osc_finished(parser);
+                    } else {
+                        self.advance_parser(parser, b"\x1b");
+                        start = i;
+                        self.apc = Apc::Esc;
+                        continue;
+                    }
+                }
+                Apc::OscDiscard => {
+                    match bytes[i..].iter().position(|&b| matches!(b, 0x07 | 0x18 | 0x1a | 0x1b)) {
+                        Some(off) => i += off,
+                        None => break,
+                    }
+                    self.apc = if bytes[i] == 0x1b { Apc::OscDiscardEsc } else { Apc::Ground };
+                    start = i + 1;
+                }
+                Apc::OscDiscardEsc => {
+                    if bytes[i] == b'\\' {
+                        start = i + 1;
+                        self.apc = Apc::Ground;
+                    } else {
+                        self.advance_parser(parser, b"\x1b");
+                        start = i;
+                        self.apc = Apc::Esc;
+                        continue;
                     }
                 }
                 Apc::Body => {
@@ -173,9 +256,26 @@ impl Terminal {
             }
             i += 1;
         }
-        if start < bytes.len() && matches!(self.apc, Apc::Ground | Apc::Esc) {
+        if start < bytes.len() && matches!(self.apc, Apc::Ground | Apc::Esc | Apc::Osc) {
             self.advance_parser(parser, &bytes[start..]);
         }
+    }
+
+    /// Only iTerm2 images (OSC 1337) may be as large as an image; everything
+    /// else fits the largest clipboard write (OSC 52).
+    fn max_osc(&self) -> usize {
+        let image =
+            self.osc_head.starts_with(b"1337;") || (self.osc_head.len() < 5 && b"1337;".starts_with(&self.osc_head));
+        let max =
+            if image { super::MAX_OSC52.max(self.config.graphics.max_image_bytes / 3 * 4) } else { super::MAX_OSC52 };
+        max + 8192
+    }
+
+    fn osc_finished(&mut self, parser: &mut vte::Parser) {
+        if self.osc_len > OSC_SHRINK {
+            *parser = vte::Parser::new();
+        }
+        self.apc = Apc::Ground;
     }
 
     fn apc_push(&mut self, chunk: &[u8]) {
@@ -218,14 +318,23 @@ impl Terminal {
         self.images.views(&self.grid, &self.styles, self.cell_pixel_size())
     }
 
-    /// File-based kitty media are only allowed for panes on this machine.
+    /// File-based kitty media are only allowed for panes the host reports as
+    /// local (see [`Terminal::set_local`]); an OSC 7 cwd on another host also
+    /// disables them, but the program cannot enable them through OSC 7.
     fn files_allowed(&self) -> bool {
         let g = &self.config.graphics;
         g.allow_local_files
+            && self.local
             && self.cwd.as_ref().is_none_or(|c| match &g.hostname {
                 Some(h) => c.is_local(h),
                 None => matches!(c.host.as_deref(), None | Some("") | Some("localhost")),
             })
+    }
+
+    /// Whether the program in the foreground runs on this machine. Only then
+    /// may it send images as local file, temp-file or shared-memory names.
+    pub fn set_local(&mut self, local: bool) {
+        self.local = local;
     }
 
     fn abs_cursor_line(&self) -> i64 {
@@ -285,9 +394,21 @@ impl Terminal {
             self.kitty_reply(&cmd, id, number, 0, Err(err("EINVAL", "Must not specify both i and I")));
             return;
         }
-        // Frame and animation commands need the pixels of earlier images.
+        // Frame and animation commands need the pixels of the image; while it
+        // is still decoding they run once the decode finishes.
         if matches!(cmd.action(), b'f' | b'a' | b'c') {
-            self.wait_images();
+            self.poll_images();
+            if let Ok(key) = self.kitty_lookup(&cmd)
+                && (self.images.image(key).is_some_and(|i| i.is_loading())
+                    || self.decodes.deferred.iter().any(|(k, _)| *k == key))
+            {
+                if self.decodes.deferred.len() >= MAX_DEFERRED {
+                    self.kitty_reply(&cmd, id, number, 0, Err(err("EBUSY", "Too many commands wait for a decode")));
+                } else {
+                    self.decodes.deferred.push((key, cmd));
+                }
+                return;
+            }
         }
         match cmd.action() {
             b't' | b'T' | b'q' => self.kitty_transmit(cmd),
@@ -325,6 +446,13 @@ impl Terminal {
             return;
         }
         let q = cmd.quiet();
+        // Errors about file media all look alike so a client cannot probe files.
+        let r = match r {
+            Err(_) if matches!(cmd.ch(b't', b'd'), b'f' | b't' | b's') => {
+                Err(err("EBADF", "Failed to read image file"))
+            }
+            r => r,
+        };
         let msg = match &r {
             Ok(()) if q >= 1 => return,
             Ok(()) => "OK",
@@ -513,16 +641,6 @@ impl Terminal {
         }
     }
 
-    /// Wait for every background decode to finish.
-    fn wait_images(&mut self) {
-        while self.decodes.pending > 0 {
-            match self.decodes.rx.recv_timeout(Duration::from_secs(10)) {
-                Ok(d) => self.finish_decode(d),
-                Err(_) => self.decodes.pending = 0,
-            }
-        }
-    }
-
     fn finish_decode(&mut self, d: Decoded) {
         self.decodes.pending = self.decodes.pending.saturating_sub(1);
         self.damage.images = true;
@@ -571,6 +689,13 @@ impl Terminal {
         }
         if let Some(r) = d.reply {
             self.kitty_reply(&r.cmd, r.id, r.number, r.pid, outcome);
+        }
+        if self.decodes.deferred.iter().any(|(k, _)| *k == key) {
+            let (ready, rest) = std::mem::take(&mut self.decodes.deferred).into_iter().partition(|(k, _)| *k == key);
+            self.decodes.deferred = rest;
+            for (_, cmd) in ready {
+                self.kitty_run(cmd);
+            }
         }
     }
 
@@ -731,7 +856,10 @@ impl Terminal {
         let (iw, ih) = img.size();
         let px = self.kitty_pixels(cmd, (iw, ih))?;
         let (x, y) = (cmd.u(b'x'), cmd.u(b'y'));
-        let rect = PxRect { x: 0, y: 0, w: px.width.min(iw.saturating_sub(x)), h: px.height.min(ih.saturating_sub(y)) };
+        if x >= iw || y >= ih {
+            return Err(err("EINVAL", "Frame offset out of bounds"));
+        }
+        let rect = PxRect { x: 0, y: 0, w: px.width.min(iw - x), h: px.height.min(ih - y) };
         let replace = cmd.u(b'X') == 1;
         let gap = cmd.i(b'z');
         let edit = cmd.u(b'r') as usize;

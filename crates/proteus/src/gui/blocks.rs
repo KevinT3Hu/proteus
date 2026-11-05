@@ -65,6 +65,34 @@ pub fn summary(b: &Block) -> String {
     parts.join(" · ")
 }
 
+/// Status shown right of a pinned command: `running · 4.2s`, `✗ exit 2 · 1.3s`.
+fn status(b: &Block) -> String {
+    let state = match (b.state, b.exit_code) {
+        (BlockState::Running, _) => "running".to_string(),
+        (_, Some(0)) => "✓".to_string(),
+        (_, Some(c)) => format!("✗ exit {c}"),
+        _ => String::new(),
+    };
+    match b.duration().map(human_duration) {
+        Some(d) if state.is_empty() => d,
+        Some(d) => format!("{state} · {d}"),
+        None => state,
+    }
+}
+
+/// The block whose command is pinned over the first shown row (`skip`):
+/// its output is at the top while its prompt and command are scrolled off.
+pub fn sticky_block<'a>(t: &'a Terminal, rows: &Rows, skip: usize) -> Option<&'a Block> {
+    if t.is_alt_screen() || t.lines().saturating_sub(skip) < 3 {
+        return None;
+    }
+    let Row::Line(top) = *rows.0.get(skip)? else { return None };
+    let b = block_at(t, top)?;
+    let (prompt_end, end) = extent(t, b);
+    let command = b.command.as_deref().is_some_and(|c| !c.trim().is_empty());
+    (command && (prompt_end..end).contains(&top)).then_some(b)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Mark {
     None,
@@ -187,17 +215,106 @@ impl App {
         out
     }
 
-    /// A command is running in a visible pane whose gutter is drawn.
+    /// A command is running in a visible pane whose gutter or pinned
+    /// command shows it.
     pub(super) fn spinner_visible(&self) -> bool {
-        if self.gutter_px() <= 0 {
+        let gutter = self.gutter_px() > 0;
+        if !gutter && !self.cfg.sticky_command {
             return false;
         }
         let view = self.view();
         view.panes.iter().map(|p| p.0).chain(view.floats.iter().map(|f| f.id)).any(|id| {
             self.panes.get(&id).is_some_and(|p| {
-                !p.term.is_alt_screen() && p.term.blocks().last().is_some_and(|b| b.state == BlockState::Running)
+                let t = &p.term;
+                let running = |b: &Block| b.state == BlockState::Running;
+                if t.is_alt_screen() || !t.blocks().last().is_some_and(running) {
+                    return false;
+                }
+                gutter || self.pinned(id, &Rows::of(t), self.row_skip(id)).is_some_and(running)
             })
         })
+    }
+
+    /// The block whose command is pinned at the top of pane `id`. Not
+    /// while the Scroll cursor is on the row it covers.
+    fn pinned(&self, id: PaneId, rows: &Rows, skip: usize) -> Option<&Block> {
+        if !self.cfg.sticky_command {
+            return None;
+        }
+        let b = sticky_block(&self.panes.get(&id)?.term, rows, skip)?;
+        let top = rows.line(skip);
+        let covered = self.w.copy.as_ref().is_some_and(|c| c.pane == id && Some(c.cursor.line) == top);
+        (!covered).then_some(b)
+    }
+
+    /// The pinned command row of pane `id` whose grid is at `r`: the
+    /// command on the left, its status on the right.
+    pub(super) fn sticky_labels(&self, id: PaneId, r: Rect, rows: &Rows, skip: usize, theme: &Theme) -> Vec<Label> {
+        let Some(b) = self.pinned(id, rows, skip) else {
+            return Vec::new();
+        };
+        let t = &self.panes[&id].term;
+        let cols = t.cols();
+        let cw = self.cell().0 as f32;
+        let (x, y) = (r.x as f32, r.y as f32);
+        let mut lines = b.command.as_deref().unwrap_or("").lines().map(str::trim).filter(|l| !l.is_empty());
+        let mut command = format!(" {}", lines.next().unwrap_or(""));
+        if lines.next().is_some() {
+            command.push_str(" …");
+        }
+        let status = format!("{} ", status(b));
+        let status_cols = super::chrome::text_width(&status);
+        let status_cols = if status_cols + 8 <= cols { status_cols } else { 0 };
+        let color = if b.state == BlockState::Running {
+            theme.accent
+        } else if b.failed() {
+            t.palette().indexed(1)
+        } else {
+            theme.dim
+        };
+        let mut out = vec![
+            Label { x, y, cols, text: String::new(), fg: theme.fg, bg: Some(theme.bar), bold: false },
+            Label {
+                x,
+                y,
+                cols: cols - status_cols - usize::from(status_cols > 0),
+                text: command,
+                fg: theme.fg,
+                bg: None,
+                bold: true,
+            },
+        ];
+        if status_cols > 0 {
+            let sx = x + (cols - status_cols) as f32 * cw;
+            out.push(Label { x: sx, y, cols: status_cols, text: status, fg: color, bg: None, bold: false });
+        }
+        out
+    }
+
+    /// Pinned command under the pointer.
+    pub(super) fn sticky_hit(&self, pos: (f64, f64)) -> Option<(PaneId, BlockId)> {
+        let (id, row, gutter) = self.row_at(pos)?;
+        let skip = self.row_skip(id);
+        if gutter || row != skip {
+            return None;
+        }
+        let rows = Rows::of(&self.panes.get(&id)?.term);
+        self.pinned(id, &rows, skip).map(|b| (id, b.id))
+    }
+
+    /// Scroll the prompt of block `bid` to the top of pane `id`.
+    pub(super) fn reveal_prompt(&mut self, id: PaneId, bid: BlockId) {
+        let Some(p) = self.panes.get_mut(&id) else {
+            return;
+        };
+        let Some(line) = p.term.blocks().get(bid).map(|b| b.prompt_line) else {
+            return;
+        };
+        p.term.scroll_to_line(line);
+        if self.w.copy.as_ref().is_some_and(|c| c.pane == id) {
+            self.copy_goto(Point::new(line, 0));
+        }
+        self.w.dirty = true;
     }
 
     /// Pane grids of the active tab, topmost first: (pane, grid rect).
@@ -491,5 +608,26 @@ mod tests {
         // The live prompt spans its own line only.
         assert_eq!(extent(&t, &last), (l0 + 4, l0 + 4));
         assert_eq!(block_at(&t, l0 + 5).map(|b| b.id), None);
+    }
+
+    #[test]
+    fn sticky_block_needs_output_at_the_top() {
+        let mut t = Terminal::new(20, 4, proteus_core::Config::default());
+        t.advance(b"\x1b]133;A\x07$ \x1b]133;B\x07make\r\n\x1b]133;C\x07");
+        let rows = Rows::of(&t);
+        // The command is still on screen.
+        assert!(sticky_block(&t, &rows, 0).is_none());
+        t.advance(b"o1\r\no2\r\no3\r\no4\r\no5");
+        let rows = Rows::of(&t);
+        let b = sticky_block(&t, &rows, 0).expect("output at the top");
+        assert_eq!(b.command.as_deref(), Some("make"));
+        assert!(status(b).starts_with("running · "), "{}", status(b));
+        // Too few rows left under the bottom bar.
+        assert!(sticky_block(&t, &rows, 2).is_none());
+        t.advance(b"\r\n\x1b]133;D;2\x07\x1b]133;A\x07$ ");
+        let b = sticky_block(&t, &Rows::of(&t), 0).expect("finished output at the top");
+        assert!(status(b).starts_with("✗ exit 2 · "), "{}", status(b));
+        t.scroll_to_line(b.prompt_line);
+        assert!(sticky_block(&t, &Rows::of(&t), 0).is_none());
     }
 }

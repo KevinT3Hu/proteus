@@ -230,6 +230,24 @@ fn failures_stop_the_instance() {
     let seen = h.wait(|m| matches!(m, FromPlugin::Failed(_) | FromPlugin::Exited));
     assert_eq!(seen, ["failed: stopped"]);
     assert!(t.elapsed() < Duration::from_secs(1));
+
+    // A plugin asleep in a WASI call is held to the same limits.
+    let h = start("sleep", Permissions { ui: true, ..Permissions::default() });
+    h.wait(|m| matches!(m, FromPlugin::Started));
+    let t = Instant::now();
+    let seen = h.act("sleep");
+    assert!(seen.last().unwrap().contains("ran longer than"), "{seen:?}");
+    assert!(t.elapsed() < proteus_wasm::runtime::CALL_LIMIT + Duration::from_secs(2));
+
+    let h = start("sleep-stop", Permissions { ui: true, ..Permissions::default() });
+    h.wait(|m| matches!(m, FromPlugin::Started));
+    h.handle.event(Event::Action("sleep".into()));
+    std::thread::sleep(Duration::from_millis(100));
+    let t = Instant::now();
+    h.handle.stop();
+    let seen = h.wait(|m| matches!(m, FromPlugin::Failed(_) | FromPlugin::Exited));
+    assert_eq!(seen, ["failed: stopped"]);
+    assert!(t.elapsed() < Duration::from_secs(1));
 }
 
 #[test]

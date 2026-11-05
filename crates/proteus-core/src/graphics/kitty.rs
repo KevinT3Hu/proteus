@@ -173,18 +173,22 @@ fn blend(dst: &mut [u8], src: &[u8]) {
 }
 
 /// Copy `rect` of `src` (stride `sw`) to `dst` (stride `dw`) at `(dx, dy)`,
-/// either replacing or alpha blending. The caller guarantees bounds.
+/// either replacing or alpha blending. Stops at the first row outside either buffer.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compose(dst: &mut [u8], dw: u32, src: &[u8], sw: u32, rect: Rect, dx: u32, dy: u32, replace: bool) {
-    for row in 0..rect.h {
-        let s = (((rect.y + row) * sw + rect.x) * 4) as usize;
-        let d = (((dy + row) * dw + dx) * 4) as usize;
-        let n = (rect.w * 4) as usize;
+    let n = rect.w as usize * 4;
+    if n == 0 {
+        return;
+    }
+    for row in 0..rect.h as usize {
+        let s = ((rect.y as usize + row) * sw as usize + rect.x as usize) * 4;
+        let d = ((dy as usize + row) * dw as usize + dx as usize) * 4;
+        let (Some(dst), Some(src)) = (dst.get_mut(d..d + n), src.get(s..s + n)) else { return };
         if replace {
-            dst[d..d + n].copy_from_slice(&src[s..s + n]);
+            dst.copy_from_slice(src);
         } else {
-            for i in (0..n).step_by(4) {
-                blend(&mut dst[d + i..d + i + 4], &src[s + i..s + i + 4]);
+            for (d, s) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src.as_chunks::<4>().0) {
+                blend(d, s);
             }
         }
     }

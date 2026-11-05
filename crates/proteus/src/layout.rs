@@ -5,6 +5,9 @@
 
 pub type PaneId = u64;
 
+/// Ratios stay strictly between 0 and 1 (what saved layouts accept).
+const MIN_RATIO: f32 = 0.001;
+
 /// Direction a split divides: `X` puts children side by side, `Y` stacks them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Axis {
@@ -400,7 +403,7 @@ impl Node {
     fn set_ratio(&mut self, path: &[bool], value: f32) -> bool {
         match (self, path.split_first()) {
             (Node::Split { ratio, .. }, None) => {
-                *ratio = value.clamp(0.0, 1.0);
+                *ratio = value.clamp(MIN_RATIO, 1.0 - MIN_RATIO);
                 true
             }
             (Node::Split { a, b, .. }, Some((&second, rest))) => {
@@ -541,11 +544,11 @@ impl Node {
         // Growing towards the second child moves the border forward.
         let signed = if in_a { delta } else { -delta };
         let old = Self::split_at(*axis, *ratio, rect, m);
-        *ratio = (*ratio + signed).clamp(0.0, 1.0);
+        *ratio = (*ratio + signed).clamp(MIN_RATIO, 1.0 - MIN_RATIO);
         // Snap so a step always moves at least one cell (or hits the limit).
         let new = Self::split_at(*axis, *ratio, rect, m);
         if new == old {
-            *ratio = (old as f32 + signed.signum() * m.cell(*axis) as f32) / avail;
+            *ratio = ((old as f32 + signed.signum() * m.cell(*axis) as f32) / avail).clamp(MIN_RATIO, 1.0 - MIN_RATIO);
         }
         true
     }
@@ -1036,6 +1039,12 @@ mod tests {
         assert_eq!(t.layout(AREA, M).rect(1).unwrap().w, 200);
         assert!(t.drag_divider(&d, -50, M));
         assert_eq!(t.layout(AREA, M).rect(1).unwrap().w, 20);
+        // Dragged past either end, the ratio stays inside (0, 1) so the saved layout loads.
+        for pos in [-5000, 5000] {
+            assert!(t.drag_divider(&d, pos, M));
+            let Node::Split { ratio, .. } = t.root else { panic!() };
+            assert!(ratio > 0.0 && ratio < 1.0, "{ratio}");
+        }
     }
 
     #[test]

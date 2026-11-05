@@ -42,18 +42,49 @@ pub fn resolve(allowed: &[String], name: &str) -> Result<PathBuf, String> {
         .ok_or_else(|| format!("{name}: not found in PATH"))
 }
 
-fn build(program: &Path, cmd: &Command, cwd: &Path) -> std::process::Command {
+fn build(program: &Path, cmd: &Command, cwd: &Path) -> Result<std::process::Command, String> {
+    if let Some((k, _)) = cmd.env.iter().find(|(k, _)| !settable(k)) {
+        return Err(format!("{}: plugins may not set the environment variable {k}", cmd.argv[0]));
+    }
     let mut c = std::process::Command::new(program);
     c.arg0(&cmd.argv[0]).args(&cmd.argv[1..]).current_dir(cwd).process_group(0);
+    c.env_clear();
+    c.envs(std::env::vars_os().filter(|(k, _)| k.to_str().is_some_and(inherited)));
     c.envs(cmd.env.iter().map(|(k, v)| (k, v)));
     c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    c
+    Ok(c)
+}
+
+/// Variables a child gets from the terminal's environment; everything else
+/// (tokens, agent sockets, loader settings) stays with the terminal.
+fn inherited(name: &str) -> bool {
+    matches!(name, "PATH" | "HOME" | "USER" | "LOGNAME" | "LANG" | "LANGUAGE" | "TERM" | "TZ" | "TMPDIR")
+        || name.starts_with("LC_")
+}
+
+/// Variables a plugin may set: locale and output formatting, or its own
+/// `PROTEUS_*` names. Others can make an allowed program run other code
+/// (`LD_PRELOAD`, `GIT_SSH_COMMAND`, `PATH`, `BASH_ENV`, ...).
+pub fn settable(name: &str) -> bool {
+    let own = name
+        .strip_prefix("PROTEUS_")
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_'));
+    own || name.starts_with("LC_")
+        || matches!(
+            name,
+            "LANG" | "LANGUAGE" | "TZ" | "NO_COLOR" | "CLICOLOR" | "CLICOLOR_FORCE" | "COLUMNS" | "LINES" | "TERM"
+        )
 }
 
 fn kill_group(child: &mut Child) {
-    let pid = rustix::process::Pid::from_raw(child.id() as i32);
-    if let Some(pid) = pid {
-        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+    use rustix::process::{WaitId, WaitIdOptions};
+    if let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32) {
+        // The group id is the leader's pid, which stays ours only until the
+        // leader is reaped; after that it may belong to another process.
+        let options = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG;
+        if rustix::process::waitid(WaitId::Pid(pid), options).is_ok() {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        }
     }
     let _ = child.kill();
 }
@@ -99,7 +130,7 @@ pub fn run(
     stop: &AtomicBool,
 ) -> Result<Output, String> {
     let name = &cmd.argv[0];
-    let mut child = build(program, cmd, cwd).spawn().map_err(|e| format!("{name}: {e}"))?;
+    let mut child = build(program, cmd, cwd)?.spawn().map_err(|e| format!("{name}: {e}"))?;
     let io_stop = Arc::new(AtomicBool::new(false));
     let setup = (|| {
         let mut stdin = InputWriter::new(child.stdin.take().expect("piped"))?;
@@ -191,7 +222,7 @@ impl Processes {
             return Err(format!("at most {MAX_PROCESSES} processes at a time"));
         }
         let name = &cmd.argv[0];
-        let mut child = build(program, cmd, cwd).spawn().map_err(|e| format!("{name}: {e}"))?;
+        let mut child = build(program, cmd, cwd)?.spawn().map_err(|e| format!("{name}: {e}"))?;
         self.next = self.next.wrapping_add(1).max(1);
         let id = self.next;
         let stdin = match InputWriter::new(child.stdin.take().expect("piped")) {
@@ -350,5 +381,30 @@ mod tests {
         let o = run(&sh, &slow, Path::new("/"), vec![], Duration::from_millis(100), &stop).unwrap();
         assert_eq!(o.exit_code, None);
         assert!(t.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn children_get_a_small_environment_and_plugins_cannot_set_loader_variables() {
+        let allowed = vec!["sh".to_string()];
+        let sh = resolve(&allowed, "sh").unwrap();
+        let stop = AtomicBool::new(false);
+        let env =
+            |env: Vec<(String, String)>| Command { argv: vec!["sh".into(), "-c".into(), "env".into()], cwd: None, env };
+        let o =
+            run(&sh, &env(vec![("PROTEUS_MODE".into(), "x".into())]), Path::new("/"), vec![], DEFAULT_TIMEOUT, &stop)
+                .unwrap();
+        let out = String::from_utf8(o.stdout).unwrap();
+        assert!(out.lines().any(|l| l == "PROTEUS_MODE=x"));
+        for line in out.lines() {
+            let name = line.split('=').next().unwrap();
+            assert!(
+                inherited(name) || name == "PROTEUS_MODE" || name == "PWD" || name == "SHLVL" || name == "_",
+                "{line}"
+            );
+        }
+        for bad in ["LD_PRELOAD", "GIT_SSH_COMMAND", "PATH", "BASH_ENV", "HOME", "proteus_x", "PROTEUS_"] {
+            let e = run(&sh, &env(vec![(bad.into(), "x".into())]), Path::new("/"), vec![], DEFAULT_TIMEOUT, &stop);
+            assert!(e.unwrap_err().contains("may not set"), "{bad}");
+        }
     }
 }

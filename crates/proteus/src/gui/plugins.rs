@@ -464,6 +464,9 @@ impl App {
                 let _ = tx.send(Msg::Plugin(k, m));
             }
         });
+        if let Err(e) = cache.claim(&entry.id, &entry.source) {
+            return self.toast(format!("plugin {}: {e}", entry.name), true, None);
+        }
         let spec = Spec {
             config: entry.source.config.clone(),
             key,
@@ -1474,7 +1477,13 @@ impl App {
             && self.mods.ctrl
             && let Some(uri) = uri
         {
-            self.xdg_open(&uri, None);
+            // A plugin chose the link: only web and mail links, not other handlers.
+            let lower = uri.to_ascii_lowercase();
+            if ["http://", "https://", "mailto:"].iter().any(|s| lower.starts_with(s)) {
+                self.xdg_open(&uri, None);
+            } else {
+                self.notice(format!("not opening {uri:?}: plugins may only link to http, https and mailto"));
+            }
             return;
         }
         self.w.surface_drag = Some((id, button, (col, row)));

@@ -6,7 +6,7 @@ use super::*;
 /// up, keys answer it instead of going to the application.
 #[derive(Debug)]
 pub(super) enum Prompt {
-    ClipboardRead(PaneId, ClipboardKind, Terminator),
+    ClipboardRead(PaneId, ClipboardKind, Terminator, Instant, String),
     Paste(PaneId, String),
     Notice(String),
     /// Close these panes (something is running in them).
@@ -21,13 +21,21 @@ pub(super) enum Prompt {
     PluginPermissions(Box<proteus_wasm::Resolved>),
 }
 
+/// How long after the clipboard question appears keys are ignored.
+const PROMPT_GRACE: Duration = Duration::from_millis(500);
+
 impl App {
     pub(super) fn clipboard_load(&mut self, id: PaneId, kind: ClipboardKind, terminator: Terminator) {
         if self.cfg.osc52_read == ClipboardRead::Allow || self.osc52_always {
             self.read_clipboard(kind, ClipTarget::Osc52(id, kind, terminator));
         } else if !self.w.prompts.iter().any(|p| matches!(p, Prompt::ClipboardRead(..))) {
             // One question at a time; repeated queries while it is up are dropped.
-            self.w.prompts.push_back(Prompt::ClipboardRead(id, kind, terminator));
+            let title: String = self
+                .panes
+                .get(&id)
+                .map(|p| p.title().chars().filter(|c| !c.is_control()).take(60).collect())
+                .unwrap_or_default();
+            self.w.prompts.push_back(Prompt::ClipboardRead(id, kind, terminator, Instant::now(), title));
             self.w.dirty = true;
         }
     }
@@ -38,15 +46,20 @@ impl App {
         let yes = matches!(key, Key::Char('y' | 'Y'));
         let no = matches!(key, Key::Char('n' | 'N') | Key::Escape);
         match p {
-            Prompt::ClipboardRead(id, kind, terminator) => match key {
-                Key::Char('a' | 'A') => {
+            Prompt::ClipboardRead(id, kind, terminator, shown, title) => match key {
+                // Keys typed just before it appeared are not answers.
+                _ if shown.elapsed() < PROMPT_GRACE => {
+                    self.w.prompts.push_front(Prompt::ClipboardRead(id, kind, terminator, shown, title))
+                }
+                // Shift+A: lowercase `a` is too easily typed by accident.
+                Key::Char('A') => {
                     self.osc52_always = true;
                     self.read_clipboard(kind, ClipTarget::Osc52(id, kind, terminator));
                 }
                 _ if yes => self.read_clipboard(kind, ClipTarget::Osc52(id, kind, terminator)),
                 Key::Enter => {}
                 _ if no => {}
-                _ => self.w.prompts.push_front(Prompt::ClipboardRead(id, kind, terminator)),
+                _ => self.w.prompts.push_front(Prompt::ClipboardRead(id, kind, terminator, shown, title)),
             },
             Prompt::Paste(id, text) => match key {
                 Key::Enter => self.paste_now(id, &text),
@@ -104,11 +117,11 @@ pub(super) fn needs_paste_confirmation(text: &str, mode: TermMode) -> bool {
 impl Prompt {
     pub(super) fn overlay(&self, catalog: &crate::i18n::Catalog) -> Overlay {
         match self {
-            Prompt::ClipboardRead(_, kind, _) => {
+            Prompt::ClipboardRead(_, kind, _, _, pane) => {
                 let which =
                     if matches!(kind, ClipboardKind::Primary) { "ui-primary-selection" } else { "ui-clipboard" };
                 Overlay {
-                    title: catalog.t("prompt-read-clipboard", &[("which", &catalog.t(which, &[]))]),
+                    title: catalog.t("prompt-read-clipboard", &[("which", &catalog.t(which, &[])), ("pane", pane)]),
                     detail: None,
                     keys: catalog.t("prompt-clipboard-keys", &[]),
                 }
@@ -136,7 +149,18 @@ impl Prompt {
                         ("panes", &spec.pane_count().to_string()),
                     ],
                 ),
-                detail: None,
+                detail: {
+                    let commands = spec.commands();
+                    (!commands.is_empty()).then(|| {
+                        let list: String = commands
+                            .join("; ")
+                            .chars()
+                            .map(|c| if c.is_control() { '\u{fffd}' } else { c })
+                            .take(300)
+                            .collect();
+                        catalog.t("prompt-restore-commands", &[("commands", &list)])
+                    })
+                },
                 keys: catalog.t("prompt-restore-keys", &[]),
             },
             Prompt::Close(_, msg) | Prompt::Quit(msg) => {

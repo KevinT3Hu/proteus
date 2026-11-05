@@ -102,6 +102,14 @@ struct CachedRow {
 }
 
 #[derive(Clone, Copy)]
+enum Upload {
+    /// The glyph's atlas entry (None: nothing to draw).
+    Done(Option<AtlasGlyph>),
+    /// No room in this frame.
+    NoRoom,
+}
+
+#[derive(Clone, Copy)]
 struct AtlasGlyph {
     color: bool,
     uv: [f32; 4],
@@ -131,7 +139,7 @@ pub struct PaneFrame<'a> {
     pub floating: bool,
     /// Drawn under the grid: floating frames, the block gutter.
     pub backdrop: Vec<([f32; 4], Rgb)>,
-    /// Floating panes: frame text, drawn over the grid.
+    /// Text over the grid: the pinned command, a floating pane's frame title.
     pub labels: Vec<Label>,
     /// What each row shows (see [`Rows`]).
     pub rows: Rows,
@@ -249,6 +257,9 @@ pub struct Renderer {
     samplers: [wgpu::Sampler; 2],
     /// Changes whenever atlas positions of cached glyphs become invalid.
     glyph_epoch: u64,
+    /// Times the (mask, color) atlas was started over in this frame, and in the one before.
+    atlas_resets: [u32; 2],
+    prev_atlas_resets: [u32; 2],
     /// Instances of grid rows from earlier frames, by (terminal, viewport row).
     row_cache: HashMap<(usize, usize), CachedRow>,
     row_hasher: foldhash::fast::RandomState,
@@ -468,6 +479,8 @@ impl Renderer {
             atlas_layout: layout,
             samplers,
             glyph_epoch: 0,
+            atlas_resets: [0; 2],
+            prev_atlas_resets: [0; 2],
             row_cache: HashMap::default(),
             row_hasher: Default::default(),
             frame_no: 0,
@@ -571,20 +584,38 @@ impl Renderer {
         if let Some(&a) = self.glyphs.get(&g) {
             return a;
         }
-        let entry = self.upload_glyph(fonts, g);
-        self.glyphs.insert(g, entry);
-        entry
+        match self.upload_glyph(fonts, g) {
+            Upload::Done(entry) => {
+                self.glyphs.insert(g, entry);
+                entry
+            }
+            // Not cached: it gets another chance once the atlas has room.
+            Upload::NoRoom => None,
+        }
     }
 
-    fn upload_glyph(&mut self, fonts: &mut Fonts, g: GlyphRef) -> Option<AtlasGlyph> {
-        let r = fonts.rasterize(g)?;
+    fn upload_glyph(&mut self, fonts: &mut Fonts, g: GlyphRef) -> Upload {
+        let Some(r) = fonts.rasterize(g) else { return Upload::Done(None) };
+        // Never fits, even in the largest atlas: do not evict the others for it.
+        if r.width + 1 > self.max_atlas || r.height + 1 > self.max_atlas {
+            return Upload::Done(None);
+        }
         let shelves = if r.color { &mut self.color_shelves } else { &mut self.mask_shelves };
         let (x, y) = match shelves.alloc(r.width, r.height) {
             Some(p) => p,
             None => {
+                // This frame needs more glyphs than the largest atlas holds:
+                // starting over again (in this frame or right after the last
+                // one did) would only evict the glyphs on screen, every frame.
+                let i = r.color as usize;
+                if shelves.size >= self.max_atlas && (self.atlas_resets[i] > 0 || self.prev_atlas_resets[i] > 0) {
+                    return Upload::NoRoom;
+                }
+                self.atlas_resets[i] += 1;
                 self.atlas_full(r.color);
                 let shelves = if r.color { &mut self.color_shelves } else { &mut self.mask_shelves };
-                shelves.alloc(r.width, r.height)?
+                let Some(p) = shelves.alloc(r.width, r.height) else { return Upload::NoRoom };
+                p
             }
         };
         let (tex, bpp) = if r.color { (&self.color, 4) } else { (&self.mask, 1) };
@@ -600,14 +631,14 @@ impl Renderer {
             wgpu::Extent3d { width: r.width, height: r.height, depth_or_array_layers: 1 },
         );
         let a = tex.width() as f32;
-        Some(AtlasGlyph {
+        Upload::Done(Some(AtlasGlyph {
             color: r.color,
             uv: [x as f32 / a, y as f32 / a, (x + r.width) as f32 / a, (y + r.height) as f32 / a],
             left: r.left,
             top: r.top,
             w: r.width,
             h: r.height,
-        })
+        }))
     }
 
     /// Render one frame. Returns false if the surface was not available
@@ -688,6 +719,7 @@ impl Renderer {
 
     /// Build instances and record the render pass into `view`.
     fn encode(&mut self, fonts: &mut Fonts, info: &FrameInfo, view: &wgpu::TextureView) -> wgpu::CommandBuffer {
+        self.prev_atlas_resets = std::mem::take(&mut self.atlas_resets);
         let m = fonts.metrics();
         let bg_default = info.theme.bg;
         self.scratch.clear();
@@ -793,6 +825,9 @@ impl Renderer {
                 self.scratch.push(solid(x, y, w, h, rgba(c, 1.0)));
             }
             self.build_pane(fonts, p, info, m);
+        }
+        for p in info.panes.iter().filter(|p| !p.floating) {
+            self.chrome(fonts, &[], &p.labels, m);
         }
         self.chrome(fonts, &info.tiled_rects, &info.tiled_labels, m);
         self.flush_layer();

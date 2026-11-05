@@ -69,10 +69,22 @@ fn text(value: &str) -> bool {
 
 impl Workspace {
     pub fn discover(cwd: &Path) -> Result<Option<Self>, String> {
+        use std::os::unix::fs::MetadataExt;
+        let uid = rustix::process::geteuid().as_raw();
         for parent in cwd.ancestors() {
             let path = parent.join(FILE);
             match std::fs::symlink_metadata(&path) {
-                Ok(_) => return Self::load(&path).map(Some),
+                Ok(m) => {
+                    // Tasks run commands: another user's file (say in /tmp),
+                    // or one others can change, defines nothing for us.
+                    let dir = std::fs::metadata(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+                    let others_replace = dir.mode() & 0o002 != 0 && dir.mode() & 0o1000 == 0;
+                    let trusted = (m.uid() == uid || m.uid() == 0) && m.mode() & 0o002 == 0 && !others_replace;
+                    // `load` reports symlinks (which it never follows) as errors.
+                    if trusted || m.file_type().is_symlink() {
+                        return Self::load(&path).map(Some);
+                    }
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(format!("{}: {e}", path.display())),
             }
@@ -227,6 +239,12 @@ mod tests {
         }
         std::fs::write(&path, "x".repeat(MAX_FILE as usize + 1)).unwrap();
         assert!(Workspace::load(&path).unwrap_err().contains("exceeds 256 KiB"));
+        std::fs::remove_file(&path).unwrap();
+        // A file others may write defines no tasks.
+        std::fs::write(&path, "presets = ['node']").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(Workspace::discover(&root.join("src")).unwrap().is_none());
         std::fs::remove_file(&path).unwrap();
         std::os::unix::fs::symlink(root.join("package.json"), &path).unwrap();
         assert!(Workspace::discover(&root.join("src")).is_err());

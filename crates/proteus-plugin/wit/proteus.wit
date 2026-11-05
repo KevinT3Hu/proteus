@@ -126,7 +126,10 @@ interface types {
         argv: list<string>,
         /// Default: the plugin's data directory.
         cwd: option<string>,
-        /// Added to the environment (which is the terminal's otherwise).
+        /// Added to the environment. The child gets only PATH, HOME, USER,
+        /// LOGNAME, LANG, LANGUAGE, LC_*, TERM, TZ and TMPDIR from the
+        /// terminal. A plugin may set LANG, LANGUAGE, LC_*, TZ, TERM,
+        /// NO_COLOR, CLICOLOR, CLICOLOR_FORCE, COLUMNS, LINES and PROTEUS_*.
         env: list<tuple<string, string>>,
     }
 
@@ -465,8 +468,9 @@ interface host {
     unwatch: func(id: watch-id);
     /// Move to the desktop trash (needs `rw`).
     trash: func(path: string) -> result<_, string>;
-    /// Open with the desktop's default application: a path, or an
-    /// `http(s)` / `mailto` URL.
+    /// Open with the desktop's default application (permission `ui`): a
+    /// path under an `fs` grant (not the data directory), an `http(s)` URL
+    /// to a host `network` allows, or a `mailto` URL.
     open: func(path-or-url: string) -> result<_, string>;
     /// `inode/directory`, `text/x-rust`, `image/png`, ... from the name
     /// and the first bytes.

@@ -2,7 +2,7 @@
 //! Nonblocking sockets keep cancellation independent of a stalled peer, even
 //! during CONNECT tunnelling and TLS handshakes. DNS uses ureq's resolve timeout.
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
+use std::net::{IpAddr, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -13,6 +13,31 @@ const POLL: Duration = Duration::from_millis(5);
 pub(super) struct StreamConnector {
     pub cancel: Arc<AtomicBool>,
     pub idle: Duration,
+    /// The URL names `localhost` or an IP address itself.
+    pub allow_private: bool,
+}
+
+/// Loopback, private, link-local, shared and unspecified addresses.
+pub(super) fn local_address(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || (a == 100 && (64..128).contains(&b))
+                || a == 0
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return local_address(IpAddr::V4(v4));
+            }
+            let first = v6.segments()[0];
+            v6.is_loopback() || v6.is_unspecified() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
+        }
+    }
 }
 
 impl StreamConnector {
@@ -38,8 +63,17 @@ impl<In: Transport> Connector<In> for StreamConnector {
         }
         let end = self.end(details.timeout);
         let mut last = None;
+        // Through a proxy, `addrs` are the proxy's, which the user chose.
+        let filter = !self.allow_private && details.config.proxy().is_none();
         for addr in &details.addrs {
             self.check(end)?;
+            if filter && local_address(addr.ip()) {
+                last = Some(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("{} resolves to the local or private address {}", details.uri, addr.ip()),
+                ));
+                continue;
+            }
             use rustix::net::{AddressFamily, SocketFlags, SocketType};
             let family = if addr.is_ipv4() { AddressFamily::INET } else { AddressFamily::INET6 };
             let fd = rustix::net::socket_with(

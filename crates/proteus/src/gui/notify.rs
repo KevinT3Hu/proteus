@@ -83,21 +83,22 @@ fn worker(rx: mpsc::Receiver<Req>, events: Sender<Msg>) {
             std::thread::Builder::new().name("notify-signals".into()).spawn(move || listen(&conn, &shared, &events));
     }
     let mut warned = false;
+    // Servers with `body-markup` render tags in the body; the text comes
+    // from programs' output, so it is escaped for them.
+    let markup = conn
+        .call_method(Some(DEST), PATH, Some(DEST), "GetCapabilities", &())
+        .and_then(|m| m.body().deserialize::<Vec<String>>())
+        .is_ok_and(|caps| caps.iter().any(|c| c == "body-markup"));
     for req in rx {
+        let summary = limit(&req.summary, 256);
+        let body = limit(&req.body, 2048);
+        let body = if markup { escape_markup(&body) } else { body };
         let mut hints: HashMap<&str, Value> = HashMap::new();
         hints.insert("desktop-entry", Value::from(super::APP_ID));
         hints.insert("urgency", Value::U8(1));
         let actions = vec!["default", "Show"];
-        let body = (
-            super::APP_NAME,
-            0u32,
-            "utilities-terminal",
-            req.summary.as_str(),
-            req.body.as_str(),
-            actions,
-            hints,
-            -1i32,
-        );
+        let body =
+            (super::APP_NAME, 0u32, "utilities-terminal", summary.as_str(), body.as_str(), actions, hints, -1i32);
         match conn
             .call_method(Some(DEST), PATH, Some(DEST), "Notify", &body)
             .and_then(|m| m.body().deserialize::<u32>())
@@ -114,6 +115,14 @@ fn worker(rx: mpsc::Receiver<Req>, events: Sender<Msg>) {
             Err(_) => {}
         }
     }
+}
+
+fn limit(s: &str, max_chars: usize) -> String {
+    s.chars().filter(|c| !c.is_control() || *c == '\n').take(max_chars).collect()
+}
+
+fn escape_markup(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
 fn listen(conn: &Connection, shared: &Mutex<Shared>, events: &Sender<Msg>) {

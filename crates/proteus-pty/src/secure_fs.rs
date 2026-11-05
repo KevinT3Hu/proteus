@@ -2,6 +2,7 @@
 use rustix::fs::{Mode, OFlags, mkdirat, open, openat};
 use std::fs::File;
 use std::io;
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Component, Path};
 
 /// Existing ancestors must not be replaceable by other users. Sticky shared
@@ -49,52 +50,117 @@ fn private_group_of(uid: u32, passwd: &str, group: &str) -> Option<u32> {
     (entry[0] == name && alone && matching.next().is_none()).then_some(gid)
 }
 
+/// Symlinked ancestors followed before giving up.
+const MAX_LINKS: usize = 8;
+
 fn directory(path: &Path, migrate: bool, private_final: bool) -> io::Result<File> {
     if !path.is_absolute() {
         return Err(io::ErrorKind::InvalidInput.into());
     }
-    let mut fd = open("/", OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty())?;
-    let parts: Vec<_> = path.components().filter(|c| !matches!(c, Component::RootDir)).collect();
-    for (i, part) in parts.iter().enumerate() {
-        let Component::Normal(name) = part else {
+    let mut path = path.to_path_buf();
+    let mut links = 0;
+    'walk: loop {
+        let mut fd = open("/", OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty())?;
+        let mut walked = std::path::PathBuf::from("/");
+        let parts: Vec<_> = path.components().filter(|c| !matches!(c, Component::RootDir)).collect();
+        if parts.is_empty() {
             return Err(io::ErrorKind::InvalidInput.into());
-        };
-        match mkdirat(&fd, *name, Mode::from_raw_mode(0o700)) {
-            Ok(()) => {
-                if migrate || !private_final {
-                    rustix::fs::fsync(&fd)?;
+        }
+        for (i, part) in parts.iter().enumerate() {
+            let Component::Normal(name) = part else {
+                return Err(io::ErrorKind::InvalidInput.into());
+            };
+            let final_dir = i + 1 == parts.len();
+            // An ancestor may be a symlink (a home directory or ~/.local on
+            // another disk) if only root or the user could have made it: it
+            // sits in a directory checked below, and must be owned by them.
+            if !final_dir
+                && let Ok(st) = rustix::fs::statat(&fd, *name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+                && rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::Symlink
+            {
+                let uid = rustix::process::geteuid().as_raw();
+                links += 1;
+                if links > MAX_LINKS || (st.st_uid != 0 && st.st_uid != uid) {
+                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, "untrusted application directory"));
                 }
+                let target = rustix::fs::readlinkat(&fd, *name, Vec::new())?;
+                let target = std::path::PathBuf::from(std::ffi::OsString::from_vec(target.into_bytes()));
+                let mut next = walked.join(target);
+                for rest in &parts[i + 1..] {
+                    next.push(rest);
+                }
+                path = lexical(&next).ok_or(io::ErrorKind::InvalidInput)?;
+                continue 'walk;
             }
-            Err(rustix::io::Errno::EXIST) => {}
-            Err(e) => return Err(e.into()),
+            match mkdirat(&fd, *name, Mode::from_raw_mode(0o700)) {
+                Ok(()) => {
+                    if migrate || !private_final {
+                        rustix::fs::fsync(&fd)?;
+                    }
+                }
+                Err(rustix::io::Errno::EXIST) => {}
+                Err(e) => return Err(e.into()),
+            }
+            fd = openat(
+                &fd,
+                *name,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?;
+            walked.push(name);
+            let m = rustix::fs::fstat(&fd)?;
+            if final_dir && migrate && m.st_uid == rustix::process::geteuid().as_raw() {
+                rustix::fs::fchmod(&fd, Mode::from_raw_mode(0o700))?;
+            }
+            let m = rustix::fs::fstat(&fd)?;
+            let uid = rustix::process::geteuid().as_raw();
+            let group_ok = |bits: u32| m.st_mode & bits == 0 || (m.st_uid == uid && is_private_group(m.st_gid));
+            let private = m.st_uid == uid && m.st_mode & 0o007 == 0 && group_ok(0o070);
+            let safe_ancestor = (m.st_uid == 0 || m.st_uid == uid)
+                && ((m.st_mode & 0o002 == 0 && group_ok(0o020)) || m.st_mode & 0o1000 != 0);
+            if (final_dir && private_final && !private) || ((!final_dir || !private_final) && !safe_ancestor) {
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, "untrusted application directory"));
+            }
         }
-        fd =
-            openat(&fd, *name, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty())?;
-        let m = rustix::fs::fstat(&fd)?;
-        let final_dir = i + 1 == parts.len();
-        if final_dir && migrate && m.st_uid == rustix::process::geteuid().as_raw() {
-            rustix::fs::fchmod(&fd, Mode::from_raw_mode(0o700))?;
-        }
-        let m = rustix::fs::fstat(&fd)?;
-        let uid = rustix::process::geteuid().as_raw();
-        let group_ok = |bits: u32| m.st_mode & bits == 0 || (m.st_uid == uid && is_private_group(m.st_gid));
-        let private = m.st_uid == uid && m.st_mode & 0o007 == 0 && group_ok(0o070);
-        let safe_ancestor = (m.st_uid == 0 || m.st_uid == uid)
-            && ((m.st_mode & 0o002 == 0 && group_ok(0o020)) || m.st_mode & 0o1000 != 0);
-        if (final_dir && private_final && !private) || ((!final_dir || !private_final) && !safe_ancestor) {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "untrusted application directory"));
+        return Ok(fd.into());
+    }
+}
+
+/// `p` with `.` and `..` resolved without touching the file system.
+fn lexical(p: &Path) -> Option<std::path::PathBuf> {
+    let mut out = std::path::PathBuf::from("/");
+    for c in p.components() {
+        match c {
+            Component::RootDir | Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Normal(n) => out.push(n),
+            Component::Prefix(_) => return None,
         }
     }
-    if parts.is_empty() {
-        return Err(io::ErrorKind::InvalidInput.into());
-    }
-    Ok(fd.into())
+    Some(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn symlinked_ancestors_are_followed_but_not_the_final_directory() {
+        let root = std::env::temp_dir().join(format!("proteus-secure-fs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("disk/share")).unwrap();
+        std::os::unix::fs::symlink("disk", root.join("local")).unwrap();
+        std::os::unix::fs::symlink(root.join("disk/share"), root.join("abs")).unwrap();
+        state_dir(&root.join("local/share/proteus")).unwrap();
+        assert!(root.join("disk/share/proteus").is_dir());
+        state_dir(&root.join("abs/state")).unwrap();
+        assert!(root.join("disk/share/state").is_dir());
+        std::os::unix::fs::symlink("disk/share/state", root.join("final")).unwrap();
+        assert!(state_dir(&root.join("final")).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
     #[test]
     fn private_groups_are_named_after_the_user_and_have_no_other_members() {
         let passwd =

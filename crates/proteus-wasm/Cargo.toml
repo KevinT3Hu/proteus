@@ -19,6 +19,7 @@ zbus.workspace = true
 rustix.workspace = true
 proteus-pty.workspace = true
 image.workspace = true
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

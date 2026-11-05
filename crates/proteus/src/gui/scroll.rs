@@ -206,7 +206,7 @@ impl App {
 
     /// Move the cursor to `to`, scrolling it into view and extending the
     /// keyboard selection.
-    fn copy_goto(&mut self, to: Point) {
+    pub(super) fn copy_goto(&mut self, to: Point) {
         let Some(c) = self.w.copy.as_mut() else {
             return;
         };
