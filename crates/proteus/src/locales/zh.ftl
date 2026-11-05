@@ -361,6 +361,7 @@ badge-export-scrollback = 导出回滚记录
 ui-export-scrollback = 导出回滚记录
 hint-export-scrollback = 目标路径；不会覆盖已有文件
 notice-scrollback-exported = 已导出回滚记录
+notice-paste-busy = 未粘贴：其他剪贴板传输仍在进行
 action-scrollback-export = 导出回滚记录
 
 ui-reset-renderer = 重置渲染器

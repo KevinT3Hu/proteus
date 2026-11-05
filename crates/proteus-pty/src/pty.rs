@@ -285,10 +285,20 @@ impl Pty {
         self.child.as_mut().expect("owned until drop").wait()
     }
 
-    /// Send SIGHUP to the session, as closing a terminal does.
+    /// Send SIGHUP to the session, as closing a terminal does: the shell's
+    /// process group and the foreground job, which the kernel would only
+    /// reach once every copy of the master is closed.
     pub fn hangup(&self) {
-        if let Some(pid) = Pid::from_raw(self.child_pid()) {
-            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::HUP);
+        use rustix::process::{Signal, kill_process_group};
+        let shell = Pid::from_raw(self.child_pid());
+        if let Some(pid) = shell {
+            let _ = kill_process_group(pid, Signal::HUP);
+        }
+        if let Some(fg) = self.foreground_pgrp().and_then(Pid::from_raw)
+            && Some(fg) != shell
+        {
+            let _ = kill_process_group(fg, Signal::HUP);
+            let _ = kill_process_group(fg, Signal::CONT);
         }
     }
 }

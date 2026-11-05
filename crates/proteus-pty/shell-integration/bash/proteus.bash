@@ -52,8 +52,10 @@ if [[ "$-" == *i* && -z "$__proteus_loaded" && "${BASH_VERSINFO[0]:-0}${BASH_VER
             builtin printf '\e]133;D;%s\a' "$ret"
             __proteus_executing=""
         fi
+        __proteus_urlencode "$HOSTNAME"
+        local host="$__proteus_url"
         __proteus_urlencode "$PWD"
-        builtin printf '\e]7;file://%s%s\a' "$HOSTNAME" "$__proteus_url"
+        builtin printf '\e]7;file://%s%s\a' "$host" "$__proteus_url"
         return "$ret"
     }
 
@@ -68,8 +70,14 @@ if [[ "$-" == *i* && -z "$__proteus_loaded" && "${BASH_VERSINFO[0]:-0}${BASH_VER
         if [[ "$PS1" != *'133;A'* ]]; then
             PS1='\[\e]133;A\a\]'"$PS1"'\[\e]133;B\a\]'
         fi
-        if [[ "$PS0" != *'133;C'* ]]; then
-            PS0="$__proteus_ps0$PS0"
+        # The PS0 mark relies on parameter expansion in prompts (promptvars);
+        # without it the text would be printed literally before each command.
+        if builtin shopt -q promptvars; then
+            if [[ "$PS0" != *'133;C'* ]]; then
+                PS0="$__proteus_ps0$PS0"
+            fi
+        elif [[ "$PS0" == "$__proteus_ps0"* ]]; then
+            PS0="${PS0#"$__proteus_ps0"}"
         fi
     }
 

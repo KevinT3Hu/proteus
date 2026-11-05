@@ -89,7 +89,6 @@ pub fn install(dir: &Path) -> io::Result<()> {
 /// supported shell or its arguments make injection unsafe.
 pub fn inject(spec: &mut CommandSpec, dir: &Path) -> Option<Shell> {
     let shell = detect(spec)?;
-    spec.set_env("PROTEUS_SHELL_INTEGRATION_DIR", dir);
     match shell {
         Shell::Bash => {
             // `--posix` + ENV only works for a plain interactive start; login shells
@@ -123,6 +122,7 @@ pub fn inject(spec: &mut CommandSpec, dir: &Path) -> Option<Shell> {
             spec.set_env("PROTEUS_FISH_XDG_DATA_DIR", ours);
         }
     }
+    spec.set_env("PROTEUS_SHELL_INTEGRATION_DIR", dir);
     Some(shell)
 }
 
@@ -134,7 +134,11 @@ pub fn install_terminfo(dir: &Path) -> Option<PathBuf> {
         return Some(dir.to_path_buf());
     }
     std::fs::create_dir_all(dir).ok()?;
-    let src = dir.join("proteus.terminfo");
+    // A unique name: instances starting together must not share or remove
+    // each other's source file while `tic` reads it.
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let src = dir.join(format!(".proteus.terminfo.{}.{seq}", std::process::id()));
     std::fs::write(&src, crate::TERMINFO_SRC).ok()?;
     let ok = Command::new("tic")
         .arg("-x")

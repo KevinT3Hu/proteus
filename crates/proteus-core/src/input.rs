@@ -583,6 +583,21 @@ pub fn encode_paste(text: &str, mode: TermMode) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn unconfirmed_pastes_cannot_leave_bracketed_paste() {
+        let bracketed = TermMode::BRACKETED_PASTE;
+        for text in ["a\x1b[201~; rm -rf ~\n", "\x1b\x1b[201~x", "x\u{9b}201~y", "\x03\x04\x1a", "ok\r\nnext"] {
+            if paste_needs_confirmation(text, bracketed) {
+                continue;
+            }
+            let out = encode_paste(text, bracketed);
+            let body = &out[6..out.len() - 6];
+            assert!(out.starts_with(b"\x1b[200~") && out.ends_with(b"\x1b[201~"));
+            let body = std::str::from_utf8(body).unwrap();
+            assert!(body.chars().all(|c| !c.is_control() || c == '\t' || c == '\r'), "{text:?}");
+        }
+    }
+
     fn key(k: Key, mods: Mods, text: &str, mode: TermMode, flags: KeyboardFlags) -> Vec<u8> {
         encode_key(&KeyEvent::new(k, mods, text), mode, flags).unwrap_or_default()
     }

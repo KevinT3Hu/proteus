@@ -1009,7 +1009,7 @@ impl Terminal {
 
     pub(super) fn new_sixel(&self, p2: u16) -> Option<Box<SixelDecoder>> {
         let g = &self.config.graphics;
-        g.enabled.then(|| Box::new(SixelDecoder::new(p2, g.max_image_bytes)))
+        g.enabled.then(|| Box::new(SixelDecoder::new(p2, g.max_image_bytes, g.window_budget.clone())))
     }
 
     pub(super) fn sixel_finish(&mut self, dec: SixelDecoder) {

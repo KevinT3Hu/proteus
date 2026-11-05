@@ -2273,7 +2273,7 @@ impl Perform for Terminal {
             _ => None,
         };
         let sixel = match kind {
-            Some(DcsKind::Sixel) => match self.new_sixel(params.iter().nth(1).map_or(0, |p| p[0])) {
+            Some(DcsKind::Sixel) if !ignore => match self.new_sixel(params.iter().nth(1).map_or(0, |p| p[0])) {
                 Some(dec) => Some(dec),
                 None => {
                     self.dcs = None;

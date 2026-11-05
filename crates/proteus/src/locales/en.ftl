@@ -364,6 +364,7 @@ badge-export-scrollback = EXPORT SCROLLBACK
 ui-export-scrollback = export scrollback
 hint-export-scrollback = Destination path; existing files are preserved
 notice-scrollback-exported = Scrollback exported
+notice-paste-busy = Paste skipped: other clipboard transfers are still in progress
 action-scrollback-export = Export scrollback
 
 ui-reset-renderer = reset renderer

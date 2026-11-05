@@ -20,7 +20,7 @@ set -q __proteus_loaded; and exit 0
 set -g __proteus_loaded 1
 
 function __proteus_report_cwd --on-variable PWD
-    printf '\e]7;file://%s%s\a' $hostname (string escape --style=url -- $PWD)
+    printf '\e]7;file://%s%s\a' (string escape --style=url -- $hostname) (string escape --style=url -- $PWD)
 end
 
 function __proteus_preexec --on-event fish_preexec

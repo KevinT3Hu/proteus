@@ -20,8 +20,10 @@ __proteus_urlencode() {
 }
 
 __proteus_report_cwd() {
+    __proteus_urlencode "$HOST"
+    local host=$REPLY
     __proteus_urlencode "$PWD"
-    builtin print -rn -- $'\e]7;file://'"${HOST}${REPLY}"$'\a'
+    builtin print -rn -- $'\e]7;file://'"${host}${REPLY}"$'\a'
 }
 
 __proteus_precmd() {

@@ -8,12 +8,16 @@ use std::time::Duration;
 
 pub const MAX_PENDING_INPUT: usize = 16 << 20;
 const RETRY: Duration = Duration::from_millis(5);
+/// How long `close` keeps trying to deliver queued input to a child that
+/// stopped reading before giving up and releasing the descriptor.
+const DRAIN: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
 struct State {
     queue: VecDeque<Vec<u8>>,
     bytes: usize,
     closing: bool,
+    drain_until: Option<std::time::Instant>,
     cancelled: bool,
     finished: bool,
     error: Option<String>,
@@ -64,7 +68,8 @@ impl InputWriter {
                             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                                 let state = worker.state.lock().unwrap();
-                                if state.cancelled {
+                                if state.cancelled || state.drain_until.is_some_and(|t| std::time::Instant::now() >= t)
+                                {
                                     return Ok(());
                                 }
                                 let _ = worker.wake.wait_timeout(state, RETRY).unwrap();
@@ -106,7 +111,10 @@ impl InputWriter {
     }
     pub fn close(&mut self) {
         self.draining = true;
-        self.shared.state.lock().unwrap().closing = true;
+        let mut s = self.shared.state.lock().unwrap();
+        s.closing = true;
+        s.drain_until = Some(std::time::Instant::now() + DRAIN);
+        drop(s);
         self.shared.wake.notify_all();
     }
     pub fn is_finished(&self) -> bool {

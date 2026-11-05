@@ -81,9 +81,54 @@ pub fn settable(name: &str) -> bool {
         )
 }
 
+/// Parent of every process, from `/proc/*/stat` (field 4, after the
+/// parenthesised command name, which may itself contain spaces or `)`).
+fn parents() -> Vec<(i32, i32)> {
+    let Ok(dir) = std::fs::read_dir("/proc") else { return Vec::new() };
+    dir.filter_map(|e| {
+        let pid: i32 = e.ok()?.file_name().to_str()?.parse().ok()?;
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let ppid = stat.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok()?;
+        Some((pid, ppid))
+    })
+    .collect()
+}
+
+/// Stop, then kill, every descendant of `root`, including ones that left its
+/// process group with `setsid` or `setpgid`. Stopping first keeps them from
+/// forking new children while the tree is walked.
+fn kill_descendants(root: i32) {
+    use rustix::process::{Pid, Signal, kill_process};
+    let mut stopped = std::collections::HashSet::new();
+    for _ in 0..8 {
+        let table = parents();
+        let mut tree = vec![root];
+        let mut i = 0;
+        while i < tree.len() {
+            let p = tree[i];
+            tree.extend(table.iter().filter(|&&(_, pp)| pp == p).map(|&(c, _)| c));
+            i += 1;
+        }
+        let fresh: Vec<i32> = tree.into_iter().skip(1).filter(|p| stopped.insert(*p)).collect();
+        if fresh.is_empty() {
+            break;
+        }
+        for p in fresh.iter().filter_map(|&p| Pid::from_raw(p)) {
+            let _ = kill_process(p, Signal::STOP);
+        }
+    }
+    for p in stopped.into_iter().filter_map(Pid::from_raw) {
+        let _ = kill_process(p, Signal::KILL);
+    }
+}
+
 fn kill_group(child: &mut Child) {
     use rustix::process::{WaitId, WaitIdOptions};
     if let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32) {
+        let alive = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG;
+        if rustix::process::waitid(WaitId::Pid(pid), alive).is_ok() {
+            kill_descendants(pid.as_raw_nonzero().get());
+        }
         // The group id is the leader's pid, which stays ours only until the
         // leader is reaped; after that it may belong to another process.
         let options = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG;
@@ -350,6 +395,25 @@ mod tests {
         .unwrap();
         assert!(out.exit_code.is_none());
         assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn timeout_kills_descendants_that_leave_the_process_group() {
+        let marker = std::env::temp_dir().join(format!("proteus-setsid-{}", std::process::id()));
+        let script = format!("setsid sh -c 'sleep 0.5; touch {}' & wait", marker.display());
+        let cmd = Command { argv: vec!["sh".into(), "-c".into(), script], cwd: None, env: vec![] };
+        let out = run(
+            Path::new("/bin/sh"),
+            &cmd,
+            Path::new("/"),
+            vec![],
+            Duration::from_millis(100),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(out.exit_code.is_none());
+        std::thread::sleep(Duration::from_secs(1));
+        assert!(!marker.exists(), "the setsid child survived");
     }
 
     #[test]

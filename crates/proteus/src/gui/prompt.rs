@@ -104,14 +104,10 @@ impl App {
     }
 }
 
-/// Whether pasting `text` should be confirmed: outside bracketed paste a
-/// newline runs whatever precedes it, and control characters can drive the
-/// application.
+/// Whether pasting `text` should be confirmed. Bracketed paste is exempt
+/// only because [`proteus_core::input::encode_paste`] strips controls there.
 pub(super) fn needs_paste_confirmation(text: &str, mode: TermMode) -> bool {
-    if mode.contains(TermMode::BRACKETED_PASTE) {
-        return false;
-    }
-    text.chars().any(|c| c.is_control() && c != '\t')
+    proteus_core::input::paste_needs_confirmation(text, mode)
 }
 
 impl Prompt {

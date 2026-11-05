@@ -96,12 +96,12 @@ impl ImageBudget {
     pub fn used(&self) -> usize {
         self.used.load(Ordering::Relaxed)
     }
-    fn try_reserve(&self, n: usize) -> bool {
+    pub(crate) fn try_reserve(&self, n: usize) -> bool {
         self.used
             .try_update(Ordering::AcqRel, Ordering::Acquire, |u| u.checked_add(n).filter(|&t| t <= self.limit))
             .is_ok()
     }
-    fn release(&self, n: usize) {
+    pub(crate) fn release(&self, n: usize) {
         let _ = self.used.try_update(Ordering::AcqRel, Ordering::Acquire, |u| Some(u.saturating_sub(n)));
     }
 }

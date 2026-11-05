@@ -60,6 +60,9 @@ impl App {
         static TRANSFERS: std::sync::OnceLock<proteus_pty::budget::Budget> = std::sync::OnceLock::new();
         let budget = TRANSFERS.get_or_init(|| proteus_pty::budget::Budget::new(64 << 20, 4));
         let Some(permit) = budget.try_acquire(16 << 20) else {
+            if matches!(target, ClipTarget::Paste(_)) {
+                self.toast(self.cfg.i18n.t("notice-paste-busy", &[]), true, None);
+            }
             self.clipboard_received(target, String::new());
             return;
         };

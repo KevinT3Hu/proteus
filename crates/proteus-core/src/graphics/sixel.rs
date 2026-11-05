@@ -1,5 +1,10 @@
 //! Streaming Sixel decoder (DCS P1;P2;P3 q ... ST) producing RGBA.
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use super::ImageBudget;
+
 const REGISTERS: usize = 256;
 const MAX_SIDE: usize = 1 << 14;
 const MAX_PARAMS: usize = 8;
@@ -73,10 +78,69 @@ pub(crate) struct SixelDecoder {
     stride: usize,
     rows: usize,
     max_pixels: usize,
+    budget: Option<Arc<ImageBudget>>,
+    /// Bytes of `buf` reserved in `budget`.
+    reserved: usize,
+    band: Band,
     state: State,
     params: Vec<u32>,
     cur: Option<u32>,
     transparent: bool,
+}
+
+/// Spans awaiting rasterisation, after this many the band is flushed early.
+const MAX_SPANS: usize = 1 << 14;
+
+/// The current six-pixel band as non-overlapping colored spans per row.
+/// Programs redraw a band once per color (and attackers repeat full-width
+/// runs); later spans replace earlier ones here in O(log n), so the pixels
+/// are written once per flush instead of once per command.
+#[derive(Debug, Default)]
+struct Band {
+    rows: [BTreeMap<usize, (usize, u32)>; 6],
+    spans: usize,
+}
+
+impl Band {
+    fn insert(&mut self, row: usize, start: usize, end: usize, color: u32) {
+        let map = &mut self.rows[row];
+        let before = map.len();
+        if let Some((&k, &(ke, kc))) = map.range(..start).next_back()
+            && ke > start
+        {
+            map.insert(k, (start, kc));
+            if ke > end {
+                map.insert(end, (ke, kc));
+            }
+        }
+        let inside: Vec<(usize, (usize, u32))> = map.range(start..end).map(|(&k, &v)| (k, v)).collect();
+        for (k, (ke, kc)) in inside {
+            map.remove(&k);
+            if ke > end {
+                map.insert(end, (ke, kc));
+            }
+        }
+        map.insert(start, (end, color));
+        self.spans = self.spans + map.len() - before;
+    }
+
+    fn flush(&mut self, buf: &mut [u32], stride: usize, y: usize) {
+        for (i, map) in self.rows.iter_mut().enumerate() {
+            let row = (y + i) * stride;
+            for (s, (e, c)) in std::mem::take(map) {
+                buf[row + s..row + e].fill(c);
+            }
+        }
+        self.spans = 0;
+    }
+}
+
+impl Drop for SixelDecoder {
+    fn drop(&mut self) {
+        if let Some(b) = &self.budget {
+            b.release(self.reserved);
+        }
+    }
 }
 
 /// A finished sixel image.
@@ -89,7 +153,7 @@ pub(crate) struct Sixel {
 
 impl SixelDecoder {
     /// `p2 == 1` makes pixels that are never drawn transparent.
-    pub fn new(p2: u16, max_bytes: usize) -> Self {
+    pub fn new(p2: u16, max_bytes: usize, budget: Option<Arc<ImageBudget>>) -> Self {
         let mut palette = [rgba(0, 0, 0); REGISTERS];
         for (i, &(r, g, b)) in VT340.iter().enumerate() {
             palette[i] = rgba(pct(r), pct(g), pct(b));
@@ -105,6 +169,9 @@ impl SixelDecoder {
             stride: 0,
             rows: 0,
             max_pixels: max_bytes / 4,
+            budget,
+            reserved: 0,
+            band: Band::default(),
             state: State::Data,
             params: Vec::new(),
             cur: None,
@@ -156,6 +223,7 @@ impl SixelDecoder {
             b'!' => self.state = State::Repeat,
             b'$' => self.x = 0,
             b'-' => {
+                self.flush();
                 self.x = 0;
                 self.y += 6;
             }
@@ -210,6 +278,14 @@ impl SixelDecoder {
     }
 
     fn grow(&mut self, nw: usize, nh: usize) -> bool {
+        let bytes = nw * nh * 4;
+        if let Some(b) = &self.budget {
+            if !b.try_reserve(bytes.saturating_sub(self.reserved)) {
+                return false;
+            }
+            b.release(self.reserved.saturating_sub(bytes));
+            self.reserved = bytes;
+        }
         let mut nb = vec![0u32; nw * nh];
         for y in 0..self.rows {
             nb[y * nw..y * nw + self.stride].copy_from_slice(&self.buf[y * self.stride..(y + 1) * self.stride]);
@@ -230,9 +306,11 @@ impl SixelDecoder {
             let c = self.palette[self.color];
             for i in 0..6 {
                 if bits & (1 << i) != 0 {
-                    let row = (self.y + i) * self.stride;
-                    self.buf[row + self.x..row + self.x + n].fill(c);
+                    self.band.insert(i, self.x, self.x + n, c);
                 }
+            }
+            if self.band.spans >= MAX_SPANS {
+                self.flush();
             }
             let used = 8 - bits.leading_zeros() as usize;
             self.height = self.height.max(self.y + used);
@@ -241,7 +319,12 @@ impl SixelDecoder {
         self.x = (self.x + n).min(MAX_SIDE);
     }
 
-    pub fn finish(self) -> Option<Sixel> {
+    fn flush(&mut self) {
+        self.band.flush(&mut self.buf, self.stride, self.y);
+    }
+
+    pub fn finish(mut self) -> Option<Sixel> {
+        self.flush();
         let (w, h) = (self.width.min(self.stride), self.height.min(self.rows));
         if w == 0 || h == 0 {
             return None;
@@ -263,7 +346,7 @@ mod tests {
     use super::*;
 
     fn decode(p2: u16, data: &str) -> Sixel {
-        let mut d = SixelDecoder::new(p2, 1 << 20);
+        let mut d = SixelDecoder::new(p2, 1 << 20, None);
         for b in data.bytes() {
             d.put(b);
         }
@@ -303,10 +386,51 @@ mod tests {
 
     #[test]
     fn huge_repeat_is_bounded() {
-        let mut d = SixelDecoder::new(1, 4096);
+        let mut d = SixelDecoder::new(1, 4096, None);
         for b in "!99999~".bytes() {
             d.put(b);
         }
         assert!(d.finish().is_none());
+    }
+
+    #[test]
+    fn later_spans_replace_earlier_ones() {
+        let s = decode(1, "#1;2;100;0;0!8~$#2;2;0;100;0!2?!4~$#3;2;0;0;100!3?A");
+        assert_eq!((s.width, s.height), (8, 6));
+        assert_eq!(px(&s, 0, 0), [255, 0, 0, 255]);
+        assert_eq!(px(&s, 2, 0), [0, 255, 0, 255]);
+        assert_eq!(px(&s, 3, 1), [0, 0, 255, 255]);
+        assert_eq!(px(&s, 3, 2), [0, 255, 0, 255]);
+        assert_eq!(px(&s, 6, 0), [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn full_width_overdraw_costs_per_command_not_per_pixel() {
+        let mut d = SixelDecoder::new(1, 64 << 20, None);
+        let start = std::time::Instant::now();
+        for _ in 0..200_000 {
+            for b in "!16383~$".bytes() {
+                d.put(b);
+            }
+        }
+        let s = d.finish().unwrap();
+        assert_eq!((s.width, s.height), (16383, 6));
+        assert!(start.elapsed() < std::time::Duration::from_secs(2), "{:?}", start.elapsed());
+    }
+
+    #[test]
+    fn decode_buffers_are_charged_to_the_window_budget() {
+        let budget = ImageBudget::new(1 << 20);
+        let mut d = SixelDecoder::new(1, 64 << 20, Some(budget.clone()));
+        for b in "!100~".bytes() {
+            d.put(b);
+        }
+        assert!(budget.used() > 0);
+        for b in "!4000~".bytes() {
+            d.put(b);
+        }
+        assert!(budget.used() <= budget.limit());
+        drop(d);
+        assert_eq!(budget.used(), 0);
     }
 }
