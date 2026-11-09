@@ -147,7 +147,7 @@ impl Viewer {
             image::ColorType::Rgba8,
             image::ImageFormat::Png,
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("encode PNG: {e}"))?;
         Ok(out.into_inner())
     }
 }
@@ -303,7 +303,10 @@ impl App {
                 self.set_clipboard_image(png);
                 self.cfg.i18n.t("ui-copied", &[])
             }
-            Err(e) => self.cfg.i18n.t("ui-copy-failed-error", &[("error", &e.to_string())]),
+            Err(e) => {
+                tracing::error!("copying image: {e}");
+                self.cfg.i18n.t("ui-copy-failed-error", &[("error", &e.to_string())])
+            }
         };
         if let Some(v) = self.w.viewer.as_mut() {
             v.status = Some(status);
@@ -318,12 +321,15 @@ impl App {
             Some(dir) => {
                 let path = free_name(&dir, stamp);
                 let r = std::fs::create_dir_all(&dir)
-                    .map_err(|e| e.to_string())
+                    .map_err(|e| format!("{}: {e}", dir.display()))
                     .and_then(|()| v.png())
-                    .and_then(|png| std::fs::write(&path, png).map_err(|e| e.to_string()));
+                    .and_then(|png| std::fs::write(&path, png).map_err(|e| format!("{}: {e}", path.display())));
                 match r {
                     Ok(()) => self.cfg.i18n.t("ui-saved-path", &[("path", &path.display().to_string())]),
-                    Err(e) => self.cfg.i18n.t("ui-save-failed-error", &[("error", &e.to_string())]),
+                    Err(e) => {
+                        tracing::error!("saving image: {e}");
+                        self.cfg.i18n.t("ui-save-failed-error", &[("error", &e.to_string())])
+                    }
                 }
             }
         };

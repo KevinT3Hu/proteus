@@ -186,7 +186,7 @@ impl App {
                     argv = connection.batch_argv(&file.path);
                     batch = Some(file);
                 }
-                Err(e) => return self.notice(e),
+                Err(e) => return self.notice_error(format!("cannot prepare the SFTP transfer: {e}")),
             }
         }
         if let Some(command) = &command {
@@ -196,8 +196,10 @@ impl App {
             argv.pop();
             argv.push(command.into());
         }
+        tracing::debug!(kind = ?connection.kind, argv = %ssh::argv_for_log(&argv), "opening ssh pane");
         match self.split_with(None, None, Some(argv)) {
             Ok(id) => {
+                tracing::info!(pane = id, connection = %connection.label(), "ssh pane opened");
                 if let Some(pane) = self.panes.get_mut(&id) {
                     pane.remote = Some(Remote {
                         connection,
@@ -213,7 +215,7 @@ impl App {
                 }
                 self.update_title();
             }
-            Err(e) => self.notice(e),
+            Err(e) => self.notice_error(format!("{}: {e}", connection.label())),
         }
     }
     pub(super) fn ssh_submit(&mut self, purpose: Purpose, text: String) {
@@ -261,6 +263,11 @@ impl App {
         let Some(remote) = pane.remote.as_ref() else { return self.close_pane(id) };
         let label = remote.connection.label();
         let status = pane.finish();
+        if status == 0 {
+            tracing::info!(pane = id, connection = %label, status, "ssh process ended");
+        } else {
+            tracing::warn!(pane = id, connection = %label, status, "ssh process failed");
+        }
         if let Some(remote) = &mut pane.remote {
             remote.closed = true;
             remote.batch = None;
@@ -300,7 +307,7 @@ impl App {
             if let Some(remote) = self.panes.get_mut(&id).and_then(|p| p.remote.as_mut()) {
                 remote.loading = false;
             }
-            self.notice(e.to_string());
+            self.notice_error(format!("cannot start the remote workspace request: {e}"));
         }
     }
     pub(super) fn ssh_workspace_received(&mut self, id: PaneId, result: Result<Option<Workspace>, String>) {
@@ -328,38 +335,94 @@ impl App {
 
 fn fetch_workspace(destination: &Destination, cwd: &str) -> Result<Option<Workspace>, String> {
     use std::os::unix::process::CommandExt;
+    const FAILED: &str = "Remote workspace read failed; needs Python 3 and noninteractive SSH authentication. Check the remote files and connection.";
+    let command = ssh::workspace_command(cwd);
+    let args = ["-T", "-oBatchMode=yes", "-oConnectTimeout=10", "--", destination.as_str(), &command];
+    tracing::debug!(
+        argv = %ssh::argv_for_log(&std::iter::once("ssh").chain(args).map(Into::into).collect::<Vec<_>>()),
+        "fetching remote workspace"
+    );
     let mut child = Command::new("ssh")
-        .args([
-            "-T",
-            "-oBatchMode=yes",
-            "-oConnectTimeout=10",
-            "--",
-            destination.as_str(),
-            &ssh::workspace_command(cwd),
-        ])
+        .args(args)
         .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("cannot run ssh: {e}"))?;
+    let stderr = child.stderr.take().expect("piped");
+    let stderr = std::thread::Builder::new()
+        .name("ssh-workspace-stderr".into())
+        .spawn(move || super::transfer::read(stderr, 64 * 1024, Duration::from_secs(25)).unwrap_or_default())
+        .ok();
     let result = super::transfer::read(child.stdout.take().expect("piped"), 2 * 1024 * 1024, Duration::from_secs(20));
     // read is deadline bounded; never block the worker on a server that closes
     // stdout but continues running. Kill/reap on every exit path.
-    let status = child.try_wait().map_err(|e| e.to_string());
+    let status = child.try_wait().map_err(|e| format!("ssh: {e}"));
     if !matches!(status, Ok(Some(_)))
         && let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32)
     {
         let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
     }
     let _ = child.wait();
-    let bytes = result.map_err(|e| format!("remote workspace: {e}"))?;
+    let stderr = stderr.and_then(|h| h.join().ok()).unwrap_or_default();
+    let stderr = String::from_utf8_lossy(&stderr);
+    let stderr = stderr.trim();
+    let fail = |what: String| {
+        let mut start = stderr.len().saturating_sub(4096);
+        while !stderr.is_char_boundary(start) {
+            start += 1;
+        }
+        tracing::warn!(
+            destination = destination.as_str(),
+            status = ?status,
+            stderr = &stderr[start..],
+            "remote workspace: {what}"
+        );
+        match last_line(stderr) {
+            Some(line) => format!("{what} ({line})"),
+            None => what,
+        }
+    };
+    let bytes = match result {
+        Ok(bytes) => bytes,
+        Err(e) => return Err(fail(format!("remote workspace: {e}"))),
+    };
     if bytes.is_empty() {
-        return Err("Remote workspace read failed; needs Python 3 and noninteractive SSH authentication. Check the remote files and connection.".into());
+        return Err(fail(FAILED.into()));
     }
-    match status {
-        Ok(Some(status)) if !status.success() => Err("Remote workspace read failed; needs Python 3 and noninteractive SSH authentication. Check the remote files and connection.".into()),
-        Err(e) => Err(e),
-        _ => ssh::parse_workspace(&bytes),
+    match &status {
+        Ok(Some(s)) if !s.success() => Err(fail(FAILED.into())),
+        Err(e) => Err(fail(e.clone())),
+        _ => ssh::parse_workspace(&bytes).inspect_err(|e| {
+            tracing::warn!(destination = destination.as_str(), "remote workspace: {e}");
+        }),
+    }
+}
+
+/// The last nonempty line of `text`, cut to a length fit for a notice.
+fn last_line(text: &str) -> Option<String> {
+    const MAX: usize = 200;
+    let line = text.lines().map(str::trim).rfind(|l| !l.is_empty())?;
+    let mut out: String = line.chars().filter(|c| !c.is_control()).take(MAX).collect();
+    if line.chars().count() > MAX {
+        out.push('…');
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::last_line;
+
+    #[test]
+    fn stderr_summary_is_one_short_line() {
+        assert_eq!(last_line(""), None);
+        assert_eq!(last_line("\n  \n"), None);
+        let stderr = "Warning: Permanently added 'h'\nuser@h: Permission denied (publickey).\n\n";
+        assert_eq!(last_line(stderr).as_deref(), Some("user@h: Permission denied (publickey)."));
+        let long = last_line(&format!("x\u{1b}{}", "y".repeat(500))).unwrap();
+        assert_eq!(long.chars().count(), 201);
+        assert!(long.ends_with('…') && !long.contains('\u{1b}'));
     }
 }

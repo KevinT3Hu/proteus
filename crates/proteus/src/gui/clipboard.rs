@@ -69,7 +69,10 @@ impl App {
         let tx = self.sender.clone();
         let _ = std::thread::Builder::new().name("paste".into()).spawn(move || {
             // Timeout/overflow discards the whole selection, never a partial command.
-            let data = transfer::read(File::from(fd), 16 << 20, Duration::from_secs(3)).unwrap_or_default();
+            let data = transfer::read(File::from(fd), 16 << 20, Duration::from_secs(3)).unwrap_or_else(|e| {
+                tracing::warn!("reading the selection failed, nothing pasted: {e}");
+                Vec::new()
+            });
             let _ = tx.send(Msg::Clipboard(target, String::from_utf8_lossy(&data).into_owned(), permit));
         });
     }
@@ -126,7 +129,9 @@ impl App {
             return;
         };
         let _ = std::thread::Builder::new().name("copy".into()).spawn(move || {
-            let _ = transfer::write(File::from(fd), &data, Duration::from_secs(5));
+            if let Err(e) = transfer::write(File::from(fd), &data, Duration::from_secs(5)) {
+                tracing::debug!(bytes = data.len(), "sending our selection failed: {e}");
+            }
             drop(permit);
         });
     }

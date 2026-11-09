@@ -11,6 +11,7 @@ pub mod files;
 mod limits;
 pub mod manifest;
 pub mod net;
+mod output;
 pub mod process;
 pub mod runtime;
 pub mod secrets;
@@ -18,6 +19,7 @@ pub mod source;
 pub mod storage;
 
 pub use manifest::{FsGrant, Manifest, Permissions};
+pub use output::printable;
 pub use runtime::{Answer, Call, FromPlugin, Handle, Key, Pixels, Reply, Responder, Runtime, Sink, Spec, types};
 pub use source::{Cache, Resolved, Source};
 

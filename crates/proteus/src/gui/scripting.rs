@@ -169,7 +169,7 @@ impl App {
             });
         }
         for m in messages {
-            self.toast(m.text, m.error, None);
+            self.show_toast(m.text, m.error, None);
         }
     }
 
@@ -255,9 +255,21 @@ impl App {
     // --- toasts ----------------------------------------------------------------
 
     /// Show a message in the keyboard window. Repeats of the same message
-    /// within [`REPEAT`] are dropped.
+    /// within [`REPEAT`] are dropped. Errors are logged too.
     pub(super) fn toast(&mut self, text: String, error: bool, timeout: Option<Duration>) {
-        eprintln!("proteus: {text}");
+        let repeat = self.sc.shown.get(&text).is_some_and(|t| t.elapsed() < REPEAT);
+        if repeat {
+            tracing::trace!(error, "toast repeated: {text}");
+        } else if error {
+            tracing::error!("{text}");
+        } else {
+            tracing::debug!("toast: {text}");
+        }
+        self.show_toast(text, error, timeout);
+    }
+
+    /// [`App::toast`] for a message that was already logged in more detail.
+    pub(super) fn show_toast(&mut self, text: String, error: bool, timeout: Option<Duration>) {
         let now = Instant::now();
         self.sc.shown.retain(|_, t| now.duration_since(*t) < REPEAT);
         if self.sc.shown.insert(text.clone(), now).is_some() {
@@ -388,7 +400,10 @@ impl App {
     pub(super) fn watch_config(&mut self) {
         use rustix::fs::inotify;
         let Some(dir) = self.sc.config_path.as_deref().and_then(Path::parent).map(Path::to_path_buf) else { return };
-        let Ok(fd) = inotify::init(inotify::CreateFlags::CLOEXEC | inotify::CreateFlags::NONBLOCK) else { return };
+        let fd = match inotify::init(inotify::CreateFlags::CLOEXEC | inotify::CreateFlags::NONBLOCK) {
+            Ok(fd) => fd,
+            Err(e) => return tracing::warn!(dir = %dir.display(), "config reload disabled: inotify: {e}"),
+        };
         let flags = inotify::WatchFlags::CLOSE_WRITE
             | inotify::WatchFlags::MOVED_TO
             | inotify::WatchFlags::MOVED_FROM
@@ -397,11 +412,16 @@ impl App {
         let dirs = config_dirs(&dir);
         let mut any = false;
         for d in &dirs {
-            any |= inotify::add_watch(&fd, d.as_path(), flags).is_ok();
+            match inotify::add_watch(&fd, d.as_path(), flags) {
+                Ok(_) => any = true,
+                Err(e) => tracing::debug!(dir = %d.display(), "cannot watch config directory: {e}"),
+            }
         }
         if !any {
+            tracing::info!(dir = %dir.display(), "config directory not watched; reload disabled");
             return;
         }
+        tracing::debug!(dir = %dir.display(), dirs = dirs.len(), "watching config for changes");
         let source = Generic::new(fd, Interest::READ, PollMode::Level);
         let _ = self.handle.insert_source(source, move |_, fd, app: &mut App| {
             let relevant = drain_inotify(fd.as_fd());
@@ -431,11 +451,18 @@ impl App {
     /// Load the config again. On an error the running config stays.
     pub(super) fn reload_config(&mut self) {
         let Some(path) = self.sc.config_path.clone() else { return };
+        tracing::info!(path = %path.display(), "reloading config");
         match config::load(&path, false) {
             Err(e) => {
-                self.toast(format!("config error (still using the previous config): {e}"), true, Some(CONFIG_ERROR))
+                tracing::error!(path = %path.display(), "config reload failed, keeping the previous config: {e}");
+                self.show_toast(
+                    format!("config error (still using the previous config): {e}"),
+                    true,
+                    Some(CONFIG_ERROR),
+                )
             }
             Ok(mut l) => {
+                tracing::info!(path = %path.display(), "config reloaded");
                 self.sc.overrides.apply(&mut l.config);
                 self.install_script(l.script);
                 self.apply_config(l.config);

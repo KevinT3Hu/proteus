@@ -260,7 +260,7 @@ impl App {
                     ("key:esc", _) => app.input_key(input::Key::Escape, input::Mods::empty(), ""),
                     ("key:y", _) => app.answer_prompt(input::Key::Char('y')),
                     (_, Some(a)) => app.dispatch(a),
-                    (_, None) => eprintln!("proteus: PROTEUS_ACTIONS: unknown action `{name}`"),
+                    (_, None) => tracing::warn!("PROTEUS_ACTIONS: unknown action `{name}`"),
                 }
             }
         };
@@ -268,7 +268,7 @@ impl App {
             return run(self);
         }
         let Ok(after) = Duration::try_from_secs_f64(after) else {
-            return eprintln!("proteus: PROTEUS_ACTIONS: invalid delay {after}");
+            return tracing::warn!("PROTEUS_ACTIONS: invalid delay {after}");
         };
         let mut run = Some(run);
         let _ = self.handle.insert_source(Timer::from_duration(after), move |_, _, app| {

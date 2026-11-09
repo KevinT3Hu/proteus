@@ -127,7 +127,7 @@ pub(super) fn load_recent() -> Vec<String> {
         read_recent(&file)
     })();
     result.unwrap_or_else(|e| {
-        eprintln!("proteus: loading palette history: {e}");
+        tracing::warn!(path = %path.display(), "loading palette history: {e}");
         Vec::new()
     })
 }
@@ -709,7 +709,7 @@ impl App {
         if let Some(path) = recent_path() {
             match remember_at(&path, &entry) {
                 Ok(recent) => self.recent = recent,
-                Err(e) => eprintln!("proteus: saving palette history: {e}"),
+                Err(e) => tracing::warn!(path = %path.display(), "saving palette history: {e}"),
             }
         }
     }
@@ -735,11 +735,11 @@ impl App {
                         }
                         self.watch_runs();
                     }
-                    Err(e) => self.notice(e),
+                    Err(e) => self.notice_error(e),
                 }
             }
             Item::ProjectFile(path) => self.open_editor_path(&path),
-            Item::ProjectError(error) => self.notice(error),
+            Item::ProjectError(error) => self.notice_error(error),
             Item::Action(a) => {
                 self.remember(label);
                 self.dispatch(a);

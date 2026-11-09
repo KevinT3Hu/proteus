@@ -1858,6 +1858,9 @@ impl Terminal {
             return;
         }
         if !self.config.osc52_write || data.len() > MAX_OSC52 {
+            if data.len() > MAX_OSC52 {
+                tracing::debug!(kind = "osc 52", size = data.len(), max = MAX_OSC52, "dropping oversized string");
+            }
             return;
         }
         if let Ok(bytes) = BASE64.decode(data) {
@@ -1872,6 +1875,11 @@ impl Terminal {
             self.notify_times.pop_front();
         }
         if self.notify_times.len() >= self.config.notify_burst {
+            tracing::debug!(
+                burst = self.config.notify_burst,
+                window = ?self.config.notify_window,
+                "notification dropped by rate limit"
+            );
             return;
         }
         self.notify_times.push_back(now);
@@ -2316,6 +2324,9 @@ impl Perform for Terminal {
 
     fn unhook(&mut self) {
         if let Some(d) = self.dcs.take() {
+            if d.sixel.is_none() && d.data.len() >= MAX_DCS {
+                tracing::debug!(kind = "dcs", max = MAX_DCS, "oversized string truncated");
+            }
             self.dcs_finish(d);
         }
     }

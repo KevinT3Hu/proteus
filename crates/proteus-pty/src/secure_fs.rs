@@ -81,7 +81,8 @@ fn directory(path: &Path, migrate: bool, private_final: bool) -> io::Result<File
                 let uid = rustix::process::geteuid().as_raw();
                 links += 1;
                 if links > MAX_LINKS || (st.st_uid != 0 && st.st_uid != uid) {
-                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, "untrusted application directory"));
+                    let check = if links > MAX_LINKS { "too many symlinks" } else { "symlink owned by another user" };
+                    return Err(refuse(&walked.join(name), check, st.st_uid, st.st_mode));
                 }
                 let target = rustix::fs::readlinkat(&fd, *name, Vec::new())?;
                 let target = std::path::PathBuf::from(std::ffi::OsString::from_vec(target.into_bytes()));
@@ -99,14 +100,26 @@ fn directory(path: &Path, migrate: bool, private_final: bool) -> io::Result<File
                     }
                 }
                 Err(rustix::io::Errno::EXIST) => {}
-                Err(e) => return Err(e.into()),
+                Err(e) => {
+                    let path = walked.join(name);
+                    tracing::warn!(path = %path.display(), error = %e, "creating application directory failed");
+                    return Err(io::Error::new(
+                        io::Error::from(e).kind(),
+                        format!("create directory {}: {e}", path.display()),
+                    ));
+                }
             }
             fd = openat(
                 &fd,
                 *name,
                 OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
-            )?;
+            )
+            .map_err(|e| {
+                let path = walked.join(name);
+                tracing::warn!(path = %path.display(), error = %e, "opening application directory failed");
+                io::Error::new(io::Error::from(e).kind(), format!("open directory {}: {e}", path.display()))
+            })?;
             walked.push(name);
             let m = rustix::fs::fstat(&fd)?;
             if final_dir && migrate && m.st_uid == rustix::process::geteuid().as_raw() {
@@ -119,11 +132,25 @@ fn directory(path: &Path, migrate: bool, private_final: bool) -> io::Result<File
             let safe_ancestor = (m.st_uid == 0 || m.st_uid == uid)
                 && ((m.st_mode & 0o002 == 0 && group_ok(0o020)) || m.st_mode & 0o1000 != 0);
             if (final_dir && private_final && !private) || ((!final_dir || !private_final) && !safe_ancestor) {
-                return Err(io::Error::new(io::ErrorKind::PermissionDenied, "untrusted application directory"));
+                let check = if final_dir && private_final {
+                    "directory must be owned by the user and not accessible to others"
+                } else {
+                    "directory writable by other users or owned by another user"
+                };
+                return Err(refuse(&walked, check, m.st_uid, m.st_mode));
             }
         }
         return Ok(fd.into());
     }
+}
+
+fn refuse(path: &Path, check: &str, owner: u32, mode: u32) -> io::Error {
+    let mode = format!("{:o}", mode & 0o7777);
+    tracing::warn!(path = %path.display(), check, owner, mode, "refusing untrusted application directory");
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!("untrusted application directory {}: {check}", path.display()),
+    )
 }
 
 /// `p` with `.` and `..` resolved without touching the file system.

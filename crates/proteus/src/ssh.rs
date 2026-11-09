@@ -480,10 +480,21 @@ impl Batch {
             return Err("SFTP command exceeds 8 KiB".into());
         }
         let path = directory.join(format!("transfer-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
-        let file = proteus_pty::persistence::StateFile::new(&path).map_err(|e| e.to_string())?;
-        file.write(line.as_bytes()).map_err(|e| e.to_string())?;
+        let file = proteus_pty::persistence::StateFile::new(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        file.write(line.as_bytes()).map_err(|e| format!("{}: {e}", path.display()))?;
         Ok(Self { file, path })
     }
+}
+
+/// `argv` for the log: long arguments (encoded scripts) are shown by size.
+pub fn argv_for_log(argv: &[OsString]) -> String {
+    argv.iter()
+        .map(|a| {
+            let a = a.to_string_lossy();
+            if a.len() > 160 { format!("<{} bytes>", a.len()) } else { a.into_owned() }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 fn sftp_path(path: &str) -> Result<String, String> {
     if path.is_empty() || path.len() > 16384 || path.chars().any(char::is_control) {

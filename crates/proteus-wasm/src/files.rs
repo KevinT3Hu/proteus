@@ -132,7 +132,10 @@ impl Access {
     /// Host path for `path` as the plugin names it; `write` needs an `rw`
     /// grant. `follow`: the last component may be a symlink to follow.
     pub fn resolve(&self, path: &str, write: bool, follow: bool) -> Result<PathBuf, String> {
-        let denied = || format!("{path}: not inside the plugin's directories (permission `fs`)");
+        let denied = || {
+            tracing::debug!(path, write, "file access outside the plugin's grants refused");
+            format!("{path}: not inside the plugin's directories (permission `fs`)")
+        };
         if !path.starts_with('/') {
             return Err(format!("{path}: the path must be absolute"));
         }
@@ -260,9 +263,11 @@ impl Watcher {
         let fd = Arc::new(fd);
         let dirs: Arc<Mutex<HashMap<i32, (u32, String)>>> = Arc::default();
         let (f, d, s) = (fd.clone(), dirs.clone(), stop.clone());
+        let span = tracing::Span::current();
         std::thread::Builder::new()
             .name("plugin-watch".into())
             .spawn(move || {
+                let _entered = span.enter();
                 let mut buf = [std::mem::MaybeUninit::<u8>::uninit(); 8192];
                 while !s.load(Ordering::Relaxed) {
                     let mut reader = inotify::Reader::new(f.as_fd(), &mut buf);

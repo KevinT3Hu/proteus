@@ -35,6 +35,7 @@ pub const TRUSTED_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 /// The program to start for `name`, if the manifest lists it.
 pub fn resolve(allowed: &[String], name: &str) -> Result<PathBuf, String> {
     if !allowed.iter().any(|a| a == name) {
+        tracing::debug!(program = name, "permission denied: run-command");
         return Err(format!("permission denied: run-command:{name}"));
     }
     if name.starts_with('/') {
@@ -58,6 +59,17 @@ fn build(program: &Path, cmd: &Command, cwd: &Path) -> Result<std::process::Comm
     c.envs(cmd.env.iter().map(|(k, v)| (k, v)));
     c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     Ok(c)
+}
+
+/// Only the program name is logged: arguments may hold secrets.
+fn start(program: &Path, cmd: &Command, cwd: &Path) -> Result<Child, String> {
+    let name = &cmd.argv[0];
+    let child = build(program, cmd, cwd)?.spawn().map_err(|e| {
+        tracing::warn!(program = %name, error = %e, "plugin process failed to start");
+        format!("{name}: {e}")
+    })?;
+    tracing::debug!(program = %name, pid = child.id(), "plugin process started");
+    Ok(child)
 }
 
 /// Variables a child gets from the terminal's environment; everything else
@@ -179,8 +191,7 @@ pub fn run(
     timeout: Duration,
     stop: &AtomicBool,
 ) -> Result<Output, String> {
-    let name = &cmd.argv[0];
-    let mut child = build(program, cmd, cwd)?.spawn().map_err(|e| format!("{name}: {e}"))?;
+    let mut child = start(program, cmd, cwd)?;
     let io_stop = Arc::new(AtomicBool::new(false));
     let setup = (|| {
         let mut stdin = InputWriter::new(child.stdin.take().expect("piped"))?;
@@ -271,8 +282,7 @@ impl Processes {
         if self.live.len() >= MAX_PROCESSES {
             return Err(format!("at most {MAX_PROCESSES} processes at a time"));
         }
-        let name = &cmd.argv[0];
-        let mut child = build(program, cmd, cwd)?.spawn().map_err(|e| format!("{name}: {e}"))?;
+        let mut child = start(program, cmd, cwd)?;
         self.next = self.next.wrapping_add(1).max(1);
         let id = self.next;
         let stdin = match InputWriter::new(child.stdin.take().expect("piped")) {
@@ -291,7 +301,9 @@ impl Processes {
         .map(|(stderr, mut r)| {
             let post = post.clone();
             let nonblocking = rustix::io::ioctl_fionbio(r.as_fd(), true);
+            let span = tracing::Span::current();
             std::thread::spawn(move || {
+                let _entered = span.enter();
                 if nonblocking.is_err() {
                     return;
                 }
@@ -318,7 +330,9 @@ impl Processes {
         .collect();
         let child = Arc::new(Mutex::new(child));
         let (c, ended) = (child.clone(), self.ended.clone());
+        let span = tracing::Span::current();
         std::thread::spawn(move || {
+            let _entered = span.enter();
             for r in readers {
                 let _ = r.join();
             }
@@ -333,6 +347,7 @@ impl Processes {
             if let Ok(mut e) = ended.lock() {
                 e.push(id);
             }
+            tracing::debug!(process = id, exit_code = ?code, "plugin process exited");
             post.event(Event::ProcessExited((id, code)));
         });
         self.live.insert(id, Live { child, stdin });

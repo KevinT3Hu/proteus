@@ -81,6 +81,28 @@ pub struct Message {
     pub error: bool,
 }
 
+/// What ran a callback, for the log.
+#[derive(Debug, Clone, Copy)]
+enum Via<'a> {
+    Action,
+    Event(&'a str),
+    Timer(u32),
+    Surface(u32),
+    Segment,
+}
+
+impl std::fmt::Display for Via<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Via::Action => f.write_str("action"),
+            Via::Event(name) => write!(f, "event {name}"),
+            Via::Timer(id) => write!(f, "timer {id}"),
+            Via::Surface(id) => write!(f, "ui surface {id}"),
+            Via::Segment => f.write_str("status segment"),
+        }
+    }
+}
+
 #[derive(Default)]
 struct Registry {
     /// Generation and function of each slot (`None`: free).
@@ -408,7 +430,10 @@ impl Script {
             package.set("cpath", "")?;
             Ok(ctor)
         };
-        let pane_ctor = setup().map_err(|e| clean(&e))?;
+        let pane_ctor = setup().map_err(|e| {
+            tracing::error!("lua setup failed: {e}");
+            clean(&e)
+        })?;
         Ok(Script {
             lua,
             reg,
@@ -439,7 +464,10 @@ impl Script {
         self.deadline.set(Some(Instant::now() + LOAD_LIMIT));
         let r = self.lua.load(src).set_name(format!("@{}", path.display())).exec();
         self.deadline.set(None);
-        r.map_err(|e| clean(&e))
+        r.map_err(|e| {
+            tracing::warn!(path = %path.display(), "lua config failed: {e}");
+            clean(&e)
+        })
     }
 
     pub fn has_hooks(&self, event: &str) -> bool {
@@ -466,7 +494,7 @@ impl Script {
     /// Run a bound or palette function with `ctx = { pane = <pane> }`.
     pub fn call_fn(&self, host: &mut dyn Host, f: FnId, pane: Option<PaneId>) {
         let ctx = self.ctx(pane);
-        self.invoke(host, f, ctx);
+        self.invoke(host, f, ctx, Via::Action);
     }
 
     /// Run the hooks of an event.
@@ -477,10 +505,13 @@ impl Script {
         }
         let table = match self.event_table(ev) {
             Ok(t) => t,
-            Err(e) => return self.message(format!("Lua: {}", clean(&e)), true),
+            Err(e) => {
+                tracing::warn!(event = ev.name, "lua event table: {e}");
+                return self.message(format!("Lua: {}", clean(&e)), true);
+            }
         };
         for f in hooks {
-            self.invoke(host, f, Value::Table(table.clone()));
+            self.invoke(host, f, Value::Table(table.clone()), Via::Event(ev.name));
         }
     }
 
@@ -490,7 +521,7 @@ impl Script {
         if !repeat {
             self.reg.borrow_mut().timers.remove(&id);
         }
-        self.invoke(host, f, Value::Nil);
+        self.invoke(host, f, Value::Nil, Via::Timer(id));
         if !repeat {
             self.reg.borrow_mut().release(f);
         }
@@ -508,9 +539,12 @@ impl Script {
         let Some(f) = f else { return false };
         match ui::event(&self.lua, e) {
             Ok(t) => {
-                self.invoke(host, f, Value::Table(t));
+                self.invoke(host, f, Value::Table(t), Via::Surface(id));
             }
-            Err(err) => self.message(format!("Lua: {}", clean(&err)), true),
+            Err(err) => {
+                tracing::warn!(surface = id, "lua ui event table: {err}");
+                self.message(format!("Lua: {}", clean(&err)), true)
+            }
         }
         if closed {
             self.reg.borrow_mut().release(f);
@@ -525,12 +559,13 @@ impl Script {
         let (mut left, mut right) = (Vec::new(), Vec::new());
         for (side, f) in segs {
             let ctx = self.ctx(pane);
-            let text = match self.invoke(host, f, ctx) {
+            let text = match self.invoke(host, f, ctx, Via::Segment) {
                 Some(Value::String(s)) => s.to_string_lossy(),
                 Some(Value::Integer(i)) => i.to_string(),
                 Some(Value::Number(n)) => n.to_string(),
                 Some(Value::Nil) => continue,
-                Some(_) => {
+                Some(v) => {
+                    tracing::warn!(kind = v.type_name(), "lua status segment returned neither a string nor nil");
                     self.message("Lua: a status segment returned neither a string nor nil".into(), true);
                     "?".into()
                 }
@@ -580,17 +615,25 @@ impl Script {
 
     /// Call function `f` with the host reachable; errors and slowness
     /// become messages. `None` if it failed.
-    fn invoke(&self, host: &mut dyn Host, f: FnId, arg: Value) -> Option<Value> {
+    fn invoke(&self, host: &mut dyn Host, f: FnId, arg: Value, via: Via) -> Option<Value> {
         let func = self.reg.borrow().get(f).cloned()?;
         let start = Instant::now();
         self.host_time.set(Duration::ZERO);
         let r = self.with_host(host, |_| func.call::<Value>(arg));
         let took = start.elapsed().saturating_sub(self.host_time.get());
         if took > SLOW && r.is_ok() && self.reg.borrow_mut().slow.insert(f) {
+            let function = describe(&func);
+            tracing::warn!(
+                callback = %via,
+                function = %function,
+                ms = took.as_millis() as u64,
+                budget_ms = SLOW.as_millis() as u64,
+                "slow lua callback"
+            );
             self.message(
                 format!(
                     "slow Lua callback ({}): {} ms; callbacks should take under {} ms",
-                    describe(&func),
+                    function,
                     took.as_millis(),
                     SLOW.as_millis()
                 ),
@@ -600,6 +643,12 @@ impl Script {
         match r {
             Ok(v) => Some(v),
             Err(e) => {
+                tracing::warn!(
+                    callback = %via,
+                    function = %describe(&func),
+                    ms = took.as_millis() as u64,
+                    "lua callback failed: {e}"
+                );
                 self.message(format!("Lua: {}", clean(&e)), true);
                 None
             }

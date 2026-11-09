@@ -439,6 +439,7 @@ pub fn parse(src: &str, chunk: &str) -> Result<LayoutSpec, String> {
     })
     .map_err(|e| e.to_string())?;
     let value: Value = lua.load(src).set_name(format!("@{chunk}")).eval().map_err(|e| {
+        tracing::warn!(chunk, "layout evaluation failed: {e}");
         let s = e.to_string();
         s.lines().next().unwrap_or("").trim_start_matches("runtime error: ").to_string()
     })?;
@@ -528,7 +529,12 @@ pub fn load(path: &Path) -> Result<LayoutSpec, String> {
     std::fs::File::open(path)
         .and_then(|f| f.take((1 << 20) + 1).read_to_string(&mut src))
         .map_err(|e| format!("{}: {e}", path.display()))?;
-    parse(&src, &path.display().to_string())
+    let name = path.display().to_string();
+    parse(&src, &name).map_err(|e| {
+        let e = if e.starts_with(&name) { e } else { format!("{name}: {e}") };
+        tracing::warn!(path = %name, "layout not loaded: {e}");
+        e
+    })
 }
 
 /// `$XDG_CONFIG_HOME/proteus/layouts`.

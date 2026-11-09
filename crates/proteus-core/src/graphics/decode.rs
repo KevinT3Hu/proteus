@@ -53,6 +53,25 @@ fn limits(max_bytes: usize) -> Limits {
 /// Decode `data`, refusing images whose RGBA size exceeds `max_bytes`.
 /// Animated GIFs yield all frames that fit within `max_bytes` in total.
 pub fn decode_image(data: &[u8], max_bytes: usize) -> Result<DecodedImage, DecodeError> {
+    let result = decode(data, max_bytes);
+    match &result {
+        Err(DecodeError::Invalid(e)) => log_decode_failure(data, e),
+        Err(DecodeError::TooLarge) => {
+            let dimensions = image_dimensions(data);
+            tracing::debug!(len = data.len(), ?dimensions, max_bytes, "image too large to decode");
+        }
+        Ok(_) => {}
+    }
+    result
+}
+
+/// Report an image that could not be decoded (once per image).
+pub(crate) fn log_decode_failure(data: &[u8], error: &str) {
+    let format = image::guess_format(data).ok();
+    tracing::warn!(?format, dimensions = ?image_dimensions(data), len = data.len(), error, "image decode failed");
+}
+
+fn decode(data: &[u8], max_bytes: usize) -> Result<DecodedImage, DecodeError> {
     let reader = ImageReader::new(Cursor::new(data)).with_guessed_format().map_err(invalid)?;
     let format = reader.format();
     if format.is_none() {
@@ -73,6 +92,7 @@ pub fn decode_image(data: &[u8], max_bytes: usize) -> Result<DecodedImage, Decod
         let mut total = 0usize;
         for f in dec.into_frames() {
             if frames.len() >= super::MAX_FRAMES {
+                tracing::debug!(max = super::MAX_FRAMES, "gif frame limit reached; later frames dropped");
                 break;
             }
             let f = f.map_err(invalid)?;
@@ -84,6 +104,11 @@ pub fn decode_image(data: &[u8], max_bytes: usize) -> Result<DecodedImage, Decod
             }
             total += frame_bytes;
             if total > max_bytes {
+                tracing::debug!(
+                    frames = frames.len(),
+                    max_bytes,
+                    "gif frames exceed the size limit; later frames dropped"
+                );
                 break;
             }
             frames.push((buf.into_raw(), delay));
@@ -121,6 +146,7 @@ impl Drop for DecodePermit {
 pub(crate) fn reserve_decode(bytes: usize) -> Option<DecodePermit> {
     let mut used = DECODE_USAGE.lock().unwrap();
     if used.1 >= 32 || bytes > (512usize << 20).saturating_sub(used.0) {
+        tracing::debug!(bytes, queued_jobs = used.1, queued_bytes = used.0, "image decode queue full");
         return None;
     }
     used.0 += bytes;
@@ -154,6 +180,9 @@ pub(crate) fn run_in_background(job: Job) {
                     }
                 }
             });
+            if let Err(e) = &spawned {
+                tracing::warn!(error = %e, "starting an image decoder thread failed");
+            }
             started += spawned.is_ok() as usize;
         }
         (started > 0).then_some(tx)

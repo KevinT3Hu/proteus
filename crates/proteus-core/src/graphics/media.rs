@@ -18,6 +18,17 @@ pub(crate) enum Medium {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ReadFailed;
 
+/// Why a medium was refused, for the log only (never sent to the client).
+struct Refused(&'static str, Option<std::io::Error>);
+
+fn refused(why: &'static str) -> Refused {
+    Refused(why, None)
+}
+
+fn io_failed<E: Into<std::io::Error>>(why: &'static str) -> impl FnOnce(E) -> Refused {
+    move |e| Refused(why, Some(e.into()))
+}
+
 const SENSITIVE: &[&str] = &["/proc", "/sys", "/dev"];
 const TEMP_MARKER: &str = "tty-graphics-protocol";
 const MAX_SHM_NAME: usize = 255;
@@ -31,44 +42,47 @@ fn temp_dirs() -> Vec<PathBuf> {
 }
 
 /// Validate the path for `medium` and return what to open (and unlink afterwards).
-fn resolve(medium: Medium, name: &str) -> Result<(PathBuf, bool), ReadFailed> {
+fn resolve(medium: Medium, name: &str) -> Result<(PathBuf, bool), Refused> {
     match medium {
         Medium::SharedMemory => {
-            let rest = name.strip_prefix('/').ok_or(ReadFailed)?;
+            let rest = name.strip_prefix('/').ok_or(refused("shm name must start with /"))?;
             if rest.is_empty() || rest.contains('/') || name.len() > MAX_SHM_NAME || rest == "." || rest == ".." {
-                return Err(ReadFailed);
+                return Err(refused("invalid shm name"));
             }
             let path = Path::new("/dev/shm").join(rest);
             if !rest.contains(TEMP_MARKER) {
-                return Err(ReadFailed);
+                return Err(refused("shm name lacks the tty-graphics-protocol marker"));
             }
             // Never follow symlinks out of the shm directory.
-            let meta = fs::symlink_metadata(&path).map_err(|_| ReadFailed)?;
+            let meta = fs::symlink_metadata(&path).map_err(io_failed("stat shm object"))?;
             if !meta.file_type().is_file() {
-                return Err(ReadFailed);
+                return Err(refused("shm object is not a regular file"));
             }
             Ok((path, true))
         }
         Medium::File | Medium::TempFile => {
             let path = Path::new(name);
             if !path.is_absolute() {
-                return Err(ReadFailed);
+                return Err(refused("path is not absolute"));
             }
             // Checked before opening: opening some files has side effects.
-            let canon = fs::canonicalize(path).map_err(|_| ReadFailed)?;
+            let canon = fs::canonicalize(path).map_err(io_failed("canonicalize"))?;
             let temp = medium == Medium::TempFile;
             let in_shm = canon.starts_with("/dev/shm");
             if SENSITIVE.iter().any(|s| canon.starts_with(s)) && !(temp && in_shm) {
-                return Err(ReadFailed);
+                return Err(refused("path is under /proc, /sys or /dev"));
             }
-            if !fs::metadata(&canon).map_err(|_| ReadFailed)?.is_file() {
-                return Err(ReadFailed);
+            if !fs::metadata(&canon).map_err(io_failed("stat"))?.is_file() {
+                return Err(refused("not a regular file"));
             }
             if temp {
                 let in_temp = temp_dirs().iter().any(|d| canon.starts_with(d));
                 let marked = canon.file_name().is_some_and(|n| n.to_string_lossy().contains(TEMP_MARKER));
-                if !in_temp || !marked {
-                    return Err(ReadFailed);
+                if !in_temp {
+                    return Err(refused("temp file is outside the temp directories"));
+                }
+                if !marked {
+                    return Err(refused("temp file name lacks the tty-graphics-protocol marker"));
                 }
             }
             Ok((canon, temp))
@@ -79,15 +93,28 @@ fn resolve(medium: Medium, name: &str) -> Result<(PathBuf, bool), ReadFailed> {
 /// Read `size` bytes (0 = to end of file) at `offset` from the object named by
 /// `name`. Temp files and shm objects are removed after reading.
 pub(crate) fn read(medium: Medium, name: &[u8], size: u64, offset: u64, max: usize) -> Result<Vec<u8>, ReadFailed> {
-    let name = std::str::from_utf8(name).map_err(|_| ReadFailed)?;
+    read_object(medium, name, size, offset, max).map_err(|Refused(why, error)| {
+        tracing::debug!(
+            ?medium,
+            name = %String::from_utf8_lossy(name),
+            reason = why,
+            error = error.as_ref().map(tracing::field::display),
+            "kitty graphics medium refused"
+        );
+        ReadFailed
+    })
+}
+
+fn read_object(medium: Medium, name: &[u8], size: u64, offset: u64, max: usize) -> Result<Vec<u8>, Refused> {
+    let name = std::str::from_utf8(name).map_err(|_| refused("name is not UTF-8"))?;
     if name.contains('\0') {
-        return Err(ReadFailed);
+        return Err(refused("name contains NUL"));
     }
     let (path, unlink) = resolve(medium, name)?;
     use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, openat2};
     use std::os::fd::AsRawFd;
-    let parent = path.parent().ok_or(ReadFailed)?;
-    let name = path.file_name().ok_or(ReadFailed)?;
+    let parent = path.parent().ok_or(refused("no parent directory"))?;
+    let name = path.file_name().ok_or(refused("no file name"))?;
     let parent = openat2(
         CWD,
         parent,
@@ -95,7 +122,7 @@ pub(crate) fn read(medium: Medium, name: &[u8], size: u64, offset: u64, max: usi
         Mode::empty(),
         ResolveFlags::NO_SYMLINKS,
     )
-    .map_err(|_| ReadFailed)?;
+    .map_err(io_failed("open parent directory"))?;
     let pinned = openat2(
         &parent,
         name,
@@ -103,10 +130,10 @@ pub(crate) fn read(medium: Medium, name: &[u8], size: u64, offset: u64, max: usi
         Mode::empty(),
         ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
     )
-    .map_err(|_| ReadFailed)?;
-    let meta = rustix::fs::fstat(&pinned).map_err(|_| ReadFailed)?;
+    .map_err(io_failed("open file"))?;
+    let meta = rustix::fs::fstat(&pinned).map_err(io_failed("stat opened file"))?;
     if rustix::fs::FileType::from_raw_mode(meta.st_mode) != rustix::fs::FileType::RegularFile {
-        return Err(ReadFailed);
+        return Err(refused("opened file is not a regular file"));
     }
     let object = PathBuf::from(format!("/proc/self/fd/{}", pinned.as_raw_fd()));
     let result = read_at(&object, size, offset, max);
@@ -120,25 +147,28 @@ pub(crate) fn read(medium: Medium, name: &[u8], size: u64, offset: u64, max: usi
     result
 }
 
-fn read_at(path: &Path, size: u64, offset: u64, max: usize) -> Result<Vec<u8>, ReadFailed> {
+fn read_at(path: &Path, size: u64, offset: u64, max: usize) -> Result<Vec<u8>, Refused> {
     use std::os::unix::fs::OpenOptionsExt;
     let mut f = File::options()
         .read(true)
         .custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32)
         .open(path)
-        .map_err(|_| ReadFailed)?;
-    let meta = f.metadata().map_err(|_| ReadFailed)?;
+        .map_err(io_failed("open for reading"))?;
+    let meta = f.metadata().map_err(io_failed("stat for reading"))?;
     if !meta.is_file() {
-        return Err(ReadFailed);
+        return Err(refused("not a regular file"));
     }
-    let avail = meta.len().checked_sub(offset).ok_or(ReadFailed)?;
+    let avail = meta.len().checked_sub(offset).ok_or(refused("offset past end of file"))?;
     let want = if size > 0 { size } else { avail };
-    if want > avail || want > max as u64 {
-        return Err(ReadFailed);
+    if want > avail {
+        return Err(refused("size past end of file"));
     }
-    f.seek(SeekFrom::Start(offset)).map_err(|_| ReadFailed)?;
+    if want > max as u64 {
+        return Err(refused("larger than the image size limit"));
+    }
+    f.seek(SeekFrom::Start(offset)).map_err(io_failed("seek"))?;
     let mut buf = vec![0u8; want as usize];
-    f.read_exact(&mut buf).map_err(|_| ReadFailed)?;
+    f.read_exact(&mut buf).map_err(io_failed("read"))?;
     Ok(buf)
 }
 

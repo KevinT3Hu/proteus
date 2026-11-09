@@ -34,10 +34,17 @@ pub fn spawn_pty(opts: &SpawnOptions) -> io::Result<(Pty, Option<Shell>)> {
         let dir = shell::runtime_dir().join("shell-integration");
         match shell::install(&dir) {
             Ok(()) => sh = shell::inject(&mut spec, &dir),
-            Err(e) => eprintln!("proteus: shell integration disabled: {e}"),
+            Err(e) => tracing::warn!(dir = %dir.display(), "shell integration disabled: {e}"),
         }
     }
+    tracing::debug!(program = %spec.program.display(), args = ?spec.args, "spawning");
     let pty = Pty::spawn(&spec, window_size(opts.cols, opts.rows, opts.cell))?;
+    tracing::info!(
+        program = %spec.program.display(),
+        cwd = %spec.cwd.as_deref().map(|d| d.display().to_string()).unwrap_or_else(|| "(inherited)".into()),
+        pid = pty.child_pid(),
+        "pane spawned"
+    );
     Ok((pty, sh))
 }
 

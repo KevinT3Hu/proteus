@@ -68,8 +68,15 @@ impl InputWriter {
                             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                                 let state = worker.state.lock().unwrap();
-                                if state.cancelled || state.drain_until.is_some_and(|t| std::time::Instant::now() >= t)
-                                {
+                                if state.cancelled {
+                                    return Ok(());
+                                }
+                                if state.drain_until.is_some_and(|t| std::time::Instant::now() >= t) {
+                                    tracing::warn!(
+                                        pending_bytes = state.bytes,
+                                        timeout = ?DRAIN,
+                                        "child stopped reading input; dropping queued input on close"
+                                    );
                                     return Ok(());
                                 }
                                 let _ = worker.wake.wait_timeout(state, RETRY).unwrap();
@@ -81,6 +88,11 @@ impl InputWriter {
             })();
             drop(output);
             let mut state = worker.state.lock().unwrap();
+            if let Err(e) = &result {
+                tracing::warn!(error = %e, pending_bytes = state.bytes, "writing input to the child failed");
+            } else if state.cancelled && state.bytes > 0 {
+                tracing::debug!(pending_bytes = state.bytes, "input writer cancelled with queued input");
+            }
             state.finished = true;
             state.error = result.err().map(|e| e.to_string());
             state.queue.clear();
@@ -100,6 +112,7 @@ impl InputWriter {
             return Err(io::ErrorKind::BrokenPipe.into());
         }
         if bytes.len() > MAX_PENDING_INPUT.saturating_sub(s.bytes) {
+            tracing::warn!(len = bytes.len(), pending_bytes = s.bytes, "stdin queue full; input refused");
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "stdin queue is full (16 MiB)"));
         }
         if !bytes.is_empty() {

@@ -69,6 +69,22 @@ pub enum Request {
     },
 }
 
+impl Request {
+    /// The `op` name, for the log (the request itself may hold user text).
+    pub fn op(&self) -> &'static str {
+        match self {
+            Request::List {} => "list",
+            Request::SendText { .. } => "send-text",
+            Request::Read { .. } => "read",
+            Request::Focus { .. } => "focus",
+            Request::Close { .. } => "close",
+            Request::Action { .. } => "action",
+            Request::Split { .. } => "split",
+            Request::NewTab { .. } => "new-tab",
+        }
+    }
+}
+
 #[derive(Debug, clap::Args)]
 pub struct Client {
     /// Socket path; defaults to PROTEUS_SOCKET in terminal children.
@@ -85,16 +101,18 @@ impl Client {
             .or_else(|| std::env::var_os("PROTEUS_SOCKET").map(PathBuf::from))
             .ok_or("specify --socket or run inside a terminal with IPC enabled")?;
         let mut stream = UnixStream::connect(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let mut bytes = serde_json::to_vec(&self.request).map_err(|e| e.to_string())?;
+        let mut bytes = serde_json::to_vec(&self.request).map_err(|e| format!("encode IPC request: {e}"))?;
         if bytes.len() > MAX_REQUEST {
             return Err("IPC request too large".into());
         }
         bytes.push(b'\n');
-        write_message(&mut stream, &bytes, Instant::now() + TIMEOUT).map_err(|e| e.to_string())?;
+        write_message(&mut stream, &bytes, Instant::now() + TIMEOUT)
+            .map_err(|e| format!("send request to {}: {e}", path.display()))?;
         // The server may spend TIMEOUT waiting for the terminal and TIMEOUT writing.
         let deadline = Instant::now() + 2 * TIMEOUT + Duration::from_secs(1);
-        let reply = read_message(&mut stream, MAX_RESPONSE, deadline).map_err(|e| e.to_string())?;
-        let value: Value = serde_json::from_slice(&reply).map_err(|e| e.to_string())?;
+        let reply = read_message(&mut stream, MAX_RESPONSE, deadline)
+            .map_err(|e| format!("read reply from {}: {e}", path.display()))?;
+        let value: Value = serde_json::from_slice(&reply).map_err(|e| format!("invalid IPC reply: {e}"))?;
         if let Some(error) = value.get("error").and_then(Value::as_str) {
             return Err(error.into());
         }
@@ -119,21 +137,25 @@ pub struct Server {
 
 impl Server {
     pub fn start(path: PathBuf, dispatch: impl Fn(Call) -> bool + Send + 'static) -> io::Result<Self> {
+        let context = |e: io::Error| io::Error::new(e.kind(), format!("{}: {e}", path.display()));
         let (wake, wake_read) = UnixStream::pair()?;
-        let listener = bind(&path)?;
-        let inode = std::fs::symlink_metadata(&path)?.ino();
+        let listener = bind(&path).map_err(context)?;
+        let inode = std::fs::symlink_metadata(&path).map_err(context)?.ino();
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = stop.clone();
-        let mut server = Self { path, inode, stop, wake, thread: None };
         listener.set_nonblocking(true)?;
-        std::fs::set_permissions(&server.path, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(context)?;
+        let mut server = Self { path, inode, stop, wake, thread: None };
         let thread = std::thread::Builder::new().name("proteus-ipc".into()).spawn(move || {
             while !stopping.load(Ordering::Acquire) {
                 use rustix::event::{PollFd, PollFlags, poll};
                 let mut fds = [PollFd::new(&listener, PollFlags::IN), PollFd::new(&wake_read, PollFlags::IN)];
                 match poll(&mut fds, None) {
                     Err(rustix::io::Errno::INTR) => continue,
-                    Err(_) => break,
+                    Err(e) => {
+                        tracing::error!("control socket poll failed; no longer accepting requests: {e}");
+                        break;
+                    }
                     Ok(_) => {}
                 }
                 if !fds[1].revents().is_empty() || stopping.load(Ordering::Acquire) {
@@ -142,18 +164,46 @@ impl Server {
                 let mut stream = match listener.accept() {
                     Ok((stream, _)) => stream,
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-                    Err(_) => break,
+                    Err(e) => {
+                        tracing::error!("control socket accept failed; no longer accepting requests: {e}");
+                        break;
+                    }
                 };
-                let allowed = rustix::net::sockopt::socket_peercred(&stream)
-                    .is_ok_and(|cred| cred.uid == rustix::process::geteuid());
-                if !allowed {
-                    continue;
+                let me = rustix::process::geteuid();
+                match rustix::net::sockopt::socket_peercred(&stream) {
+                    Ok(cred) if cred.uid == me => {
+                        tracing::debug!(
+                            uid = cred.uid.as_raw(),
+                            pid = cred.pid.as_raw_nonzero().get(),
+                            "ipc connection"
+                        )
+                    }
+                    Ok(cred) => {
+                        tracing::warn!(uid = cred.uid.as_raw(), "ipc connection rejected: peer is another user");
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!("ipc connection rejected: cannot read peer credentials: {e}");
+                        continue;
+                    }
                 }
                 let result = (|| {
-                    let bytes =
-                        read_message(&mut stream, MAX_REQUEST, Instant::now() + TIMEOUT).map_err(|e| e.to_string())?;
-                    let request: Request =
-                        serde_json::from_slice(&bytes).map_err(|e| format!("invalid IPC request: {e}"))?;
+                    let bytes = read_message(&mut stream, MAX_REQUEST, Instant::now() + TIMEOUT).map_err(|e| {
+                        tracing::warn!("reading ipc request: {e}");
+                        format!("reading IPC request: {e}")
+                    })?;
+                    let request: Request = serde_json::from_slice(&bytes).map_err(|e| {
+                        // The message can quote request values, which may be user text.
+                        tracing::warn!(
+                            category = ?e.classify(),
+                            line = e.line(),
+                            column = e.column(),
+                            bytes = bytes.len(),
+                            "invalid ipc request"
+                        );
+                        format!("invalid IPC request: {e}")
+                    })?;
+                    tracing::debug!(op = request.op(), "ipc request");
                     if stopping.load(Ordering::Acquire) {
                         return Err("terminal is shutting down".into());
                     }
@@ -166,14 +216,20 @@ impl Server {
                 })();
                 let response = match result {
                     Ok(value) => serde_json::json!({"result": value}),
-                    Err(error) => serde_json::json!({"error": error}),
+                    Err(error) => {
+                        tracing::debug!("ipc request failed: {error}");
+                        serde_json::json!({"error": error})
+                    }
                 };
                 if let Ok(mut bytes) = serde_json::to_vec(&response) {
                     if bytes.len() > MAX_RESPONSE {
+                        tracing::warn!(bytes = bytes.len(), "ipc response too large");
                         bytes = br#"{"error":"IPC response too large"}"#.to_vec();
                     }
                     bytes.push(b'\n');
-                    let _ = write_message(&mut stream, &bytes, Instant::now() + TIMEOUT);
+                    if let Err(e) = write_message(&mut stream, &bytes, Instant::now() + TIMEOUT) {
+                        tracing::warn!("ipc reply not delivered: {e}");
+                    }
                 }
             }
         })?;
@@ -288,6 +344,23 @@ mod tests {
         drop(server);
         assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn op_names_match_the_wire_tag() {
+        let requests = [
+            Request::List {},
+            Request::SendText { pane: None, paste: false, text: "x".into() },
+            Request::Read { pane: None, scrollback: 0 },
+            Request::Focus { pane: 1 },
+            Request::Close { pane: 1 },
+            Request::Action { pane: None, id: "x".into() },
+            Request::Split { pane: None, axis: None },
+            Request::NewTab { cwd: None, command: Vec::new() },
+        ];
+        for r in requests {
+            assert_eq!(serde_json::to_value(&r).unwrap()["op"], r.op());
+        }
     }
 
     #[test]

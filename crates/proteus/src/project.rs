@@ -58,15 +58,16 @@ fn read(path: &Path) -> Result<String, String> {
 }
 
 fn read_open(file: File, path: &Path) -> Result<String, String> {
-    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+    let context = |e: std::io::Error| format!("{}: {e}", path.display());
+    if !file.metadata().map_err(context)?.is_file() {
         return Err(format!("{}: expected a regular file", path.display()));
     }
     let mut bytes = Vec::new();
-    file.take(MAX_FILE + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    file.take(MAX_FILE + 1).read_to_end(&mut bytes).map_err(context)?;
     if bytes.len() as u64 > MAX_FILE {
         return Err(format!("{}: exceeds 256 KiB", path.display()));
     }
-    String::from_utf8(bytes).map_err(|e| e.to_string())
+    String::from_utf8(bytes).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 fn text(value: &str) -> bool {
@@ -101,8 +102,12 @@ impl Workspace {
             let dir_safe = unshared(dir.uid(), dir.gid(), dir.mode())
                 || ((dir.uid() == me || dir.uid() == 0) && dir.mode() & 0o1000 != 0);
             if unshared(m.uid(), m.gid(), m.mode()) && dir_safe {
-                return Self::from_definition(&path, &read_open(file, &path)?).map(Some);
+                let shown = path.display().to_string();
+                return Self::from_definition(&path, &read_open(file, &path)?)
+                    .map(Some)
+                    .map_err(|e| if e.starts_with(&shown) { e } else { format!("{shown}: {e}") });
             }
+            tracing::debug!(path = %path.display(), "ignoring workspace file writable by others");
         }
         Ok(None)
     }
@@ -113,14 +118,16 @@ impl Workspace {
     }
 
     fn from_definition(path: &Path, definition: &str) -> Result<Self, String> {
-        let root = path.parent().ok_or("workspace has no parent")?.canonicalize().map_err(|e| e.to_string())?;
+        let parent = path.parent().ok_or("workspace has no parent")?;
+        let root = parent.canonicalize().map_err(|e| format!("{}: {e}", parent.display()))?;
         Self::parse(
             &root,
             definition,
             |name| read(&root.join(name)),
             |name| root.join(name).is_file(),
             |relative| {
-                let cwd = root.join(relative).canonicalize().map_err(|e| e.to_string())?;
+                let cwd = root.join(relative);
+                let cwd = cwd.canonicalize().map_err(|e| format!("{}: {e}", cwd.display()))?;
                 if !cwd.starts_with(&root) || !cwd.is_dir() {
                     return Err("cwd must stay inside workspace".into());
                 }
@@ -168,7 +175,7 @@ impl Workspace {
                 }
                 "node" => {
                     let package: serde_json::Value =
-                        serde_json::from_str(&read_file("package.json")?).map_err(|e| e.to_string())?;
+                        serde_json::from_str(&read_file("package.json")?).map_err(|e| format!("package.json: {e}"))?;
                     let manager = if exists("pnpm-lock.yaml") {
                         "pnpm"
                     } else if exists("yarn.lock") {

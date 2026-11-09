@@ -88,6 +88,8 @@ pub(crate) struct SixelDecoder {
     params: Vec<u32>,
     cur: Option<u32>,
     transparent: bool,
+    /// Pixels were dropped because the image outgrew its limits.
+    clipped: bool,
 }
 
 /// Spans awaiting rasterisation, after this many the band is flushed early.
@@ -179,6 +181,7 @@ impl SixelDecoder {
             params: Vec::new(),
             cur: None,
             transparent: p2 == 1,
+            clipped: false,
         }
     }
 
@@ -299,6 +302,7 @@ impl SixelDecoder {
         let n = n.min(MAX_SIDE);
         if bits != 0 {
             if !self.reserve(self.x + n, self.y + 6) {
+                self.clipped = true;
                 self.x += n;
                 return;
             }
@@ -324,6 +328,14 @@ impl SixelDecoder {
 
     pub fn finish(mut self) -> Option<Sixel> {
         self.flush();
+        if self.clipped {
+            tracing::debug!(
+                width = self.stride,
+                height = self.rows,
+                max_pixels = self.max_pixels,
+                "sixel image exceeds its size or memory limit; clipped"
+            );
+        }
         let (w, h) = (self.width.min(self.stride), self.height.min(self.rows));
         if w == 0 || h == 0 {
             return None;
@@ -333,6 +345,9 @@ impl SixelDecoder {
             && rh <= MAX_SIDE
             && rw * rh <= self.max_pixels
             && self.budget.as_ref().is_none_or(|b| b.used().saturating_sub(self.reserved) + rw * rh * 4 <= b.limit());
+        if !fits {
+            tracing::debug!(raster = ?self.raster, drawn = ?(w, h), "sixel raster over the limits; using drawn size");
+        }
         let (w, h) = if fits { (rw, rh) } else { (w, h) };
         let bg = if self.transparent { 0 } else { self.palette[0] };
         let mut rgba = Vec::with_capacity(w * h * 4);

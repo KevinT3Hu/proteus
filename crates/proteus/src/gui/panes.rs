@@ -45,7 +45,7 @@ impl App {
         if let Err(e) = self.split_with(axis, None, None) {
             // Too small to split: nothing happens, as before.
             if e.starts_with("cannot") {
-                self.notice(e);
+                self.notice_error(e);
             }
         }
     }
@@ -99,7 +99,7 @@ impl App {
 
     pub(super) fn new_floating(&mut self) {
         if let Err(e) = self.new_floating_with(None, None) {
-            self.notice(e);
+            self.notice_error(e);
         }
     }
 
@@ -126,7 +126,7 @@ impl App {
 
     pub(super) fn new_tab(&mut self) {
         if let Err(e) = self.new_tab_with(None, None) {
-            self.notice(e);
+            self.notice_error(e);
         }
     }
 
@@ -198,7 +198,7 @@ impl App {
         let cwd = self.focused_pane().cwd(&self.hostname);
         let from = self.w.id;
         if let Err(e) = self.new_window() {
-            return self.notice(format!("cannot open a window: {e}"));
+            return self.notice_error(format!("cannot open a window: {e}"));
         }
         let (cols, rows) = {
             let m = self.layout_metrics_default();
@@ -215,7 +215,7 @@ impl App {
             Err(e) => {
                 self.destroy_window();
                 self.activate(from);
-                self.notice(format!("cannot start shell: {e}"));
+                self.notice_error(format!("cannot start shell: {e}"));
             }
         }
     }
@@ -266,7 +266,7 @@ impl App {
                     // Put it back.
                     self.activate(from);
                     self.w.tabs.insert(i.min(self.w.tabs.len()), tab);
-                    return self.notice(format!("cannot open a window: {e}"));
+                    return self.notice_error(format!("cannot open a window: {e}"));
                 }
             },
         };
@@ -303,7 +303,7 @@ impl App {
             Err(e) => {
                 self.activate(from);
                 self.w.tabs.insert(self.w.active + 1, Tab::new(id));
-                self.notice(format!("cannot open a window: {e}"));
+                self.notice_error(format!("cannot open a window: {e}"));
             }
         }
     }
@@ -361,6 +361,12 @@ impl App {
     /// new shell, with `panes.keep_last_shell`); the last window ends the
     /// program.
     pub(super) fn close_pane(&mut self, id: PaneId) {
+        if let Some(p) = self.panes.get_mut(&id) {
+            match p.exit_status() {
+                Some(status) => tracing::info!(pane = id, status, "pane exited"),
+                None => tracing::info!(pane = id, running = p.pty.is_some(), "pane closed"),
+            }
+        }
         if !self.activate_pane(id) {
             if let Some(p) = self.panes.remove(&id) {
                 self.surface_pane_gone(p.surface);
@@ -399,7 +405,7 @@ impl App {
         if self.w.tabs.is_empty() {
             if self.cfg.keep_last_shell {
                 if let Err(e) = self.open_default(None) {
-                    eprintln!("proteus: cannot start shell: {e}");
+                    tracing::error!("cannot start shell: {e}");
                     self.destroy_window();
                 }
             } else {

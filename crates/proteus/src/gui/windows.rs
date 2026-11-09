@@ -66,13 +66,36 @@ impl App {
         let sender = self.sender.clone();
         let id = self.w.id;
         let lost = self.w.renderer.lost.clone();
-        self.w.renderer.device.set_device_lost_callback(move |reason, message| {
+        let device = &self.w.renderer.device;
+        device.set_device_lost_callback(move |reason, message| {
             if reason != wgpu::DeviceLostReason::Destroyed {
                 lost.store(true, std::sync::atomic::Ordering::Release);
-                eprintln!("proteus: GPU device lost: {message}");
+                tracing::error!(window = id, ?reason, "gpu device lost: {message}");
                 let _ = sender.send(Msg::GpuLost(id));
+            } else {
+                tracing::debug!(window = id, "gpu device destroyed");
             }
         });
+        let reported = std::sync::atomic::AtomicU32::new(0);
+        device.on_uncaptured_error(std::sync::Arc::new(move |e: wgpu::Error| {
+            const LIMIT: u32 = 20;
+            let n = reported.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < LIMIT {
+                match &e {
+                    wgpu::Error::OutOfMemory { source } => {
+                        tracing::error!(window = id, "gpu out of memory: {source}")
+                    }
+                    wgpu::Error::Validation { description, .. } => {
+                        tracing::error!(window = id, "gpu validation error: {description}")
+                    }
+                    wgpu::Error::Internal { description, .. } => {
+                        tracing::error!(window = id, "gpu internal error: {description}")
+                    }
+                }
+            } else if n == LIMIT {
+                tracing::error!(window = id, "further gpu errors on this device are not logged");
+            }
+        }));
     }
 
     pub(super) fn recover_gpu(&mut self, id: WinId) {
@@ -89,10 +112,10 @@ impl App {
                 self.watch_gpu();
                 self.w.frame_pending = false;
                 self.w.dirty = true;
-                eprintln!("proteus: GPU recovered with {}", self.w.renderer.adapter_info);
+                tracing::info!(window = id, adapter = %self.w.renderer.adapter_info, "gpu recovered");
             }
             Err(e) => {
-                eprintln!("proteus: GPU recovery failed: {e}; retrying in two seconds");
+                tracing::warn!(window = id, "gpu recovery failed, retrying in two seconds: {e}");
                 let _ = self.handle.insert_source(Timer::from_duration(Duration::from_secs(2)), move |_, _, app| {
                     app.recover_gpu(id);
                     TimeoutAction::Drop
@@ -123,6 +146,7 @@ impl App {
         self.setup_accessibility();
         self.watch_gpu();
         self.style_window();
+        tracing::info!(window = id, "window created");
         Ok(id)
     }
 
@@ -178,6 +202,7 @@ impl App {
     /// Close the current window (it must have no tabs left). The last
     /// window ends the program.
     pub(super) fn destroy_window(&mut self) {
+        tracing::info!(window = self.w.id, last = self.parked.is_empty(), "window closed");
         if self.parked.is_empty() {
             self.exit = true;
             return;
@@ -208,7 +233,7 @@ impl App {
 
     pub(super) fn snapshot(&mut self, path: &std::path::Path) {
         if self.w.renderer.lost.load(std::sync::atomic::Ordering::Acquire) {
-            eprintln!("proteus: snapshot unavailable while the GPU is recovering");
+            tracing::warn!(window = self.w.id, path = %path.display(), "snapshot unavailable while the gpu is recovering");
             return;
         }
         let mut parts = self.frame_parts();
@@ -231,8 +256,9 @@ impl App {
         info.viewer = self.w.viewer.as_ref().map(|v| v.frame(area));
         let (w, h, px) = self.w.renderer.snapshot(&mut self.w.fonts, &info);
         drop(info);
-        if let Err(e) = image::save_buffer(path, &px, w, h, image::ColorType::Rgba8) {
-            eprintln!("proteus: snapshot: {e}");
+        match image::save_buffer(path, &px, w, h, image::ColorType::Rgba8) {
+            Ok(()) => tracing::info!(window = self.w.id, path = %path.display(), "snapshot saved"),
+            Err(e) => tracing::error!(window = self.w.id, path = %path.display(), "snapshot: {e}"),
         }
     }
 }

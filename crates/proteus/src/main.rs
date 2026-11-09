@@ -10,6 +10,7 @@ mod i18n;
 mod icat;
 mod ipc;
 mod layout;
+mod logging;
 mod modes;
 mod project;
 mod script;
@@ -113,6 +114,18 @@ fn load_config(cli: &Cli) -> (config::Loaded, Option<PathBuf>, Option<String>) {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    let cli_tool = cli.tool.is_some()
+        || cli.check_config
+        || cli.diagnostics
+        || cli.list_keybindings
+        || cli.list_actions
+        || cli.emit_lua_types.is_some();
+    let log_file = if cli_tool {
+        logging::init_stderr();
+        None
+    } else {
+        logging::init()
+    };
     match cli.tool {
         Some(Tool::Icat(args)) => return ExitCode::from(icat::run(args)),
         Some(Tool::Msg(args)) => {
@@ -179,7 +192,11 @@ fn main() -> ExitCode {
                 }
                 seen.push((*mode, *chord));
             }
-            println!("Selected GPU is reported in window startup logs.");
+            println!(
+                "log file: {}",
+                logging::log_path().map_or_else(|| "none (HOME is unset)".into(), |p| p.display().to_string())
+            );
+            println!("The selected GPU adapter is written to the log file at startup.");
         }
         if error.is_none() && cli.list_keybindings {
             let keymap = loaded.config.keymap();
@@ -207,7 +224,7 @@ fn main() -> ExitCode {
         };
     }
     if let Some(e) = &error {
-        eprintln!("proteus: config error, using defaults: {e}");
+        tracing::error!("config error, using defaults: {e}");
     }
     // Command-line font options win over the config (also after reloads).
     let overrides = gui::Overrides { font: cli.font, font_size: cli.font_size.map(|s| s.clamp(4.0, 96.0)) };
@@ -221,15 +238,15 @@ fn main() -> ExitCode {
             Some(path) => match path.and_then(|p| spec::load(&p)) {
                 Ok(s) => Some(s),
                 Err(e) => {
-                    eprintln!("proteus: layout: {e}");
+                    tracing::error!("layout: {e}");
                     return ExitCode::from(2);
                 }
             },
         };
-    match gui::run(loaded, config_path, overrides, error, command, layout, cli.listen) {
+    match gui::run(loaded, config_path, overrides, error, command, layout, cli.listen, log_file) {
         Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
         Err(e) => {
-            eprintln!("proteus: {e}");
+            tracing::error!("{e}");
             ExitCode::from(2)
         }
     }

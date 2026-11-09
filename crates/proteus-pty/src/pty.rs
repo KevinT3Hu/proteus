@@ -135,7 +135,7 @@ fn reaper() -> io::Result<mpsc::Sender<Child>> {
     REAPER
         .get_or_init(|| {
             let (tx, rx) = mpsc::channel::<Child>();
-            std::thread::Builder::new().name("pty-reaper".into()).spawn(move || {
+            let spawned = std::thread::Builder::new().name("pty-reaper".into()).spawn(move || {
                 let mut children = Vec::<Child>::new();
                 loop {
                     if children.is_empty() {
@@ -151,18 +151,34 @@ fn reaper() -> io::Result<mpsc::Sender<Child>> {
                         Err(mpsc::RecvTimeoutError::Disconnected) => std::thread::sleep(Duration::from_millis(25)),
                     }
                     children.extend(rx.try_iter().take(64));
-                    children.retain_mut(|child| match child.try_wait() {
-                        Ok(None) => true,
-                        Err(e) if e.kind() == io::ErrorKind::Interrupted => true,
-                        _ => false,
-                    });
+                    children.retain_mut(reap);
                 }
-            })?;
+            });
+            if let Err(e) = &spawned {
+                tracing::warn!(error = %e, "starting the pty reaper thread failed");
+            }
+            spawned?;
             Ok(tx)
         })
         .as_ref()
         .cloned()
         .map_err(|e| io::Error::new(e.kind(), e.to_string()))
+}
+
+/// False once `child` has exited (or can no longer be waited for).
+fn reap(child: &mut Child) -> bool {
+    match child.try_wait() {
+        Ok(None) => true,
+        Err(e) if e.kind() == io::ErrorKind::Interrupted => true,
+        Ok(Some(status)) => {
+            tracing::debug!(pid = child.id(), %status, "child reaped");
+            false
+        }
+        Err(e) => {
+            tracing::warn!(pid = child.id(), error = %e, "waiting for child failed; giving up on it");
+            false
+        }
+    }
 }
 
 /// Open a master and its slave. Prefers `TIOCGPTPEER` (no path lookup race).
@@ -189,10 +205,17 @@ impl Pty {
     /// Spawn `spec` as session leader with the PTY as controlling terminal.
     /// `TERM`, `COLORTERM` and `TERM_PROGRAM*` are set unless `spec` overrides them.
     pub fn spawn(spec: &CommandSpec, size: WindowSize) -> io::Result<Pty> {
+        let program = spec.program.display();
+        tracing::info!(%program, cwd = ?spec.cwd.as_deref(), cols = size.cols, rows = size.rows, "spawning child");
+        tracing::debug!(%program, args = ?spec.args, "child argv");
+        let context = |what: &str, e: io::Error| {
+            tracing::warn!(%program, error = %e, errno = e.raw_os_error(), "{what} failed");
+            io::Error::new(e.kind(), format!("{what} for {program}: {e}"))
+        };
         // Establish the cleanup worker before starting a child.
-        let reaper = reaper()?;
-        let (master, slave) = open_pair()?;
-        termios::tcsetwinsize(&slave, size.to_winsize())?;
+        let reaper = reaper().map_err(|e| context("starting the reaper", e))?;
+        let (master, slave) = open_pair().map_err(|e| context("opening a pty", e))?;
+        termios::tcsetwinsize(&slave, size.to_winsize()).map_err(|e| context("setting the pty size", e.into()))?;
 
         let mut cmd = Command::new(&spec.program);
         cmd.args(&spec.args)
@@ -222,7 +245,14 @@ impl Pty {
                 Ok(())
             });
         }
-        let child = cmd.spawn()?;
+        let child = cmd.spawn().map_err(|e| {
+            tracing::warn!(%program, cwd = ?spec.cwd.as_deref(), error = %e, errno = e.raw_os_error(), "spawn failed");
+            match &spec.cwd {
+                Some(dir) => io::Error::new(e.kind(), format!("spawn {program} in {}: {e}", dir.display())),
+                None => io::Error::new(e.kind(), format!("spawn {program}: {e}")),
+            }
+        })?;
+        tracing::info!(%program, pid = child.id(), "child started");
         Ok(Pty { master: File::from(master), child: Some(child), reaper })
     }
 
@@ -291,13 +321,18 @@ impl Pty {
     pub fn hangup(&self) {
         use rustix::process::{Signal, kill_process_group};
         let shell = Pid::from_raw(self.child_pid());
-        if let Some(pid) = shell {
-            let _ = kill_process_group(pid, Signal::HUP);
+        if let Some(pid) = shell
+            && let Err(e) = kill_process_group(pid, Signal::HUP)
+        {
+            tracing::debug!(pgrp = pid.as_raw_nonzero().get(), error = %e, "sighup to shell failed");
         }
         if let Some(fg) = self.foreground_pgrp().and_then(Pid::from_raw)
             && Some(fg) != shell
         {
-            let _ = kill_process_group(fg, Signal::HUP);
+            tracing::debug!(pgrp = fg.as_raw_nonzero().get(), "hanging up foreground job");
+            if let Err(e) = kill_process_group(fg, Signal::HUP) {
+                tracing::debug!(pgrp = fg.as_raw_nonzero().get(), error = %e, "sighup to foreground job failed");
+            }
             let _ = kill_process_group(fg, Signal::CONT);
         }
     }
@@ -306,12 +341,15 @@ impl Pty {
 impl Drop for Pty {
     fn drop(&mut self) {
         if matches!(self.try_wait(), Ok(None)) {
+            tracing::debug!(pid = self.child_pid(), "closing pty with a running child; sending sighup");
             self.hangup();
         }
         if let Some(child) = self.child.take() {
             // The process-wide sender keeps the receiver alive; the worker
             // owns this handle until wait succeeds, even after a delayed exit.
-            let _ = self.reaper.send(child);
+            if let Err(e) = self.reaper.send(child) {
+                tracing::warn!(pid = e.0.id(), "pty reaper is gone; child will not be reaped");
+            }
         }
     }
 }
@@ -355,6 +393,14 @@ mod tests {
         assert!(out.contains("tty-ok"), "{out:?}");
         assert!(out.contains("xterm-256color bar"), "{out:?}");
         assert!(pty.wait().unwrap().success());
+    }
+
+    #[test]
+    fn spawn_errors_name_the_program() {
+        let missing = "/nonexistent/proteus-test-program";
+        let err = Pty::spawn(&CommandSpec::new(missing), WindowSize::new(80, 24)).err().expect("spawn must fail");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(err.to_string().starts_with(&format!("spawn {missing}: ")), "{err}");
     }
 
     #[test]

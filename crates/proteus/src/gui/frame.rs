@@ -333,6 +333,14 @@ impl App {
     }
 
     pub(super) fn notice(&mut self, msg: String) {
+        tracing::debug!("notice: {msg}");
+        self.w.prompts.push_back(Prompt::Notice(msg));
+        self.w.dirty = true;
+    }
+
+    /// A notice about something that failed; it is logged too.
+    pub(super) fn notice_error(&mut self, msg: String) {
+        tracing::error!("{msg}");
         self.w.prompts.push_back(Prompt::Notice(msg));
         self.w.dirty = true;
     }
@@ -471,9 +479,21 @@ impl App {
         let area = self.viewer_area();
         let mut info = self.frame_parts().resolve(&self.panes, &self.pl.surfaces);
         info.viewer = self.w.viewer.as_ref().map(|v| v.frame(area));
-        let ok = self.w.renderer.draw(&mut self.w.fonts, &info);
+        let result = self.w.renderer.draw(&mut self.w.fonts, &info);
         drop(info);
-        if ok {
+        if let Err(why) = result {
+            use super::render::Skipped;
+            match why {
+                Skipped::DeviceLost => {}
+                Skipped::Outdated | Skipped::Lost | Skipped::Occluded => {
+                    tracing::debug!(window = self.w.id, reason = ?why, "surface unavailable; frame skipped")
+                }
+                Skipped::Timeout | Skipped::Validation => {
+                    tracing::warn!(window = self.w.id, reason = ?why, "surface unavailable; frame skipped")
+                }
+            }
+        }
+        if result.is_ok() {
             self.w.frame_pending = true;
             self.prompt_drawn();
         } else {

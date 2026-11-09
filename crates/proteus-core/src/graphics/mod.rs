@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 pub use decode::{DecodeError, DecodedImage, decode_image, image_dimensions};
-pub(crate) use decode::{DecodePermit, reserve_decode, run_in_background};
+pub(crate) use decode::{DecodePermit, log_decode_failure, reserve_decode, run_in_background};
 pub use image::ImageFormat;
 
 use crate::grid::{Grid, LineMap};
@@ -569,9 +569,24 @@ impl ImageStore {
                 .min_by_key(|i| (placed.contains(&i.key), i.last_used.load(Ordering::Relaxed)))
                 .map(|i| (i.key, placed.contains(&i.key)));
             match victim {
-                Some((key, false)) => self.remove_image(key),
-                Some((key, true)) => self.evict(key),
-                None => return Err(kitty::err("ENOSPC", "Image storage quota exceeded")),
+                Some((key, false)) => {
+                    tracing::debug!(image = key, need, "image budget full; removing an unplaced image");
+                    self.remove_image(key)
+                }
+                Some((key, true)) => {
+                    tracing::debug!(image = key, need, "image budget full; evicting a displayed image's pixels");
+                    self.evict(key)
+                }
+                None => {
+                    tracing::debug!(
+                        need,
+                        held = self.bytes,
+                        other,
+                        budget = cfg.pane_budget,
+                        "image storage quota exceeded"
+                    );
+                    return Err(kitty::err("ENOSPC", "Image storage quota exceeded"));
+                }
             }
         }
     }
@@ -605,6 +620,11 @@ impl ImageStore {
                 .min_by_key(|i| (placed.contains(&i.key), i.last_used.load(Ordering::Relaxed)))
                 .map(|i| i.key);
             if let Some(victim) = victim {
+                tracing::debug!(
+                    image = victim,
+                    max = MAX_IMAGES,
+                    "image limit reached; removing the least recently shown"
+                );
                 self.remove_image(victim);
             }
         }
@@ -644,6 +664,7 @@ impl ImageStore {
         if self.placements.len() >= MAX_PLACEMENTS
             && let Some(oldest) = self.placements.iter().map(|q| q.seq).min()
         {
+            tracing::debug!(max = MAX_PLACEMENTS, "placement limit reached; removing the oldest");
             self.remove_placements(|q| q.seq == oldest);
         }
         self.placements.push(p);

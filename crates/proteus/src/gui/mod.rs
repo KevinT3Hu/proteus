@@ -485,6 +485,8 @@ struct App {
     kbd_win: Option<WinId>,
     instance: wgpu::Instance,
     ipc_socket: Option<PathBuf>,
+    /// Where diagnostics are written (see [`crate::logging`]).
+    log_file: Option<PathBuf>,
     xdg: XdgShell,
     viewporter: Option<WpViewporter>,
     fractional_manager: Option<WpFractionalScaleManagerV1>,
@@ -715,6 +717,7 @@ pub fn diagnostic_protocols() -> Result<Vec<String>, String> {
 
 /// Run the GUI. `command` runs in the first pane instead of the shell;
 /// `layout` opens a layout file instead.
+#[allow(clippy::too_many_arguments)] // Everything main decided before the window opens.
 pub fn run(
     loaded: crate::config::Loaded,
     config_path: Option<PathBuf>,
@@ -723,6 +726,7 @@ pub fn run(
     command: Option<Vec<OsString>>,
     layout: Option<LayoutSpec>,
     listen: Option<PathBuf>,
+    log_file: Option<PathBuf>,
 ) -> io::Result<i32> {
     let err = |e: String| io::Error::other(e);
     let crate::config::Loaded { config: cfg, script } = loaded;
@@ -731,7 +735,9 @@ pub fn run(
     let qh = queue.handle();
     let mut event_loop: EventLoop<App> = EventLoop::try_new()?;
     let handle = event_loop.handle();
-    WaylandSource::new(conn.clone(), queue).insert(handle.clone()).map_err(|e| err(e.to_string()))?;
+    WaylandSource::new(conn.clone(), queue)
+        .insert(handle.clone())
+        .map_err(|e| err(format!("Wayland event source: {e}")))?;
 
     let compositor = CompositorState::bind(&globals, &qh).map_err(|e| err(format!("wl_compositor: {e}")))?;
     let xdg = XdgShell::bind(&globals, &qh).map_err(|e| err(format!("xdg_wm_base: {e}")))?;
@@ -759,9 +765,19 @@ pub fn run(
         &cfg,
         None,
     )?;
-    if std::env::var_os("PROTEUS_DEBUG").is_some() {
-        eprintln!("proteus: rendering with {}", first.renderer.adapter_info);
-        eprintln!("proteus: text-input-v3 {}", if text_input_manager.is_some() { "available" } else { "unavailable" });
+    tracing::info!(window = first.id, adapter = %first.renderer.adapter_info, "window created");
+    {
+        let protocol = |name: &str, present: bool| {
+            if present {
+                tracing::debug!(protocol = name, "wayland protocol available");
+            } else {
+                tracing::debug!(protocol = name, "wayland protocol missing");
+            }
+        };
+        protocol("wp_fractional_scale_manager_v1", fractional_manager.is_some());
+        protocol("wp_viewporter", viewporter.is_some());
+        protocol("ext_background_effect_manager_v1", blur_manager.is_some());
+        protocol("zwp_text_input_manager_v3", text_input_manager.is_some());
     }
 
     let (sender, rx) = channel::channel();
@@ -793,7 +809,7 @@ pub fn run(
             channel::Event::Msg(Msg::Dropped(s, list)) => app.surface_dropped(s, &list),
             channel::Event::Closed => app.exit = true,
         })
-        .map_err(|e| err(e.to_string()))?;
+        .map_err(|e| err(format!("event channel: {e}")))?;
 
     let notifier = notify::Notifier::new(sender.clone());
     let activation = ActivationState::bind(&globals, &qh).ok();
@@ -806,6 +822,7 @@ pub fn run(
         kbd_win: None,
         instance,
         ipc_socket: None,
+        log_file,
         xdg,
         viewporter,
         fractional_manager,
@@ -870,12 +887,12 @@ pub fn run(
         let sender = app.sender.clone();
         match crate::ipc::Server::start(path, move |call| sender.send(Msg::Ipc(call)).is_ok()) {
             Ok(server) => {
-                eprintln!("proteus: control socket {}", server.path.display());
+                tracing::info!(path = %server.path.display(), "control socket listening");
                 app.ipc_socket = Some(server.path.clone());
                 Some(server)
             }
             Err(e) => {
-                eprintln!("proteus: control socket: {e}");
+                tracing::error!("control socket: {e}");
                 None
             }
         }
@@ -891,7 +908,7 @@ pub fn run(
     app.watch_config();
     app.plugins_init();
     if let Some(e) = config_error {
-        app.toast(format!("config error (using the defaults): {e}"), true, Some(Duration::from_secs(15)));
+        app.show_toast(format!("config error (using the defaults): {e}"), true, Some(Duration::from_secs(15)));
     }
 
     // What to open: a layout, the saved session, or one pane.
@@ -905,7 +922,7 @@ pub fn run(
         (Some(l), _) => app.open_layout(&l)?,
         (None, Some(s)) if !explicit && app.cfg.restore == Restore::Always => {
             if let Err(e) = app.open_layout(&s) {
-                app.notice(format!("cannot restore session: {e}"));
+                app.notice_error(format!("cannot restore session: {e}"));
             }
         }
         (None, saved) => {
@@ -970,5 +987,6 @@ pub fn run(
     }
     let code = app.exit_code;
     drop(app);
+    tracing::info!(code, "proteus exiting");
     Ok(code)
 }

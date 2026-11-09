@@ -35,9 +35,19 @@ pub fn check(allowed: &[String], url: &str) -> Result<http::Uri, String> {
     }
     let port = uri.port_u16().unwrap_or(default_port);
     if !host_allowed(allowed, host, port, default_port) {
+        tracing::debug!(host, port, "permission denied: network");
         return Err(format!("permission denied: network:{host}"));
     }
     Ok(uri)
+}
+
+/// Logged by host only: paths and queries can carry tokens.
+fn log_failure(uri: &http::Uri, e: &str) {
+    let mut e = e.to_string();
+    if let Some(pq) = uri.path_and_query().map(|p| p.as_str()).filter(|p| p.len() > 1) {
+        e = e.replace(pq, "/…");
+    }
+    tracing::warn!(host = uri.host().unwrap_or_default(), error = %e, "plugin http request failed");
 }
 
 fn agent(global: Option<Duration>, response: Option<Duration>) -> ureq::Agent {
@@ -112,11 +122,18 @@ fn timeout(ms: u32) -> Duration {
 pub fn fetch(uri: http::Uri, req: HttpRequest, cancel: Arc<AtomicBool>) -> Result<HttpResponse, String> {
     let limit = timeout(req.timeout_ms);
     let agent = guarded(agent(Some(limit), None), &uri, cancel, limit);
-    let mut r = send(&agent, uri, req)?;
-    let status = r.status().as_u16();
-    let headers = headers(&r);
-    let body = r.body_mut().with_config().limit(MAX_BODY).read_to_vec().map_err(|e| e.to_string())?;
-    Ok(HttpResponse { status, headers, body })
+    let checked = uri.clone();
+    let result = (|| -> Result<HttpResponse, String> {
+        let mut r = send(&agent, uri, req)?;
+        let status = r.status().as_u16();
+        let headers = headers(&r);
+        let body = r.body_mut().with_config().limit(MAX_BODY).read_to_vec().map_err(|e| e.to_string())?;
+        Ok(HttpResponse { status, headers, body })
+    })();
+    if let Err(e) = &result {
+        log_failure(&checked, e);
+    }
+    result
 }
 
 /// `base` with the cancellable transport that also refuses loopback and
@@ -151,9 +168,12 @@ impl Streams {
             return Err(format!("stream {id} is still running"));
         }
         self.live.insert(id, cancel.clone());
+        let span = tracing::Span::current();
         std::thread::Builder::new()
             .name("plugin-http".into())
             .spawn(move || {
+                let _entered = span.enter();
+                let checked = uri.clone();
                 let result = (|| {
                     let idle = timeout(req.timeout_ms);
                     let agent = guarded(agent(None, Some(idle)), &uri, cancel.clone(), idle);
@@ -181,6 +201,9 @@ impl Streams {
                     }
                 })();
                 if !cancel.load(Ordering::Relaxed) {
+                    if let Err(e) = &result {
+                        log_failure(&checked, e);
+                    }
                     post.event(Event::HttpDone((id, result.err())));
                 }
             })

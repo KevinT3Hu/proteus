@@ -26,7 +26,8 @@ all = { level = "warn", priority = -1 }
 [profile.release]
 opt-level = "s"
 lto = true
-strip = true
+# Keep the name section: crash backtraces show function names.
+strip = "debuginfo"
 
 # Not part of the terminal workspace: built for wasm32-wasip2.
 [workspace]

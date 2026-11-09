@@ -56,7 +56,7 @@ impl Guest for Fixture {
                     host::storage_delete("key");
                     host::notify("delete returned", false);
                 }
-                "panic" => panic!("on purpose"),
+                "panic" => panic!("fixture panic"),
                 "alloc" => {
                     let v: Vec<u8> = vec![1; 1 << 30];
                     host::notify(&format!("allocated {}", v.len()), false);

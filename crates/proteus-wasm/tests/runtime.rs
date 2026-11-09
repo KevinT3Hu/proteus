@@ -79,7 +79,6 @@ fn start(name: &str, granted: Permissions) -> Host {
         data_dir: data.clone(),
         storage: storage.clone(),
         memory: 64 << 20,
-        stderr: false,
         compiled: Some(data.with_extension("compiled")),
     };
     let handle = runtime().start(spec, sink).unwrap();
@@ -206,12 +205,14 @@ fn failures_stop_the_instance() {
     let h = start("panic", ui.clone());
     h.wait(|m| matches!(m, FromPlugin::Started));
     let seen = h.act("panic");
-    assert!(seen.last().unwrap().starts_with("failed: crashed"), "{seen:?}");
+    let failed = seen.last().unwrap();
+    assert!(failed.starts_with("failed: crashed: panicked at src/lib.rs:"), "{seen:?}");
+    assert!(failed.ends_with(": fixture panic"), "{seen:?}");
 
     let h = start("alloc", ui.clone());
     h.wait(|m| matches!(m, FromPlugin::Started));
     let seen = h.act("alloc");
-    assert!(seen.last().unwrap().starts_with("failed:"), "{seen:?}");
+    assert!(seen.last().unwrap().starts_with("failed: crashed: memory allocation of"), "{seen:?}");
 
     let h = start("loop", ui.clone());
     h.wait(|m| matches!(m, FromPlugin::Started));

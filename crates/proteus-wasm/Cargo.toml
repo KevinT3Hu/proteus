@@ -20,6 +20,7 @@ rustix.workspace = true
 proteus-pty.workspace = true
 image.workspace = true
 tokio = { workspace = true, features = ["time"] }
+tracing.workspace = true
 
 [lints]
 workspace = true

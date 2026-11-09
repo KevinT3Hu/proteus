@@ -54,6 +54,13 @@ pub fn data_dir() -> Option<PathBuf> {
 
 /// Write the integration scripts under `dir` (only files whose content changed).
 pub fn install(dir: &Path) -> io::Result<()> {
+    install_files(dir).map_err(|e| {
+        tracing::debug!(dir = %dir.display(), error = %e, "installing shell integration failed");
+        io::Error::new(e.kind(), format!("install shell integration in {}: {e}", dir.display()))
+    })
+}
+
+fn install_files(dir: &Path) -> io::Result<()> {
     use rustix::fs::{AtFlags, Mode, OFlags, openat, renameat, unlinkat};
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -88,12 +95,16 @@ pub fn install(dir: &Path) -> io::Result<()> {
 /// Returns the shell that was set up, or `None` if the program is not a
 /// supported shell or its arguments make injection unsafe.
 pub fn inject(spec: &mut CommandSpec, dir: &Path) -> Option<Shell> {
-    let shell = detect(spec)?;
+    let Some(shell) = detect(spec) else {
+        tracing::debug!(program = %spec.program.display(), "not a supported shell; no integration injected");
+        return None;
+    };
     match shell {
         Shell::Bash => {
             // `--posix` + ENV only works for a plain interactive start; login shells
             // would read profile files twice. Custom arguments opt out.
             if spec.args.iter().any(|a| a != "-i") {
+                tracing::debug!(?shell, "custom shell arguments; no integration injected");
                 return None;
             }
             if let Some(env) = spec.get_env("ENV") {
@@ -124,6 +135,7 @@ pub fn inject(spec: &mut CommandSpec, dir: &Path) -> Option<Shell> {
         }
     }
     spec.set_env("PROTEUS_SHELL_INTEGRATION_DIR", dir);
+    tracing::debug!(?shell, dir = %dir.display(), "shell integration injected");
     Some(shell)
 }
 
@@ -133,32 +145,75 @@ pub fn inject(spec: &mut CommandSpec, dir: &Path) -> Option<Shell> {
 pub fn install_terminfo(dir: &Path) -> Option<PathBuf> {
     let out = dir.join(format!("{:016x}", crate::persistence::stable_hash(crate::TERMINFO_SRC.as_bytes())));
     // ncurses uses either `p/proteus` or the hex layout `70/proteus`.
-    let installed = || out.join("p/proteus").is_file() || out.join("70/proteus").is_file();
-    if installed() {
+    if terminfo_installed(&out) {
         return Some(out);
     }
-    std::fs::create_dir_all(dir).ok()?;
+    let fail = |what: &str, path: &Path, e: io::Error| {
+        let fallback = crate::TERM_FALLBACK;
+        tracing::warn!(path = %path.display(), error = %e, "terminfo install: {what} failed; using {fallback}");
+    };
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        fail("creating the directory", dir, e);
+        return None;
+    }
     // Build privately, then publish the complete database with one rename:
     // instances starting together never see or remove a partial one.
     static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = dir.join(format!(".build-{}-{seq}", std::process::id()));
-    std::fs::create_dir(&tmp).ok()?;
-    let src = tmp.join("proteus.terminfo");
-    let ok = std::fs::write(&src, crate::TERMINFO_SRC).is_ok()
-        && std::fs::create_dir(tmp.join("db")).is_ok()
-        && Command::new("tic")
-            .arg("-x")
-            .arg("-o")
-            .arg(tmp.join("db"))
-            .arg(&src)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
-        && (std::fs::rename(tmp.join("db"), &out).is_ok() || installed());
+    if let Err(e) = std::fs::create_dir(&tmp) {
+        fail("creating the build directory", &tmp, e);
+        return None;
+    }
+    let ok = build_terminfo(&tmp, &out, fail);
     let _ = std::fs::remove_dir_all(&tmp);
+    if ok {
+        tracing::debug!(dir = %out.display(), "terminfo installed");
+    }
     ok.then_some(out)
+}
+
+fn build_terminfo(tmp: &Path, out: &Path, fail: impl Fn(&str, &Path, io::Error)) -> bool {
+    static TIC_MISSING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let src = tmp.join("proteus.terminfo");
+    if let Err(e) = std::fs::write(&src, crate::TERMINFO_SRC) {
+        fail("writing the source", &src, e);
+        return false;
+    }
+    let db = tmp.join("db");
+    if let Err(e) = std::fs::create_dir(&db) {
+        fail("creating the database directory", &db, e);
+        return false;
+    }
+    match Command::new("tic").arg("-x").arg("-o").arg(&db).arg(&src).stdin(Stdio::null()).stdout(Stdio::null()).output()
+    {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            tracing::warn!(status = %o.status, stderr = %stderr.trim(), "tic failed; using {}", crate::TERM_FALLBACK);
+            return false;
+        }
+        Err(e) if TIC_MISSING.swap(true, std::sync::atomic::Ordering::Relaxed) => {
+            tracing::debug!(error = %e, "running tic failed");
+            return false;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "running tic failed; using {}", crate::TERM_FALLBACK);
+            return false;
+        }
+    }
+    match std::fs::rename(&db, out) {
+        Ok(()) => true,
+        Err(_) if terminfo_installed(out) => true,
+        Err(e) => {
+            fail("publishing the database", out, e);
+            false
+        }
+    }
+}
+
+fn terminfo_installed(out: &Path) -> bool {
+    out.join("p/proteus").is_file() || out.join("70/proteus").is_file()
 }
 
 /// Use `TERM=proteus` if its terminfo is available in `terminfo_dir`;

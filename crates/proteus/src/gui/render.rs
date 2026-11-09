@@ -279,6 +279,17 @@ pub struct Renderer {
     alpha_modes: Vec<wgpu::CompositeAlphaMode>,
 }
 
+/// Why [`Renderer::draw`] produced no frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Skipped {
+    DeviceLost,
+    Outdated,
+    Lost,
+    Timeout,
+    Occluded,
+    Validation,
+}
+
 fn rgba(c: Rgb, a: f32) -> [f32; 4] {
     [c.r as f32 / 255.0, c.g as f32 / 255.0, c.b as f32 / 255.0, a]
 }
@@ -367,6 +378,17 @@ impl Renderer {
             view_formats: vec![],
             color_space: wgpu::SurfaceColorSpace::Auto,
         };
+        tracing::info!(
+            adapter = %info.name,
+            backend = ?info.backend,
+            device_type = ?info.device_type,
+            driver = %info.driver,
+            driver_info = %info.driver_info,
+            format = ?format,
+            present_mode = ?config.present_mode,
+            alpha_mode = ?alpha_mode,
+            "gpu device created"
+        );
         surface.configure(&device, &config);
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -641,25 +663,31 @@ impl Renderer {
         }))
     }
 
-    /// Render one frame. Returns false if the surface was not available
-    /// (the caller should retry on the next frame).
-    pub fn draw(&mut self, fonts: &mut Fonts, info: &FrameInfo) -> bool {
+    /// Render one frame. Fails if the surface was not available (the caller
+    /// should retry on the next frame).
+    pub fn draw(&mut self, fonts: &mut Fonts, info: &FrameInfo) -> Result<(), Skipped> {
         if self.lost.load(Ordering::Acquire) {
-            return false;
+            return Err(Skipped::DeviceLost);
         }
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+            wgpu::CurrentSurfaceTexture::Outdated => {
                 self.surface.configure(&self.device, &self.config);
-                return false;
+                return Err(Skipped::Outdated);
             }
-            _ => return false,
+            wgpu::CurrentSurfaceTexture::Lost => {
+                self.surface.configure(&self.device, &self.config);
+                return Err(Skipped::Lost);
+            }
+            wgpu::CurrentSurfaceTexture::Timeout => return Err(Skipped::Timeout),
+            wgpu::CurrentSurfaceTexture::Occluded => return Err(Skipped::Occluded),
+            wgpu::CurrentSurfaceTexture::Validation => return Err(Skipped::Validation),
         };
         let view = frame.texture.create_view(&Default::default());
         let enc = self.encode(fonts, info, &view);
         self.queue.submit([enc]);
         self.queue.present(frame);
-        true
+        Ok(())
     }
 
     /// Render the current state offscreen and return it as RGBA8.

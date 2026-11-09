@@ -54,6 +54,8 @@ sha2 = "0.11.1"
 proteus-wasm = { path = "crates/proteus-wasm" }
 ureq = { version = "=3.4.2", default-features = false, features = ["rustls", "platform-verifier", "gzip"] }
 tokio = { version = "1.54.0", default-features = false }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

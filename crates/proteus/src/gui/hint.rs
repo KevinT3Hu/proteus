@@ -295,7 +295,7 @@ impl App {
                     let argv = editor_command(editor.as_deref().unwrap_or("vi"), &path, line, col);
                     let dir = path.parent().map(Path::to_path_buf);
                     if let Err(e) = self.split_with(None, dir, Some(argv)) {
-                        self.notice(e);
+                        self.notice_error(e);
                     }
                 } else {
                     self.xdg_open(&path_arg(&path), base.as_deref());
@@ -316,7 +316,7 @@ impl App {
             Ok(mut child) => {
                 let _ = std::thread::Builder::new().name("xdg-open".into()).spawn(move || child.wait());
             }
-            Err(e) => self.notice(format!("cannot run xdg-open: {e}")),
+            Err(e) => self.notice_error(format!("cannot run xdg-open: {e}")),
         }
     }
 

@@ -19,12 +19,12 @@ impl App {
         if let Some(parent) = path.parent()
             && let Err(e) = std::fs::create_dir_all(parent)
         {
-            return self.notice(format!("{}: {e}", parent.display()));
+            return self.notice_error(format!("{}: {e}", parent.display()));
         }
         let editor = std::env::var("VISUAL").ok().filter(|s| !s.is_empty()).or_else(|| std::env::var("EDITOR").ok());
         let argv = super::hint::editor_command(editor.as_deref().unwrap_or("vi"), path, None, None);
         if let Err(e) = self.split_with(None, path.parent().map(std::path::Path::to_path_buf), Some(argv)) {
-            self.notice(e);
+            self.notice_error(e);
         }
     }
 

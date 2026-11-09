@@ -111,7 +111,7 @@ impl SeatHandler for App {
             let repeat = Box::new(|app: &mut App, _: &WlKeyboard, ev: KeyEvent| app.key(ev, KeyAction::Repeat));
             match self.seat_state.get_keyboard_with_repeat(qh, &seat, None, self.handle.clone(), repeat) {
                 Ok(k) => self.keyboard = Some(k),
-                Err(e) => eprintln!("proteus: keyboard: {e}"),
+                Err(e) => tracing::error!("cannot use the keyboard: {e}"),
             }
             if self.ime.is_none()
                 && let Some(m) = &self.text_input_manager
@@ -129,7 +129,7 @@ impl SeatHandler for App {
                 ThemeSpec::default(),
             ) {
                 Ok(p) => self.pointer = Some(p),
-                Err(e) => eprintln!("proteus: pointer: {e}"),
+                Err(e) => tracing::error!("cannot use the pointer: {e}"),
             }
         }
     }

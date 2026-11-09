@@ -11,7 +11,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -24,6 +24,7 @@ use wasmtime_wasi::{FsPerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use crate::files::{self, Access, Watcher};
 use crate::manifest::Permissions;
 use crate::net::{self, Streams};
+use crate::output::{GuestOutput, Stream};
 use crate::process::{self, Processes};
 use crate::secrets::{self, Keyring};
 use crate::storage::Storage;
@@ -273,8 +274,6 @@ pub struct Spec {
     /// Its key-value store.
     pub storage: PathBuf,
     pub memory: usize,
-    /// Pass the plugin's stderr through (debugging).
-    pub stderr: bool,
     /// Reserved for API compatibility. Native disk caches are intentionally ignored.
     pub compiled: Option<PathBuf>,
 }
@@ -290,6 +289,8 @@ impl Runtime {
         let mut config = Config::new();
         config.epoch_interruption(true);
         config.wasm_component_model(true);
+        // Function names come from the component's name section.
+        config.wasm_backtrace_max_frames(std::num::NonZeroUsize::new(32));
         let engine = Engine::new(&config).map_err(|e| e.to_string())?;
         let weak = engine.weak();
         std::thread::Builder::new()
@@ -319,6 +320,8 @@ impl Runtime {
             .name(format!("plugin {}", spec.key.id))
             .spawn(move || {
                 let key = spec.key.clone();
+                let span = tracing::info_span!("plugin", id = %key.id, instance = key.instance);
+                let _entered = span.enter();
                 let msg = match run(&engine, &cache, spec, rx, &sink, poster) {
                     Ok(()) => FromPlugin::Exited,
                     Err(e) => FromPlugin::Failed(e),
@@ -326,7 +329,16 @@ impl Runtime {
                 sink(key, msg);
             })
             .map_err(|e| e.to_string())?;
-        Ok(Handle { key, tx, stop, granted, pending, dropped: Arc::default() })
+        Ok(Handle {
+            key,
+            tx,
+            stop,
+            granted,
+            pending,
+            dropped: Arc::default(),
+            born: Instant::now(),
+            reported: AtomicU64::new(u64::MAX),
+        })
     }
 }
 
@@ -338,6 +350,9 @@ pub struct Handle {
     granted: Permissions,
     pending: Pending,
     dropped: Arc<AtomicUsize>,
+    born: Instant,
+    /// When dropped events were last logged (ms since `born`).
+    reported: AtomicU64,
 }
 
 impl Handle {
@@ -356,7 +371,7 @@ impl Handle {
         if self.tx.try_send(ToPlugin::Event(e)).is_ok() {
             pending.insert(k, None);
         } else {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
+            self.note_dropped();
         }
     }
 
@@ -366,7 +381,19 @@ impl Handle {
 
     fn send(&self, m: ToPlugin) {
         if self.tx.try_send(m).is_err() {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
+            self.note_dropped();
+        }
+    }
+
+    /// Counted, and logged at most once a second.
+    fn note_dropped(&self) {
+        let n = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+        let now = self.born.elapsed().as_millis() as u64;
+        let last = self.reported.load(Ordering::Relaxed);
+        if (last == u64::MAX || now.saturating_sub(last) >= 1000)
+            && self.reported.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+        {
+            tracing::debug!(plugin = %self.key.id, dropped = n, "plugin is behind; events dropped");
         }
     }
 
@@ -431,6 +458,7 @@ impl WasiView for State {
 }
 
 fn denied(name: &str) -> String {
+    tracing::debug!(permission = name, "permission denied");
     format!("permission denied: {name}")
 }
 
@@ -470,9 +498,11 @@ impl State {
     fn blocking<T: Send + 'static>(&mut self, f: impl FnOnce() -> T + Send + 'static) -> Result<T, String> {
         self.excluded(|s| {
             let (tx, rx) = mpsc::channel();
+            let span = tracing::Span::current();
             std::thread::Builder::new()
                 .name("plugin-call".into())
                 .spawn(move || {
+                    let _entered = span.enter();
                     let _ = tx.send(f());
                 })
                 .map_err(|e| e.to_string())?;
@@ -1130,7 +1160,6 @@ fn mailto_allowed(url: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// A trap's message: the reason first, without the wasm backtrace.
 /// Replace WASI's blocking `poll` and `pollable.block` with versions that
 /// give up when the plugin is stopped or its call runs out of time. Epoch
 /// interruption only reaches running WASM code, not a guest asleep in the host.
@@ -1181,21 +1210,43 @@ async fn until_stopped<T>(
     }
 }
 
-fn trap_message(e: &wasmtime::Error, state: &State) -> String {
+/// A failure's message for the user: the reason first (a guest panic's
+/// message and location when it printed one), without the WASM backtrace.
+fn trap_message(e: &wasmtime::Error, state: &State, panic: Option<String>) -> String {
     if let Some(f) = &state.fault {
         return f.clone();
     }
     if state.stop.load(Ordering::Relaxed) {
         return "stopped".into();
     }
+    if let Some(wasmtime::Trap::Interrupt) = e.downcast_ref::<wasmtime::Trap>() {
+        return format!("ran longer than {} s and was stopped", CALL_LIMIT.as_secs());
+    }
+    if let Some(p) = panic {
+        return format!("crashed: {p}");
+    }
     if let Some(t) = e.downcast_ref::<wasmtime::Trap>() {
-        return match t {
-            wasmtime::Trap::Interrupt => format!("ran longer than {} s and was stopped", CALL_LIMIT.as_secs()),
-            t => format!("crashed: {t}"),
-        };
+        return format!("crashed: {t}");
     }
     let s = format!("{e:#}");
     format!("crashed: {}", s.lines().next().unwrap_or(""))
+}
+
+/// Why a call into the plugin failed; the details (error chain with the
+/// WASM backtrace, the end of its stderr) go to the log.
+fn failure(e: &wasmtime::Error, state: &State, stderr: &GuestOutput) -> String {
+    let msg = trap_message(e, state, stderr.panic());
+    if state.fault.is_none() && state.stop.load(Ordering::Relaxed) {
+        tracing::debug!("plugin stopped during a call");
+        return msg;
+    }
+    let tail = stderr.tail();
+    if tail.is_empty() {
+        tracing::error!(error = ?e, "plugin failed: {msg}");
+    } else {
+        tracing::error!(error = ?e, stderr = %tail, "plugin failed: {msg}");
+    }
+    msg
 }
 
 enum Wake<T> {
@@ -1241,9 +1292,10 @@ fn run(
     let component = match cached {
         Some(c) => c,
         None => {
+            tracing::debug!(hash = &spec.hash[..spec.hash.len().min(12)], "compiling plugin");
             // Only compile verified WASM bytes. Serialized native components
             // cannot be authenticated by pathname ownership/mode checks.
-            let c = Component::new(engine, &spec.wasm).map_err(|e| format!("not a valid plugin: {e}"))?;
+            let c = Component::new(engine, &spec.wasm).map_err(|e| format!("not a valid plugin: {e:#}"))?;
             let mut cache = cache.lock().map_err(err)?;
             if cache.len() >= 16 {
                 cache.clear();
@@ -1262,9 +1314,9 @@ fn run(
     if let Some(home) = std::env::var_os("HOME").and_then(|h| h.into_string().ok()) {
         wasi.env("HOME", home);
     }
-    if spec.stderr {
-        wasi.inherit_stderr();
-    }
+    let stderr = GuestOutput::new(&spec.key.id, Stream::Stderr);
+    wasi.stdout(GuestOutput::new(&spec.key.id, Stream::Stdout));
+    wasi.stderr(stderr.clone());
     std::fs::create_dir_all(&spec.data_dir).map_err(|e| format!("{}: {e}", spec.data_dir.display()))?;
     for f in &spec.granted.fs {
         f.validate_directory()?;
@@ -1330,7 +1382,7 @@ fn run(
             $store.set_epoch_deadline(1);
             match $call {
                 Ok(v) => v,
-                Err(e) => return Err(trap_message(&e, $store.data())),
+                Err(e) => return Err(failure(&e, $store.data(), &stderr)),
             }
         }};
     }

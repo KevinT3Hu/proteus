@@ -56,6 +56,10 @@ pub struct Pane {
     /// Foreground process group, whether the pane's output is local, and
     /// when that was checked.
     fg_local: Option<(i32, bool, Instant)>,
+    /// Locality last written to the log.
+    logged_local: Option<bool>,
+    /// `pane{id}` for log events about this pane (none for plugin panes).
+    span: tracing::Span,
 }
 
 /// How long [`Pane::update_locality`] trusts its last look at `/proc`.
@@ -123,9 +127,9 @@ fn parse_stat(pid: i32, stat: &str) -> Option<Proc> {
     Some((pid, ppid, session, comm))
 }
 
-/// Whether a process in session `shell` (the shell is its leader) or
-/// descending from the shell runs a [`REMOTE_PROGRAMS`] entry.
-fn remote_in_session(procs: &[Proc], shell: i32) -> bool {
+/// The [`REMOTE_PROGRAMS`] entry a process in session `shell` (the shell is
+/// its leader) or descending from the shell runs, if any.
+fn remote_in_session(procs: &[Proc], shell: i32) -> Option<&str> {
     let mut children: HashMap<i32, Vec<i32>> = HashMap::new();
     for p in procs {
         children.entry(p.1).or_default().push(p.0);
@@ -138,7 +142,7 @@ fn remote_in_session(procs: &[Proc], shell: i32) -> bool {
         }
     }
     let remote = |comm: &str| REMOTE_PROGRAMS.contains(&comm.split(':').next().unwrap_or(comm));
-    procs.iter().any(|p| ours.contains(&p.0) && remote(&p.3))
+    procs.iter().find(|p| ours.contains(&p.0) && remote(&p.3)).map(|p| p.3.as_str())
 }
 
 impl Pane {
@@ -149,7 +153,8 @@ impl Pane {
         cell: (u32, u32),
         tx: Sender<Msg>,
     ) -> io::Result<Pane> {
-        let (pty, _shell) = session::spawn_pty(opts)?;
+        let span = tracing::info_span!("pane", id);
+        let (pty, _shell) = span.in_scope(|| session::spawn_pty(opts))?;
         let mut term = Terminal::new(opts.cols as usize, opts.rows as usize, core);
         term.set_cell_pixel_size(cell.0, cell.1);
         let writer = InputWriter::new(pty.try_clone_master()?)?;
@@ -160,15 +165,19 @@ impl Pane {
         static OUTPUT: std::sync::OnceLock<Budget> = std::sync::OnceLock::new();
         let total = OUTPUT.get_or_init(|| Budget::new(512 << 10, 64)).clone();
         let pending = Budget::new(64 << 10, 8);
+        let pane_span = span.clone();
         std::thread::Builder::new().name(format!("pty-reader-{id}")).spawn(move || {
+            let _span = span.entered();
             let mut buf = vec![0u8; 8 * 1024];
             loop {
                 if stop.load(Ordering::Relaxed) {
+                    tracing::trace!("pty reader stopped");
                     return;
                 }
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
+                        tracing::trace!(bytes = n, "pty output");
                         let Some(local) = pending.acquire(n, &stop) else { return };
                         let Some(global) = total.acquire(n, &stop) else { return };
                         if tx.send(Msg::Pty(id, buf[..n].to_vec(), (local, global))).is_err() {
@@ -184,11 +193,20 @@ impl Pane {
                         if let Err(e) = rustix::event::poll(&mut polls, Some(&wait))
                             && e != rustix::io::Errno::INTR
                         {
+                            tracing::warn!("pty poll failed: {e}");
                             break;
                         }
                         continue;
                     }
-                    Err(_) => break,
+                    Err(e) => {
+                        // EIO is how the master reports that the child side closed.
+                        if e.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error()) {
+                            tracing::debug!("pty closed");
+                        } else {
+                            tracing::warn!("pty read failed: {e}");
+                        }
+                        break;
+                    }
                 }
             }
             let _ = tx.send(Msg::PtyClosed(id));
@@ -213,6 +231,8 @@ impl Pane {
             plugin: None,
             deferred_size: None,
             fg_local: None,
+            logged_local: None,
+            span: pane_span,
         };
         pane.refresh_proc_title();
         Ok(pane)
@@ -239,6 +259,8 @@ impl Pane {
             plugin: None,
             deferred_size: None,
             fg_local: None,
+            logged_local: None,
+            span: tracing::Span::none(),
         }
     }
 
@@ -271,7 +293,8 @@ impl Pane {
 
     pub fn write(&mut self, bytes: &[u8]) {
         if let Err(e) = self.try_write(bytes) {
-            eprintln!("proteus: queue input to pty: {e}");
+            let pid = self.pty.as_ref().map(|p| p.child_pid());
+            self.span.in_scope(|| tracing::warn!(pid, bytes = bytes.len(), "queue input to pty: {e}"));
         }
     }
 
@@ -309,7 +332,11 @@ impl Pane {
             && let Some(pty) = &self.pty
         {
             self.size = ws;
-            let _ = pty.resize(ws);
+            let _span = self.span.enter();
+            tracing::debug!(pid = pty.child_pid(), cols, rows, "pty resized");
+            if let Err(e) = pty.resize(ws) {
+                tracing::warn!(pid = pty.child_pid(), cols, rows, "pty resize failed: {e}");
+            }
         }
     }
 
@@ -329,6 +356,11 @@ impl Pane {
         }
         pty.hangup();
         exited(pty).unwrap_or(0)
+    }
+
+    /// Exit status if the child has already exited (it is not signalled).
+    pub fn exit_status(&mut self) -> Option<i32> {
+        exited(self.pty.as_mut()?)
     }
 
     /// Hang up and wait up to `grace` for the exit status; then kill the
@@ -371,7 +403,15 @@ impl Pane {
                 Some((pgrp, shell)) => match self.fg_local {
                     Some((cached, local, at)) if cached == pgrp && at.elapsed() < LOCALITY_TTL => local,
                     _ => {
-                        let local = !remote_in_session(&processes(), shell);
+                        let procs = processes();
+                        let remote = remote_in_session(&procs, shell);
+                        let local = remote.is_none();
+                        if self.logged_local != Some(local) {
+                            self.logged_local = Some(local);
+                            self.span.in_scope(|| {
+                                tracing::debug!(shell, local, remote_program = remote, "pane locality changed")
+                            });
+                        }
                         self.fg_local = Some((pgrp, local, Instant::now()));
                         local
                     }
@@ -513,16 +553,16 @@ mod tests {
     fn remote_programs_anywhere_in_the_session_count() {
         let p = |pid, ppid, sid, comm: &str| (pid, ppid, sid, comm.to_string());
         let base = vec![p(1, 0, 1, "systemd"), p(10, 1, 10, "bash"), p(11, 10, 10, "myssh.sh"), p(20, 1, 20, "ssh")];
-        assert!(!remote_in_session(&base, 10));
+        assert_eq!(remote_in_session(&base, 10), None);
         let mut wrapped = base.clone();
         wrapped.push(p(12, 11, 10, "ssh"));
-        assert!(remote_in_session(&wrapped, 10));
+        assert_eq!(remote_in_session(&wrapped, 10), Some("ssh"));
         let mut sudo = base.clone();
         sudo.extend([p(12, 10, 10, "sudo"), p(13, 12, 13, "ssh")]);
-        assert!(remote_in_session(&sudo, 10));
+        assert_eq!(remote_in_session(&sudo, 10), Some("ssh"));
         let mut tmux = base;
         tmux.push(p(12, 10, 10, "tmux: client"));
-        assert!(remote_in_session(&tmux, 10));
+        assert_eq!(remote_in_session(&tmux, 10), Some("tmux: client"));
     }
 
     #[test]

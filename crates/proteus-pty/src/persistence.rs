@@ -4,7 +4,7 @@ use rustix::fs::{AtFlags, Mode, OFlags, openat, renameat, unlinkat};
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -19,13 +19,16 @@ pub struct Lock(File);
 
 impl Drop for Lock {
     fn drop(&mut self) {
-        let _ = rustix::fs::flock(&self.0, rustix::fs::FlockOperation::Unlock);
+        if let Err(e) = rustix::fs::flock(&self.0, rustix::fs::FlockOperation::Unlock) {
+            tracing::warn!(error = %e, "releasing state file lock failed");
+        }
     }
 }
 
 pub struct StateFile {
     dir: File,
     name: OsString,
+    path: PathBuf,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -50,8 +53,13 @@ impl StateFile {
         let path = if path.is_absolute() { path.to_path_buf() } else { std::env::current_dir()?.join(path) };
         let name = path.file_name().ok_or(io::ErrorKind::InvalidInput)?.to_owned();
         let parent = path.parent().ok_or(io::ErrorKind::InvalidInput)?;
-        let dir = if private { crate::secure_fs::state_dir(parent)? } else { crate::secure_fs::trusted_dir(parent)? };
-        Ok(Self { dir, name })
+        let dir = if private { crate::secure_fs::state_dir(parent) } else { crate::secure_fs::trusted_dir(parent) };
+        let dir = dir.map_err(|e| context("open state directory for", &path, e))?;
+        Ok(Self { dir, name, path })
+    }
+
+    fn sibling(&self, name: &std::ffi::OsStr) -> PathBuf {
+        self.path.with_file_name(name)
     }
 
     fn open_private(&self, name: &std::ffi::OsStr, flags: OFlags) -> io::Result<File> {
@@ -81,13 +89,15 @@ impl StateFile {
     pub fn lock(&self, nonblocking: bool) -> io::Result<Lock> {
         let mut name = self.name.clone();
         name.push(".lock");
-        let lock = self.open_private(&name, OFlags::RDWR | OFlags::CREATE)?;
+        let lock = self
+            .open_private(&name, OFlags::RDWR | OFlags::CREATE)
+            .map_err(|e| context("open lock file", &self.sibling(&name), e))?;
         let op = if nonblocking {
             rustix::fs::FlockOperation::NonBlockingLockExclusive
         } else {
             rustix::fs::FlockOperation::LockExclusive
         };
-        rustix::fs::flock(&lock, op)?;
+        rustix::fs::flock(&lock, op).map_err(|e| context("lock", &self.sibling(&name), e.into()))?;
         Ok(Lock(lock))
     }
 
@@ -97,12 +107,15 @@ impl StateFile {
         let file = match self.open_private(&self.name, OFlags::RDONLY) {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e),
+            Err(e) => return Err(context("open", &self.path, e)),
         };
         let mut bytes = Vec::new();
-        file.take(max.saturating_add(1) as u64).read_to_end(&mut bytes)?;
+        file.take(max.saturating_add(1) as u64).read_to_end(&mut bytes).map_err(|e| context("read", &self.path, e))?;
         if bytes.len() > max {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "state file exceeds size limit"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("state file {} exceeds size limit ({max} bytes)", self.path.display()),
+            ));
         }
         Ok(Some(bytes))
     }
@@ -113,8 +126,9 @@ impl StateFile {
 
     fn write_with(&self, bytes: &[u8], mut checkpoint: impl FnMut(Stage) -> io::Result<()>) -> io::Result<()> {
         let temp = format!(".state-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed));
-        let mut file =
-            self.open_private(std::ffi::OsStr::new(&temp), OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL)?;
+        let mut file = self
+            .open_private(std::ffi::OsStr::new(&temp), OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL)
+            .map_err(|e| context("create temporary file for", &self.path, e))?;
         let result = (|| {
             file.write_all(bytes)?;
             checkpoint(Stage::Written)?;
@@ -126,8 +140,14 @@ impl StateFile {
         })();
         // After rename this name no longer exists; before rename a failed
         // write leaves the previous snapshot untouched.
-        let _ = unlinkat(&self.dir, &temp, AtFlags::empty());
-        result
+        match unlinkat(&self.dir, &temp, AtFlags::empty()) {
+            Ok(()) | Err(rustix::io::Errno::NOENT) => {}
+            Err(e) => {
+                let temp = self.sibling(std::ffi::OsStr::new(&temp));
+                tracing::warn!(path = %temp.display(), error = %e, "removing temporary state file failed");
+            }
+        }
+        result.map_err(|e| context("write", &self.path, e))
     }
 
     /// Keep corrupt session bytes available for manual recovery before a new
@@ -135,15 +155,20 @@ impl StateFile {
     pub fn backup(&self, bytes: &[u8]) -> io::Result<OsString> {
         let mut name = self.name.clone();
         name.push(format!(".corrupt-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
-        let mut file = self.open_private(&name, OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL)?;
+        let backup = self.sibling(&name);
+        let mut file = self
+            .open_private(&name, OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL)
+            .map_err(|e| context("create backup", &backup, e))?;
         let result = (|| {
             file.write_all(bytes)?;
             file.sync_all()?;
             self.dir.sync_all()
         })();
         if let Err(e) = result {
-            let _ = unlinkat(&self.dir, &name, AtFlags::empty());
-            return Err(e);
+            if let Err(e) = unlinkat(&self.dir, &name, AtFlags::empty()) {
+                tracing::warn!(path = %backup.display(), error = %e, "removing incomplete backup failed");
+            }
+            return Err(context("write backup", &backup, e));
         }
         Ok(name)
     }
@@ -152,10 +177,16 @@ impl StateFile {
         match unlinkat(&self.dir, &self.name, AtFlags::empty()) {
             Ok(()) => {}
             Err(rustix::io::Errno::NOENT) => {}
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(context("remove", &self.path, e.into())),
         }
-        self.dir.sync_all()
+        self.dir.sync_all().map_err(|e| context("sync directory of", &self.path, e))
     }
+}
+
+/// `e` with the operation and path in its message; the kind is kept.
+fn context(op: &str, path: &Path, e: io::Error) -> io::Error {
+    tracing::debug!(op, path = %path.display(), error = %e, "state file operation failed");
+    io::Error::new(e.kind(), format!("{op} {}: {e}", path.display()))
 }
 
 #[cfg(test)]
@@ -241,6 +272,7 @@ mod tests {
         assert_eq!(file.read(100).unwrap().unwrap(), b"published");
         file.write(b"published").unwrap(); // Retrying also performs both syncs.
         assert!(file.read(2).is_err());
+        assert!(file.read(2).unwrap_err().to_string().contains(&path.display().to_string()));
         let backup = file.backup(b"malformed original").unwrap();
         assert_eq!(std::fs::read(dir.join(backup)).unwrap(), b"malformed original");
         let lock = file.lock(true).unwrap();

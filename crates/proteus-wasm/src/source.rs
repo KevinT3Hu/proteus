@@ -265,7 +265,9 @@ impl Cache {
             .arg(&manifest)
             .arg("--target-dir")
             .arg(slot.join("target"));
+        let started = std::time::Instant::now();
         let out = timed(&mut cmd, BUILD_TIMEOUT).map_err(|e| format!("cargo build: {e}"))?;
+        tracing::debug!(dir = %dir.display(), status = %out.status, elapsed = ?started.elapsed(), "plugin build finished");
         if !out.status.success() {
             return Err(format!(
                 "plugin build in {} failed (requires the wasm32-wasip2 Rust target):\n{}",
@@ -325,6 +327,7 @@ fn command(cmd: &mut Command, label: &str) -> Result<(), String> {
         cmd.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
     }
     let out = timed(cmd, GIT_TIMEOUT).map_err(|e| format!("{label}: {e}"))?;
+    tracing::debug!(command = label, status = %out.status, "git finished");
     if out.status.success() { Ok(()) } else { Err(format!("{label}: {}", String::from_utf8_lossy(&out.stderr))) }
 }
 

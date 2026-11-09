@@ -174,6 +174,12 @@ impl Terminal {
                         self.osc_head.extend_from_slice(&rest[..len.min(5 - head)]);
                     }
                     if self.osc_len + len > self.max_osc() {
+                        tracing::debug!(
+                            kind = "osc",
+                            size = self.osc_len + len,
+                            max = self.max_osc(),
+                            "dropping oversized string"
+                        );
                         self.advance_parser(parser, &bytes[start..i]);
                         self.osc_drop = true;
                         self.advance_parser(parser, b"\x07");
@@ -290,6 +296,7 @@ impl Terminal {
         }
         let max = self.config.graphics.max_image_bytes / 3 * 4 + 8192;
         if self.apc_buf.len() + chunk.len() > max {
+            tracing::debug!(kind = "apc", size = self.apc_buf.len() + chunk.len(), max, "dropping oversized string");
             self.apc_overflow = true;
             self.apc_buf = Vec::new();
         } else {
@@ -450,6 +457,16 @@ impl Terminal {
     }
 
     fn kitty_reply(&mut self, cmd: &Command, id: u32, number: u32, pid: u32, r: Result<(), Error>) {
+        if let Err(e) = &r {
+            tracing::debug!(
+                action = %char::from(cmd.action()),
+                medium = %char::from(cmd.ch(b't', b'd')),
+                id,
+                number,
+                error = %e,
+                "kitty graphics command failed"
+            );
+        }
         if id == 0 && number == 0 {
             return;
         }
@@ -507,6 +524,15 @@ impl Terminal {
             Some(m) => {
                 let bad = || err("EBADF", "Failed to read image file");
                 if !self.files_allowed() {
+                    let g = &self.config.graphics;
+                    let reason = if !g.allow_local_files {
+                        "local file media disabled"
+                    } else if !self.local {
+                        "pane is not local"
+                    } else {
+                        "cwd reported on another host"
+                    };
+                    tracing::debug!(medium = ?m, reason, "kitty graphics file medium refused");
                     return Err(bad());
                 }
                 media::read(m, &raw, cmd.u(b'S') as u64, cmd.u(b'O') as u64, max).map_err(|_| bad())?
@@ -578,7 +604,10 @@ impl Terminal {
         let max = self.config.graphics.max_image_bytes;
         let (w, h) = match image_dimensions(&data) {
             Some((w, h)) if w > 0 && h > 0 => (w, h),
-            _ => return self.kitty_reply(&cmd, id, number, 0, Err(err("EBADPNG", "Failed to decode image"))),
+            _ => {
+                crate::graphics::log_decode_failure(&data, "unreadable or empty image header");
+                return self.kitty_reply(&cmd, id, number, 0, Err(err("EBADPNG", "Failed to decode image")));
+            }
         };
         let bytes = w as usize * h as usize * 4;
         if bytes > max {
@@ -636,7 +665,15 @@ impl Terminal {
         };
         run_in_background(Box::new(move || {
             let decode = std::panic::AssertUnwindSafe(|| decode_image(&data, max));
-            let result = std::panic::catch_unwind(decode).unwrap_or_else(|_| Err(DecodeError::Invalid("panic".into())));
+            let result = std::panic::catch_unwind(decode).unwrap_or_else(|payload| {
+                let message = payload
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("non-string panic payload");
+                tracing::error!(panic = message, len = data.len(), "image decoder panicked");
+                Err(DecodeError::Invalid("panic".into()))
+            });
             if tx.send(Decoded { key, _permit: Some(permit), result, reply }).is_ok()
                 && let Some(w) = waker
             {
@@ -692,6 +729,12 @@ impl Terminal {
                     Ok(())
                 }
                 Some(img) if (dec.width, dec.height) != img.size() => {
+                    tracing::warn!(
+                        format = ?dec.format,
+                        header = ?img.size(),
+                        decoded = ?(dec.width, dec.height),
+                        "image size differs from its header"
+                    );
                     Err(err("EBADPNG", "Image size differs from its header"))
                 }
                 Some(img) => {
@@ -704,11 +747,19 @@ impl Terminal {
                     let rest: Vec<(Vec<u8>, u32)> =
                         if d.reply.is_none() { frames.take(MAX_FRAMES - 1).collect() } else { Vec::new() };
                     let need = rest.len() * img.extra_frame_bytes();
-                    if !rest.is_empty() && store.reserve(need, other, &self.config.graphics, Some(key)).is_ok() {
-                        let img = store.image_mut(key).expect("protected from eviction");
-                        img.frames[0].gap = gif_gap(delay);
-                        img.frames.extend(rest.into_iter().map(|(pixels, d)| Frame { pixels, gap: gif_gap(d) }));
-                        img.state = AnimationState::Running;
+                    if !rest.is_empty() {
+                        if store.reserve(need, other, &self.config.graphics, Some(key)).is_ok() {
+                            let img = store.image_mut(key).expect("protected from eviction");
+                            img.frames[0].gap = gif_gap(delay);
+                            img.frames.extend(rest.into_iter().map(|(pixels, d)| Frame { pixels, gap: gif_gap(d) }));
+                            img.state = AnimationState::Running;
+                        } else {
+                            tracing::debug!(
+                                frames = rest.len() + 1,
+                                bytes = need,
+                                "no room for animation frames; showing the first only"
+                            );
+                        }
                     }
                     Ok(())
                 }
@@ -1096,7 +1147,8 @@ impl Terminal {
         let extra = frames.as_ref().map_or(0, |f| f.len().saturating_sub(1));
         let need = frame + extra * frame.max(FRAME_OVERHEAD);
         let other = self.images_inactive.bytes();
-        if self.images.reserve(need, other, &self.config.graphics, None).is_err() {
+        if let Err(e) = self.images.reserve(need, other, &self.config.graphics, None) {
+            tracing::debug!(?source, width = w, height = h, bytes = need, error = %e, "image not stored");
             return None;
         }
         let img = match frames {
@@ -1150,6 +1202,12 @@ impl Terminal {
         } else if let Some(part) = body.strip_prefix("FilePart=") {
             if let Some((_, buf)) = &mut self.iterm_multipart {
                 if buf.len() + part.len() > max {
+                    tracing::debug!(
+                        kind = "iterm2 multipart file",
+                        size = buf.len() + part.len(),
+                        max,
+                        "dropping oversized string"
+                    );
                     self.iterm_multipart = None;
                 } else {
                     buf.extend_from_slice(part.as_bytes());
@@ -1179,20 +1237,38 @@ impl Terminal {
                 "width" => dw = parse_dim(v),
                 "height" => dh = parse_dim(v),
                 "preserveAspectRatio" => preserve = v != "0",
-                "size" if v.parse::<usize>().is_ok_and(|n| n > max) => return,
+                "size" if v.parse::<usize>().is_ok_and(|n| n > max) => {
+                    tracing::debug!(declared_size = v, max, "iterm2 image larger than the limit; ignored");
+                    return;
+                }
                 _ => {}
             }
         }
         // Downloads (inline=0) are not supported.
-        if !inline || data.len() > max / 3 * 4 + 8192 {
+        if !inline {
+            tracing::debug!("iterm2 file download (inline=0) not supported; ignored");
             return;
         }
-        let Ok(bytes) = BASE64.decode(data) else { return };
+        if data.len() > max / 3 * 4 + 8192 {
+            tracing::debug!(len = data.len(), max, "iterm2 image larger than the limit; ignored");
+            return;
+        }
+        let Ok(bytes) = BASE64.decode(data) else {
+            tracing::debug!(len = data.len(), "iterm2 image is not valid base64; ignored");
+            return;
+        };
         // Decode now, or only read the size and decode in the background.
         let (img, (iw, ih)) = if self.config.graphics.waker.is_some() {
             match image_dimensions(&bytes) {
                 Some((w, h)) if w > 0 && h > 0 && w as usize * h as usize * 4 <= max => (None, (w, h)),
-                _ => return,
+                Some((w, h)) if w > 0 && h > 0 => {
+                    tracing::debug!(width = w, height = h, max, "iterm2 image larger than the limit; ignored");
+                    return;
+                }
+                _ => {
+                    crate::graphics::log_decode_failure(&bytes, "unreadable or empty image header");
+                    return;
+                }
             }
         } else {
             match decode_image(&bytes, max) {

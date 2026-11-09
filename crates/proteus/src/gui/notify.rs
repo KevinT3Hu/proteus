@@ -73,7 +73,7 @@ fn worker(rx: mpsc::Receiver<Req>, events: Sender<Msg>) {
     let conn = match Connection::session() {
         Ok(c) => c,
         Err(e) => {
-            return eprintln!("proteus: notifications: cannot connect to the session bus: {e}");
+            return tracing::warn!("notifications disabled: cannot connect to the session bus: {e}");
         }
     };
     let shared = Arc::new(Mutex::new(Shared::default()));
@@ -110,9 +110,9 @@ fn worker(rx: mpsc::Receiver<Req>, events: Sender<Msg>) {
             }
             Err(e) if !warned => {
                 warned = true;
-                eprintln!("proteus: notifications: {e}");
+                tracing::warn!(pane = req.pane, "desktop notification failed (further failures not logged): {e}");
             }
-            Err(_) => {}
+            Err(e) => tracing::debug!(pane = req.pane, "desktop notification failed: {e}"),
         }
     }
 }

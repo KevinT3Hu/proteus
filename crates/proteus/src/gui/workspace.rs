@@ -42,13 +42,17 @@ pub(super) fn state_dir() -> Option<PathBuf> {
 
 impl SessionStore {
     pub fn acquire() -> Option<SessionStore> {
-        Self::acquire_at(state_dir()?)
+        let dir = state_dir()?;
+        Self::acquire_at(dir.clone())
             .map_err(|e| {
-                if e.kind() != io::ErrorKind::WouldBlock {
-                    eprintln!("proteus: session persistence disabled: {e}");
+                if e.kind() == io::ErrorKind::WouldBlock {
+                    tracing::info!(dir = %dir.display(), "session is owned by another instance; not saving it");
+                } else {
+                    tracing::warn!(dir = %dir.display(), "session persistence disabled: {e}");
                 }
                 e
             })
+            .inspect(|s| tracing::debug!(path = %s.path.display(), "session lock acquired"))
             .ok()
     }
 
@@ -68,7 +72,10 @@ impl SessionStore {
             Ok(None) => return None,
             Err(e) => {
                 self.blocked = true;
-                eprintln!("proteus: cannot read saved session; preserving it without autosaving: {e}");
+                tracing::error!(
+                    path = %self.path.display(),
+                    "cannot read saved session; preserving it without autosaving: {e}"
+                );
                 return None;
             }
         };
@@ -79,14 +86,16 @@ impl SessionStore {
             Ok(spec) => Some(spec),
             Err(e) => {
                 match self.file.backup(&bytes) {
-                    Ok(name) => eprintln!(
-                        "proteus: ignoring malformed session ({e}); recovery copy: {}",
-                        self.path.with_file_name(name).display()
+                    Ok(name) => tracing::warn!(
+                        path = %self.path.display(),
+                        backup = %self.path.with_file_name(name).display(),
+                        "ignoring malformed session: {e}"
                     ),
                     Err(backup_error) => {
                         self.blocked = true;
-                        eprintln!(
-                            "proteus: malformed session ({e}); cannot back up ({backup_error}); autosave disabled to preserve original"
+                        tracing::error!(
+                            path = %self.path.display(),
+                            "malformed session ({e}); cannot back up ({backup_error}); autosave disabled to preserve original"
                         );
                     }
                 }
@@ -166,7 +175,7 @@ impl App {
         let id = match self.spawn_pane(cols, rows, p.cwd.clone(), command) {
             Ok(id) => id,
             Err(e) if p.cmd.is_some() => {
-                self.notice(format!("cannot start {:?}: {e}", p.cmd.as_ref().map(|c| c.argv().join(" "))));
+                self.notice_error(format!("cannot start {:?}: {e}", p.cmd.as_ref().map(|c| c.argv().join(" "))));
                 self.spawn_pane(cols, rows, p.cwd.clone(), None)?
             }
             Err(e) => return Err(e),
@@ -362,7 +371,7 @@ impl App {
         let res = write_layout(&path, &text, &proteus_pty::shell::runtime_dir());
         match res {
             Ok(()) => self.notice(format!("Layout saved to {}", path.display())),
-            Err(e) => self.notice(format!("cannot save layout: {}: {e}", path.display())),
+            Err(e) => self.notice_error(format!("cannot save layout: {}: {e}", path.display())),
         }
     }
 
@@ -371,7 +380,7 @@ impl App {
         match spec::load(&path) {
             Ok(s) => {
                 if let Err(e) = self.open_layout(&s) {
-                    self.notice(format!("cannot open layout: {e}"));
+                    self.notice_error(format!("cannot open layout: {e}"));
                 }
             }
             Err(e) => self.notice(e),
@@ -417,8 +426,8 @@ impl App {
         if let Some(s) = self.session.as_mut()
             && let Err(e) = s.write(text)
         {
-            eprintln!("proteus: saving session: {e}");
-            self.toast(format!("Session could not be saved: {e}"), true, None);
+            let path = s.path.display().to_string();
+            self.toast(format!("Session could not be saved: {path}: {e}"), true, None);
         }
     }
 
@@ -436,12 +445,12 @@ impl App {
             if let Some(s) = self.session.as_mut()
                 && let Err(e) = s.write(text)
             {
-                eprintln!("proteus: saving final session: {e}");
+                tracing::error!(path = %s.path.display(), "saving final session: {e}");
             }
         } else if let Some(s) = self.session.as_mut()
             && let Err(e) = s.remove()
         {
-            eprintln!("proteus: removing session: {e}");
+            tracing::error!(path = %s.path.display(), "removing session: {e}");
         }
     }
 
@@ -454,7 +463,7 @@ impl App {
                     self.close_pane(id);
                 }
             }
-            Err(e) => self.notice(format!("cannot restore session: {e}")),
+            Err(e) => self.notice_error(format!("cannot restore session: {e}")),
         }
     }
 }

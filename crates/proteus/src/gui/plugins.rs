@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use proteus_core::Terminal;
 use proteus_wasm::types::{
@@ -153,6 +153,42 @@ pub(super) struct Plugins {
     pub tasks: BTreeMap<(String, u32), Task>,
     /// Loaded with the first plugin sync.
     pub approvals: Option<super::approvals::Approvals>,
+    /// `host::log` bytes per plugin in the current second, and whether the
+    /// excess was reported.
+    log_budget: HashMap<String, (Instant, usize, bool)>,
+}
+
+/// `host::log` bytes a plugin may log per second.
+const LOG_RATE: usize = 64 << 10;
+
+impl Plugins {
+    fn log_allowed(&mut self, id: &str, len: usize) -> bool {
+        let now = Instant::now();
+        let (window, used, reported) = self.log_budget.entry(id.to_string()).or_insert((now, 0, false));
+        if now.duration_since(*window) >= Duration::from_secs(1) {
+            (*window, *used, *reported) = (now, 0, false);
+        }
+        *used += len;
+        if *used <= LOG_RATE {
+            return true;
+        }
+        if !*reported {
+            *reported = true;
+            tracing::warn!(target: "plugin", plugin = %id, "log output truncated");
+        }
+        false
+    }
+}
+
+/// A plugin source for the log, without credentials or queries in URLs.
+fn source_label(s: &str) -> String {
+    let s = s.split(['?', '#']).next().unwrap_or(s);
+    let Some((scheme, rest)) = s.split_once("://") else { return s.to_string() };
+    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    match authority.rsplit_once('@') {
+        Some((_, host)) => format!("{scheme}://***@{host}{path}"),
+        None => s.to_string(),
+    }
 }
 
 /// 0xRRGGBB.
@@ -373,22 +409,26 @@ impl App {
         }
         if self.pl.approvals.is_none() {
             let approvals = super::approvals::Approvals::load().unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "plugin approvals not loaded; kept for this session only");
                 self.toast(format!("plugins: {e}; approvals are kept for this session only"), true, None);
                 Default::default()
             });
             self.pl.approvals = Some(approvals);
         }
         let Some(cache) = self.pl.cache.clone() else {
+            tracing::error!("no plugin cache or data directory");
             self.toast("plugins: no cache/data directory available".into(), true, None);
             return;
         };
         let sources = self.cfg.plugins.clone();
         let tx = self.sender.clone();
+        tracing::debug!(sources = sources.len(), generation, "resolving plugin sources");
         // No directory scans, installed-plugin registry, or bundled defaults.
         if let Err(e) = std::thread::Builder::new().name("plugin-sources".into()).spawn(move || {
             let results = sources.iter().map(|s| cache.resolve(s)).collect();
             let _ = tx.send(Msg::PluginsResolved(generation, results));
         }) {
+            tracing::error!(error = %e, "cannot start the plugin source thread");
             self.toast(format!("plugins: {e}"), true, None);
         }
     }
@@ -402,16 +442,28 @@ impl App {
         for result in results {
             match result {
                 Ok(e) if self.cfg.plugin_should_load(&e) => {
+                    tracing::info!(
+                        plugin = %e.id,
+                        source = %source_label(&e.source.source),
+                        hash = &e.hash[..e.hash.len().min(12)],
+                        permissions = %super::approvals::describe(&e.granted).join(", "),
+                        "plugin resolved"
+                    );
                     if resolved.iter().any(|other: &Resolved| other.id == e.id) {
                         duplicates.insert(e.id.clone());
                     }
                     resolved.push(e);
                 }
-                Ok(_) => {}
-                Err(e) => self.toast(format!("plugin source: {e}"), true, None),
+                Ok(e) => tracing::debug!(plugin = %e.id, "plugin resolved but not loaded"),
+                Err(e) => {
+                    tracing::error!(error = %e, "plugin source failed");
+                    let brief = self.brief(&e);
+                    self.toast(format!("plugin source: {brief}"), true, None);
+                }
             }
         }
         for id in &duplicates {
+            tracing::warn!(plugin = %id, "multiple plugin sources declare the same ID; neither is loaded");
             self.toast(format!("plugins: multiple sources declare ID `{id}`; neither is loaded"), true, None);
         }
         resolved.retain(|e| !duplicates.contains(&e.id));
@@ -440,11 +492,14 @@ impl App {
         }
         let approvals = self.pl.approvals.get_or_insert_with(Default::default);
         if !allow {
+            tracing::info!(plugin = %entry.id, "plugin permissions denied by the user");
             approvals.denied.insert(entry.id.clone());
             let msg = format!("plugin {}: not started; grant `permissions` in the config to run it", entry.id);
             return self.toast(msg, false, None);
         }
+        tracing::info!(plugin = %entry.id, "plugin permissions granted by the user");
         if let Err(e) = approvals.approve(&entry) {
+            tracing::warn!(plugin = %entry.id, error = %e, "plugin approval not saved");
             self.toast(format!("plugin {}: {e}", entry.id), true, None);
         }
         self.start_plugin(entry);
@@ -460,6 +515,7 @@ impl App {
         }
         let approvals = self.pl.approvals.get_or_insert_with(Default::default);
         if approvals.denied.contains(&entry.id) {
+            tracing::debug!(plugin = %entry.id, "plugin not started: the user denied its permissions");
             return;
         }
         if approvals.needs_approval(&entry) {
@@ -467,6 +523,11 @@ impl App {
                 w.prompts.iter().any(|p| matches!(p, super::Prompt::PluginPermissions(e) if e.id == entry.id))
             });
             if !queued {
+                tracing::info!(
+                    plugin = %entry.id,
+                    permissions = %super::approvals::describe(&entry.granted).join(", "),
+                    "asking the user to approve plugin permissions"
+                );
                 self.w.prompts.push_back(super::Prompt::PluginPermissions(Box::new(entry)));
                 self.w.dirty = true;
             }
@@ -477,7 +538,10 @@ impl App {
         if self.pl.runtime.is_none() {
             match Runtime::new() {
                 Ok(r) => self.pl.runtime = Some(r),
-                Err(e) => return self.toast(format!("plugins: cannot start the WASM runtime: {e}"), true, None),
+                Err(e) => {
+                    tracing::error!(error = %e, "cannot start the WASM runtime");
+                    return self.toast(format!("plugins: cannot start the WASM runtime: {e}"), true, None);
+                }
             }
         }
         self.pl.next_instance += 1;
@@ -489,6 +553,7 @@ impl App {
             }
         });
         if let Err(e) = cache.claim(&entry.id, &entry.source) {
+            tracing::error!(plugin = %entry.id, error = %e, "plugin data belongs to another source");
             return self.toast(format!("plugin {}: {e}", entry.name), true, None);
         }
         let spec = Spec {
@@ -500,22 +565,27 @@ impl App {
             data_dir: cache.data_dir(&entry.id),
             storage: cache.storage_path(&entry.id),
             memory: proteus_wasm::runtime::MEMORY,
-            stderr: std::env::var_os("PROTEUS_DEBUG").is_some(),
             compiled: Some(cache.compiled_dir()),
         };
         let Some(rt) = &self.pl.runtime else { return };
+        let instance = spec.key.instance;
         match rt.start(spec, sink) {
             Ok(handle) => {
+                tracing::info!(plugin = %entry.id, instance, "plugin starting");
                 let r = Running { entry, handle, started: false, actions: Vec::new(), status: Default::default() };
                 self.pl.running.insert(r.entry.id.clone(), r);
             }
-            Err(e) => self.toast(format!("plugin {}: {e}", entry.name), true, None),
+            Err(e) => {
+                tracing::error!(plugin = %entry.id, error = %e, "plugin thread not started");
+                self.toast(format!("plugin {}: {e}", entry.name), true, None)
+            }
         }
     }
 
     /// Stop a plugin and remove what it showed.
     pub(super) fn stop_plugin(&mut self, id: &str) {
         if let Some(r) = self.pl.running.remove(id) {
+            tracing::info!(plugin = %id, instance = r.handle.key.instance, "plugin stopped");
             r.handle.stop();
             self.remove_plugin_ui(&r.handle.key);
             self.keymap = self.cfg.keymap();
@@ -570,6 +640,25 @@ impl App {
         self.pl.running.get(id).map(|r| r.entry.name.clone()).unwrap_or_else(|| id.to_string())
     }
 
+    /// Where a toast's details can be read.
+    fn log_hint(&self) -> String {
+        self.log_file.as_ref().map(|p| format!(" (details in {})", p.display())).unwrap_or_default()
+    }
+
+    /// A long, multi-line error (a build log) cut to its first line for a
+    /// toast; the whole one is logged.
+    fn brief(&self, e: &str) -> String {
+        let e = e.trim_end();
+        let first = e.lines().next().unwrap_or_default();
+        let mut s: String = first.chars().take(200).collect();
+        if s.len() < e.len() {
+            s = s.trim_end_matches(':').to_string();
+            s.push_str(" …");
+            s.push_str(&self.log_hint());
+        }
+        s
+    }
+
     /// A message from a plugin thread.
     pub(super) fn plugin_msg(&mut self, key: Key, m: FromPlugin) {
         let current = self.pl.running.get(&key.id).is_some_and(|r| r.handle.key == key);
@@ -588,6 +677,7 @@ impl App {
             }
             _ if !current => {}
             FromPlugin::Started => {
+                tracing::info!(plugin = %key.id, instance = key.instance, "plugin started");
                 let theme = self.plugin_theme();
                 let Some(r) = self.pl.running.get_mut(&key.id) else { return };
                 r.started = true;
@@ -604,19 +694,30 @@ impl App {
                     }
                 }
             }
-            FromPlugin::Exited => self.stop_plugin(&key.id),
+            FromPlugin::Exited => {
+                tracing::info!(plugin = %key.id, instance = key.instance, "plugin exited");
+                self.stop_plugin(&key.id)
+            }
             FromPlugin::Failed(e) => {
                 let name = self.name_of(&key.id);
                 self.stop_plugin(&key.id);
                 let n = self.pl.failures.entry(key.id.clone()).or_insert(0);
                 *n += 1;
+                let failures = *n;
+                tracing::error!(plugin = %key.id, instance = key.instance, failures, error = %e, "plugin failed");
                 // Failing to load or initialize happens again the same way.
                 let fatal = e.starts_with("init failed") || e.starts_with("not a valid plugin");
-                if fatal || *n > MAX_RESTARTS {
-                    *n = MAX_RESTARTS + 1;
-                    self.toast(format!("plugin {name}: {e}; not restarted (palette: plugins: restart)"), true, None);
+                let hint = self.log_hint();
+                if fatal || failures > MAX_RESTARTS {
+                    self.pl.failures.insert(key.id.clone(), MAX_RESTARTS + 1);
+                    tracing::warn!(plugin = %key.id, failures, fatal, "giving up on plugin");
+                    self.toast(
+                        format!("plugin {name}: {e}; not restarted (palette: plugins: restart){hint}"),
+                        true,
+                        None,
+                    );
                 } else {
-                    self.toast(format!("plugin {name}: {e}; restarting"), true, None);
+                    self.toast(format!("plugin {name}: {e}; restarting{hint}"), true, None);
                     let id = key.id.clone();
                     let _ =
                         self.handle.insert_source(Timer::from_duration(RESTART_DELAY), move |_, _, app: &mut App| {
@@ -628,6 +729,7 @@ impl App {
                                     .find(|e| e.id == id && app.cfg.plugin_should_load(e))
                                     .cloned()
                             {
+                                tracing::info!(plugin = %id, attempt = failures, "restarting plugin");
                                 app.start_plugin(e);
                             }
                             TimeoutAction::Drop
@@ -851,8 +953,8 @@ impl App {
         match call {
             Call::Locale => Ok(Reply::Text(self.cfg.i18n.locale().into())),
             Call::Log(m) => {
-                if std::env::var_os("PROTEUS_DEBUG").is_some() {
-                    eprintln!("proteus: plugin {}: {m}", key.id);
+                if self.pl.log_allowed(&key.id, m.len()) {
+                    tracing::info!(target: "plugin", plugin = %key.id, "{}", proteus_wasm::printable(&m));
                 }
                 Ok(Reply::Unit)
             }
@@ -1058,7 +1160,10 @@ impl App {
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null());
-                let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+                let mut child = cmd.spawn().map_err(|e| {
+                    tracing::warn!(plugin = %key.id, error = %e, "xdg-open failed to start");
+                    e.to_string()
+                })?;
                 std::thread::Builder::new()
                     .name("plugin-open".into())
                     .spawn(move || {
@@ -1745,6 +1850,22 @@ mod tests {
 
     fn span(t: &str, style: Style) -> Span {
         Span { text: t.into(), style, link: None }
+    }
+
+    #[test]
+    fn logged_sources_hide_url_credentials() {
+        assert_eq!(source_label("https://u:tok@git.example/x.git?t=1"), "https://***@git.example/x.git");
+        assert_eq!(source_label("ssh://git@host/repo"), "ssh://***@host/repo");
+        assert_eq!(source_label("/home/u/plugins/a@b"), "/home/u/plugins/a@b");
+        assert_eq!(source_label("https://e.x/p.wasm"), "https://e.x/p.wasm");
+    }
+
+    #[test]
+    fn host_log_is_rate_limited_per_plugin() {
+        let mut p = Plugins::default();
+        assert!(p.log_allowed("a", LOG_RATE));
+        assert!(!p.log_allowed("a", 1));
+        assert!(p.log_allowed("b", 1));
     }
 
     #[test]
