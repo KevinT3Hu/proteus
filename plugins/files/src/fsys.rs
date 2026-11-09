@@ -214,6 +214,14 @@ pub fn tilde(p: &Path, home: Option<&Path>) -> String {
     }
 }
 
+/// A random token for this plugin instance, for naming temporary files
+/// (WASI has no process ids).
+pub fn instance() -> u64 {
+    use std::hash::{BuildHasher, RandomState};
+    static TOKEN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *TOKEN.get_or_init(|| RandomState::new().hash_one(0u8))
+}
+
 pub fn home() -> Option<PathBuf> {
     std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from)
 }

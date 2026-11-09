@@ -411,8 +411,8 @@ impl Transfer {
             static NEXT: AtomicU64 = AtomicU64::new(0);
             let (temp, to) = loop {
                 let p = it.dst.with_file_name(format!(
-                    ".proteus-copy-{}-{}",
-                    std::process::id(),
+                    ".proteus-copy-{:016x}-{}",
+                    crate::fsys::instance(),
                     NEXT.fetch_add(1, Ordering::Relaxed)
                 ));
                 match create_staging(&p) {
@@ -483,8 +483,8 @@ fn rename_all_with(
         let result = (|| {
             let dir = loop {
                 let dir = from.with_file_name(format!(
-                    ".proteus-rename-{}-{}",
-                    std::process::id(),
+                    ".proteus-rename-{:016x}-{}",
+                    crate::fsys::instance(),
                     NEXT.fetch_add(1, Ordering::Relaxed)
                 ));
                 match create_private(&dir, true) {
@@ -785,8 +785,9 @@ mod tests {
         std::fs::write(&from, "source data").unwrap();
         // Cover both the old staging name and a range of reserved-directory
         // names: all preexisting objects must survive untouched.
+        let id = crate::fsys::instance();
         let mut occupied = vec![root.join(format!(".proteus-rename-0-{}", std::process::id()))];
-        occupied.extend((0..10).map(|n| root.join(format!(".proteus-rename-{}-{n}", std::process::id()))));
+        occupied.extend((0..10).map(|n| root.join(format!(".proteus-rename-{id:016x}-{n}"))));
         for p in &occupied {
             std::fs::write(p, "unrelated data").unwrap();
         }

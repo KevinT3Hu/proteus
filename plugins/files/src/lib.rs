@@ -1482,7 +1482,7 @@ impl State {
             return self.say(id, tr!("bulk-newline"), true);
         }
         let cache = fsys::home().unwrap_or_default().join(".cache/proteus-files");
-        let file = cache.join(format!("rename-{}.txt", std::process::id()));
+        let file = cache.join(format!("rename-{:016x}.txt", fsys::instance()));
         let w = std::fs::create_dir_all(&cache).and_then(|_| std::fs::write(&file, names.join("\n") + "\n"));
         if let Err(e) = w {
             return self.say(id, format!("{}: {e}", file.display()), true);
