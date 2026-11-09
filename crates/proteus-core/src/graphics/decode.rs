@@ -72,6 +72,9 @@ pub fn decode_image(data: &[u8], max_bytes: usize) -> Result<DecodedImage, Decod
         let mut frames = Vec::new();
         let mut total = 0usize;
         for f in dec.into_frames() {
+            if frames.len() >= super::MAX_FRAMES {
+                break;
+            }
             let f = f.map_err(invalid)?;
             let (num, den) = f.delay().numer_denom_ms();
             let delay = num.checked_div(den).unwrap_or(0);

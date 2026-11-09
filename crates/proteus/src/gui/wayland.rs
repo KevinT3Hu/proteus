@@ -328,14 +328,11 @@ impl DataSourceHandler for App {
         if let Some((_, text)) = self.clipboard.as_ref().filter(|(s, _)| s.inner() == src)
             && MIMES.contains(&mime.as_str())
         {
-            Self::send_selection(text, fd.into());
+            Self::send_selection(text.as_bytes().to_vec(), fd.into());
         } else if let Some((_, png)) = self.clipboard_image.as_ref().filter(|(s, _)| s.inner() == src)
             && mime == "image/png"
         {
-            let (png, fd) = (png.clone(), OwnedFd::from(fd));
-            let _ = std::thread::Builder::new().name("copy".into()).spawn(move || {
-                let _ = File::from(fd).write_all(&png);
-            });
+            Self::send_selection(png.as_ref().clone(), fd.into());
         }
     }
     fn cancelled(&mut self, _: &Connection, _: &QueueHandle<Self>, src: &WlDataSource) {
@@ -381,7 +378,7 @@ impl PrimarySelectionSourceHandler for App {
         if let Some((_, text)) = self.primary.as_ref().filter(|(s, _)| s.inner() == src)
             && MIMES.contains(&mime.as_str())
         {
-            Self::send_selection(text, fd.into());
+            Self::send_selection(text.as_bytes().to_vec(), fd.into());
         }
     }
     fn cancelled(&mut self, _: &Connection, _: &QueueHandle<Self>, src: &ZwpPrimarySelectionSourceV1) {

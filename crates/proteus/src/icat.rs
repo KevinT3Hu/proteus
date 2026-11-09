@@ -149,7 +149,14 @@ fn show(src: &str, args: &Icat, size: (u32, u32, u32, u32)) -> Result<String, St
     };
     Ok(match args.place {
         // Save the cursor, draw at the box without moving it, restore.
-        Some(p) => format!("\x1b7\x1b[{};{}H{}", p.y + 1, p.x + 1, seq.replacen("q=2", "q=2,C=1", 1)) + "\x1b8",
+        Some(p) => {
+            format!(
+                "\x1b7\x1b[{};{}H{}",
+                p.y.saturating_add(1),
+                p.x.saturating_add(1),
+                seq.replacen("q=2", "q=2,C=1", 1)
+            ) + "\x1b8"
+        }
         None => seq + "\n",
     })
 }
@@ -190,6 +197,13 @@ mod tests {
         assert!(parse_place("0x2@1x1").is_err());
         assert!(parse_place("4x2").is_err());
         assert!(parse_place("4x2@a").is_err());
+        let path = std::env::temp_dir().join(format!("proteus-icat-place-{}.png", std::process::id()));
+        image::RgbaImage::new(1, 1).save(&path).unwrap();
+        let place = parse_place(&format!("1x1@{0}x{0}", u32::MAX)).unwrap();
+        let args = Icat { files: Vec::new(), place: Some(place), scale: false, clear: false, inline: true };
+        let out = show(path.to_str().unwrap(), &args, (80, 24, 8, 16)).unwrap();
+        assert!(out.starts_with(&format!("\x1b7\x1b[{0};{0}H", u32::MAX)));
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

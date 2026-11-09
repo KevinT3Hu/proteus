@@ -91,6 +91,8 @@ pub struct ShapedGlyph {
 
 /// Bound on each generation of cached shaped runs.
 const SHAPE_CACHE: usize = 8192;
+/// Times fontconfig is asked for a run fallback per style and script.
+const RUN_FALLBACKS: usize = 4;
 
 /// Shaped text by string, in two generations: when the recent one fills
 /// up it becomes the old one, and entries used again move back. Text on
@@ -230,6 +232,9 @@ pub struct Fonts {
     files: HashMap<(PathBuf, u32), Arc<Vec<u8>>>,
     /// Fallback face per (char, style).
     fallback: HashMap<(char, u8), Option<usize>>,
+    /// Faces chosen for runs per (style, script of the chars the primary
+    /// face lacks), and how often fontconfig was asked.
+    run_fallback: HashMap<(u8, Option<u32>), (Vec<usize>, usize)>,
     glyphs: HashMap<(char, u8), Option<GlyphRef>>,
     ctx: ScaleContext,
     /// Shaped runs per style.
@@ -294,6 +299,7 @@ impl Fonts {
             primary: [0; STYLES],
             files: HashMap::new(),
             fallback: HashMap::new(),
+            run_fallback: HashMap::new(),
             glyphs: HashMap::new(),
             ctx: ScaleContext::new(),
             shaped: Default::default(),
@@ -532,7 +538,7 @@ impl Fonts {
         let face = if chars.iter().all(|&c| self.faces[primary].font().charmap().map(c) != 0) {
             primary
         } else {
-            self.fallback_for(&chars, style).unwrap_or(primary)
+            self.run_fallback_for(&chars, style).unwrap_or(primary)
         };
         let mut out = self.shape_with_face(face, text, style, rtl, ligatures);
         out.retain(|g| g.glyph.glyph != 0);
@@ -599,6 +605,34 @@ impl Fonts {
             self.fc.as_ref().and_then(|fc| fc.find("emoji", FC_WEIGHT_REGULAR, FC_SLANT_ROMAN, &['\u{1f600}'], true));
         let f = m.and_then(|m| self.face_for(&m, false, false));
         self.emoji = Some(f);
+        f
+    }
+
+    /// A fallback face for a run the primary face does not cover. Faces
+    /// chosen before for the same style and script of the missing chars are
+    /// reused when they cover the run; fontconfig is asked only a few times
+    /// per script.
+    fn run_fallback_for(&mut self, chars: &[char], style: u8) -> Option<usize> {
+        let primary = self.primary[style as usize];
+        let missing: String = chars.iter().filter(|&&c| self.faces[primary].font().charmap().map(c) == 0).collect();
+        let key = (style, script_tag(&missing));
+        let covered =
+            |f: &Fonts, face: usize| chars.iter().filter(|&&c| f.faces[face].font().charmap().map(c) != 0).count();
+        let (known, asked) = self.run_fallback.get(&key).cloned().unwrap_or_default();
+        if let Some(&f) = known.iter().find(|&&f| covered(self, f) == chars.len()) {
+            return Some(f);
+        }
+        if asked >= RUN_FALLBACKS {
+            return known.iter().copied().max_by_key(|&f| covered(self, f));
+        }
+        let f = self.fallback_for(chars, style);
+        let entry = self.run_fallback.entry(key).or_default();
+        entry.1 += 1;
+        if let Some(f) = f
+            && !entry.0.contains(&f)
+        {
+            entry.0.push(f);
+        }
         f
     }
 
@@ -797,6 +831,19 @@ mod tests {
         assert!(f.glyph('a', BOLD).is_some());
         assert!(f.set_size(22.0, 1.0));
         assert!(f.metrics().cell_h > m.cell_h);
+    }
+
+    #[test]
+    fn run_fallbacks_are_reused() {
+        let Ok(mut f) = Fonts::new("monospace", 11.0, 1.0) else {
+            eprintln!("skipping: no fontconfig monospace font");
+            return;
+        };
+        let han: Vec<char> = ('\u{4e00}'..'\u{4ec8}').collect();
+        for w in han.chunks(3) {
+            f.shape(&w.iter().collect::<String>(), 0);
+        }
+        assert!(f.run_fallback.values().all(|e| e.1 <= RUN_FALLBACKS), "{:?}", f.run_fallback);
     }
 
     #[test]

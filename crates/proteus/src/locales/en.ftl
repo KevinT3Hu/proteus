@@ -107,6 +107,7 @@ prompt-confirm-keys = [y] yes   [n] no
 prompt-plugin-permissions = Plugin { $plugin } ({ $source }) requests these permissions. Allow and remember?
 prompt-plugin-permissions-keys = [y] allow   [n] don't start it
 prompt-plugin-run-command-warning = Programs it may run get its arguments unchecked and can run any code as you.
+prompt-plugin-open-pane-warning = Panes it opens may run any program, so it can run any code as you.
 prompt-plugin-startup-files-warning = It may change your startup files and Proteus's configuration, so it can run any code as you.
 ui-command-failed-exit-code = Command failed (exit { $code })
 ui-command-finished = Command finished

@@ -70,6 +70,7 @@ impl Guest for Fixture {
                     report("etc", std::fs::read_to_string("/etc/hostname").map(|_| ()).map_err(|e| e.kind()));
                 }
                 "work" => std::thread::sleep(std::time::Duration::from_millis(5)),
+                "busy" => std::thread::sleep(std::time::Duration::from_millis(300)),
                 "sleep" => std::thread::sleep(std::time::Duration::from_secs(3600)),
                 "sentinel" => host::notify("sentinel", false),
                 "modes" => {
@@ -111,6 +112,7 @@ impl Guest for Fixture {
             },
             Event::Timer(id) => host::notify(&format!("timer {id}"), false),
             Event::PaneOpened(p) => host::notify(&format!("opened {p}"), false),
+            Event::TitleChanged((p, t)) => host::notify(&format!("title {p} {t}"), false),
             _ => {}
         }
     }

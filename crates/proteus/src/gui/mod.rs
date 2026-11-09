@@ -52,7 +52,7 @@ pub use scripting::Overrides;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, Write};
+use std::io;
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::ptr::NonNull;
@@ -138,6 +138,9 @@ const FLASH: Duration = Duration::from_millis(120);
 const MIMES: [&str; 4] = ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain", "STRING"];
 /// Longest time a synchronized update (mode 2026) may hold a frame.
 const SYNC_TIMEOUT: Duration = Duration::from_millis(150);
+/// On exit, how long the last session may take to end after a hangup
+/// (and again after it is killed).
+const EXIT_GRACE: Duration = Duration::from_secs(2);
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 /// Cursor blink half-period.
 const BLINK: Duration = Duration::from_millis(530);
@@ -427,6 +430,8 @@ struct Win {
     active: usize,
     mode: Mode,
     prompts: VecDeque<Prompt>,
+    /// Kind of the front prompt when it was first drawn, and when.
+    prompt_shown: Option<(std::mem::Discriminant<Prompt>, Instant)>,
     /// The bottom-bar text input, when open; it takes the keys.
     input: Option<Input>,
     copy: Option<scroll::CopyState>,
@@ -677,6 +682,7 @@ fn make_win(
         active: 0,
         mode: Mode::Normal,
         prompts: VecDeque::new(),
+        prompt_shown: None,
         input: None,
         copy: None,
         search: None,
@@ -862,10 +868,17 @@ pub fn run(
     let _ipc_server = if let Some(path) = listen.or_else(|| app.cfg.ipc_socket.clone()) {
         let path = if path.is_absolute() { path } else { std::env::current_dir()?.join(path) };
         let sender = app.sender.clone();
-        let server = crate::ipc::Server::start(path, move |call| sender.send(Msg::Ipc(call)).is_ok())?;
-        eprintln!("proteus: control socket {}", server.path.display());
-        app.ipc_socket = Some(server.path.clone());
-        Some(server)
+        match crate::ipc::Server::start(path, move |call| sender.send(Msg::Ipc(call)).is_ok()) {
+            Ok(server) => {
+                eprintln!("proteus: control socket {}", server.path.display());
+                app.ipc_socket = Some(server.path.clone());
+                Some(server)
+            }
+            Err(e) => {
+                eprintln!("proteus: control socket: {e}");
+                None
+            }
+        }
     } else {
         None
     };
@@ -950,10 +963,10 @@ pub fn run(
     app.finish_session();
     // A single remaining session reports its exit status, as before.
     if app.panes.len() == 1
-        && let Some(pty) = app.panes.values_mut().next().and_then(|p| p.pty.as_mut())
+        && let Some(p) = app.panes.values_mut().next()
+        && p.pty.is_some()
     {
-        pty.hangup();
-        app.exit_code = pty.wait()?.code().unwrap_or(0);
+        app.exit_code = p.reap(EXIT_GRACE);
     }
     let code = app.exit_code;
     drop(app);

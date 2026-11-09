@@ -19,6 +19,7 @@ use crate::runtime::types::{Event, HttpHead, HttpRequest, HttpResponse};
 pub const MAX_BODY: u64 = 64 << 20;
 pub const MAX_STREAMS: usize = 16;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Check the URL against the allowed hosts.
 pub fn check(allowed: &[String], url: &str) -> Result<http::Uri, String> {
@@ -104,12 +105,13 @@ fn headers(r: &http::Response<ureq::Body>) -> Vec<(String, String)> {
 }
 
 fn timeout(ms: u32) -> Duration {
-    if ms == 0 { DEFAULT_TIMEOUT } else { Duration::from_millis(ms as u64) }
+    if ms == 0 { DEFAULT_TIMEOUT } else { Duration::from_millis(ms as u64).min(MAX_TIMEOUT) }
 }
 
-/// The whole response (blocking).
-pub fn fetch(uri: http::Uri, req: HttpRequest) -> Result<HttpResponse, String> {
-    let agent = guarded(agent(Some(timeout(req.timeout_ms)), None), &uri, Arc::default(), timeout(req.timeout_ms));
+/// The whole response (blocking); `cancel` (the plugin stopping) aborts it.
+pub fn fetch(uri: http::Uri, req: HttpRequest, cancel: Arc<AtomicBool>) -> Result<HttpResponse, String> {
+    let limit = timeout(req.timeout_ms);
+    let agent = guarded(agent(Some(limit), None), &uri, cancel, limit);
     let mut r = send(&agent, uri, req)?;
     let status = r.status().as_u16();
     let headers = headers(&r);
@@ -427,11 +429,37 @@ mod tests {
             timeout_ms: 5000,
         };
         let r = req("post", "/echo", b"hello");
-        let resp = fetch(check(&allowed, &r.url).unwrap(), r).unwrap();
+        let resp = fetch(check(&allowed, &r.url).unwrap(), r, Arc::default()).unwrap();
         assert_eq!((resp.status, &resp.body[..]), (200, &b"hello"[..]));
         assert!(resp.headers.iter().any(|(k, v)| k == "x-t" && v == "1"));
         let r = req("GET", "/moved", b"");
-        let resp = fetch(check(&allowed, &r.url).unwrap(), r).unwrap();
+        let resp = fetch(check(&allowed, &r.url).unwrap(), r, Arc::default()).unwrap();
         assert_eq!(resp.status, 302);
+    }
+
+    #[test]
+    fn fetch_is_cancelled_by_the_plugin_stopping_and_timeouts_are_capped() {
+        use std::time::Instant;
+        assert_eq!(timeout(u32::MAX), MAX_TIMEOUT);
+        assert_eq!(timeout(0), DEFAULT_TIMEOUT);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_millis(1500));
+            drop(socket);
+        });
+        let url = format!("http://{addr}/");
+        let req = HttpRequest { method: "GET".into(), url: url.clone(), headers: vec![], body: vec![], timeout_ms: 0 };
+        let stop = Arc::new(AtomicBool::new(false));
+        let s = stop.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            s.store(true, Ordering::Relaxed);
+        });
+        let t = Instant::now();
+        assert!(fetch(check(&[addr.to_string()], &url).unwrap(), req, stop).is_err());
+        assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+        server.join().unwrap();
     }
 }

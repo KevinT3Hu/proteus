@@ -331,3 +331,37 @@ fn storage_corruption_is_preserved_and_legacy_api_errors_reach_the_host() {
     assert_eq!(h.act("storage-delete"), ["delete returned"]);
     assert_eq!(h.act("storage-read"), ["storage: None"]);
 }
+
+#[test]
+fn event_floods_are_filtered_coalesced_and_dropped_without_stopping_the_plugin() {
+    let h = start("event-flood", Permissions { ui: true, read_panes: true, ..Default::default() });
+    h.wait(|m| matches!(m, FromPlugin::Started));
+    h.handle.event(Event::Action("busy".into()));
+    std::thread::sleep(Duration::from_millis(50));
+    for i in 0..1000 {
+        h.handle.event(Event::Bell(1));
+        h.handle.event(Event::TitleChanged((1, format!("t{i}"))));
+    }
+    for _ in 0..1000 {
+        h.handle.event(Event::ConfigChanged);
+    }
+    assert!(h.handle.dropped() > 0);
+    std::thread::sleep(Duration::from_millis(500));
+    h.handle.event(Event::Action("sentinel".into()));
+    let seen = h.wait(|m| {
+        matches!(m, FromPlugin::Call(Call::Notify { text, .. }, _) if text == "sentinel")
+            || matches!(m, FromPlugin::Failed(_) | FromPlugin::Exited)
+    });
+    assert_eq!(seen, ["title 1 t999", "sentinel"]);
+    assert_eq!(h.act("fixture"), ["fixture invoked"]);
+
+    // Without `read-panes` pane events never take a slot.
+    let h = start("event-filter", Permissions { ui: true, ..Default::default() });
+    h.wait(|m| matches!(m, FromPlugin::Started));
+    for i in 0..1000 {
+        h.handle.event(Event::TitleChanged((i, "x".into())));
+        h.handle.event(Event::CommandStarted((i, Some("secret".into()))));
+    }
+    assert_eq!(h.handle.dropped(), 0);
+    assert_eq!(h.act("fixture"), ["fixture invoked"]);
+}

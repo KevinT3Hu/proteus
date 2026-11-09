@@ -2,7 +2,7 @@
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
-    fs::OpenOptions,
+    fs::{File, OpenOptions},
     io::Read,
     path::{Path, PathBuf},
 };
@@ -45,13 +45,19 @@ struct TaskDefinition {
     disabled: bool,
 }
 
-fn read(path: &Path) -> Result<String, String> {
+fn open(path: &Path) -> std::io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
-    let file = OpenOptions::new()
+    OpenOptions::new()
         .read(true)
         .custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32)
         .open(path)
-        .map_err(|e| format!("{}: {e}", path.display()))?;
+}
+
+fn read(path: &Path) -> Result<String, String> {
+    read_open(open(path).map_err(|e| format!("{}: {e}", path.display()))?, path)
+}
+
+fn read_open(file: File, path: &Path) -> Result<String, String> {
     if !file.metadata().map_err(|e| e.to_string())?.is_file() {
         return Err(format!("{}: expected a regular file", path.display()));
     }
@@ -67,36 +73,50 @@ fn text(value: &str) -> bool {
     !value.trim().is_empty() && value.len() <= 1024 && !value.chars().any(char::is_control)
 }
 
+/// Neither other users nor a shared group can write it. A user private
+/// group (umask 002 setups) shares nothing.
+fn unshared(uid: u32, gid: u32, mode: u32) -> bool {
+    let me = rustix::process::geteuid().as_raw();
+    (uid == me || uid == 0)
+        && mode & 0o002 == 0
+        && (mode & 0o020 == 0 || (uid == me && proteus_pty::secure_fs::is_private_group(gid)))
+}
+
 impl Workspace {
     pub fn discover(cwd: &Path) -> Result<Option<Self>, String> {
         use std::os::unix::fs::MetadataExt;
-        let uid = rustix::process::geteuid().as_raw();
+        let me = rustix::process::geteuid().as_raw();
         for parent in cwd.ancestors() {
             let path = parent.join(FILE);
-            match std::fs::symlink_metadata(&path) {
-                Ok(m) => {
-                    // Tasks run commands: another user's file (say in /tmp),
-                    // or one others can change, defines nothing for us.
-                    let dir = std::fs::metadata(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
-                    let others_replace = dir.mode() & 0o002 != 0 && dir.mode() & 0o1000 == 0;
-                    let trusted = (m.uid() == uid || m.uid() == 0) && m.mode() & 0o002 == 0 && !others_replace;
-                    // `load` reports symlinks (which it never follows) as errors.
-                    if trusted || m.file_type().is_symlink() {
-                        return Self::load(&path).map(Some);
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            // Symlinks fail here (and are reported) instead of being followed.
+            let file = match open(&path) {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(format!("{}: {e}", path.display())),
+            };
+            let m = file.metadata().map_err(|e| format!("{}: {e}", path.display()))?;
+            let dir = std::fs::metadata(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+            // Tasks run commands: another user's file (say in /tmp), or one
+            // others can change or replace, defines nothing for us.
+            let dir_safe = unshared(dir.uid(), dir.gid(), dir.mode())
+                || ((dir.uid() == me || dir.uid() == 0) && dir.mode() & 0o1000 != 0);
+            if unshared(m.uid(), m.gid(), m.mode()) && dir_safe {
+                return Self::from_definition(&path, &read_open(file, &path)?).map(Some);
             }
         }
         Ok(None)
     }
 
+    #[cfg(test)]
     pub fn load(path: &Path) -> Result<Self, String> {
+        Self::from_definition(path, &read(path)?)
+    }
+
+    fn from_definition(path: &Path, definition: &str) -> Result<Self, String> {
         let root = path.parent().ok_or("workspace has no parent")?.canonicalize().map_err(|e| e.to_string())?;
         Self::parse(
             &root,
-            &read(path)?,
+            definition,
             |name| read(&root.join(name)),
             |name| root.join(name).is_file(),
             |relative| {
@@ -245,6 +265,25 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
         assert!(Workspace::discover(&root.join("src")).unwrap().is_none());
+        use std::os::unix::fs::MetadataExt;
+        let private = proteus_pty::secure_fs::is_private_group(std::fs::metadata(&path).unwrap().gid());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
+        assert_eq!(Workspace::discover(&root.join("src")).unwrap().is_some(), private);
+        // A shared group the user belongs to, if any.
+        let shared = rustix::process::getgroups().unwrap_or_default().into_iter().map(|g| g.as_raw()).find(|&g| {
+            !proteus_pty::secure_fs::is_private_group(g) && std::os::unix::fs::chown(&path, None, Some(g)).is_ok()
+        });
+        if shared.is_some() {
+            assert!(Workspace::discover(&root.join("src")).unwrap().is_none());
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let private_dir = proteus_pty::secure_fs::is_private_group(std::fs::metadata(&root).unwrap().gid());
+        assert_eq!(Workspace::discover(&root.join("src")).unwrap().is_some(), private_dir);
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(Workspace::discover(&root.join("src")).unwrap().is_none());
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(Workspace::discover(&root.join("src")).unwrap().is_some());
         std::fs::remove_file(&path).unwrap();
         std::os::unix::fs::symlink(root.join("package.json"), &path).unwrap();
         assert!(Workspace::discover(&root.join("src")).is_err());

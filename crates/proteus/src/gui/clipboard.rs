@@ -117,10 +117,17 @@ impl App {
         }
     }
 
-    pub(super) fn send_selection(text: &str, fd: OwnedFd) {
-        let text = text.to_string();
+    /// Send a selection we own to a reader, in the background. Readers that
+    /// stall are given up on; past a few at once, new ones get nothing.
+    pub(super) fn send_selection(data: Vec<u8>, fd: OwnedFd) {
+        static WRITERS: std::sync::OnceLock<proteus_pty::budget::Budget> = std::sync::OnceLock::new();
+        let Some(permit) = WRITERS.get_or_init(|| proteus_pty::budget::Budget::new(usize::MAX, 8)).try_acquire(0)
+        else {
+            return;
+        };
         let _ = std::thread::Builder::new().name("copy".into()).spawn(move || {
-            let _ = File::from(fd).write_all(text.as_bytes());
+            let _ = transfer::write(File::from(fd), &data, Duration::from_secs(5));
+            drop(permit);
         });
     }
 }

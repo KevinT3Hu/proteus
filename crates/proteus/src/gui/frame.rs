@@ -339,11 +339,19 @@ impl App {
 
     // --- input method ----------------------------------------------------------
 
-    /// Text committed by the input method is sent as if typed.
+    /// Text committed by the input method is sent as if typed, to whatever
+    /// takes typed text now (see [`App::key`]).
     pub(crate) fn commit_text(&mut self, text: &str) {
+        self.activate_kbd();
         self.restart_blink();
+        if !self.w.prompts.is_empty() || self.w.viewer.is_some() {
+            return;
+        }
         if self.w.input.is_some() {
             return self.input_text(text);
+        }
+        if self.w.hints.is_some() || !self.w.mode.passes_keys() {
+            return;
         }
         if let Some(s) = self.key_surface() {
             return self.surface_ui(s, proteus_wasm::types::UiEvent::Text(text.to_string()));
@@ -467,6 +475,7 @@ impl App {
         drop(info);
         if ok {
             self.w.frame_pending = true;
+            self.prompt_drawn();
         } else {
             // No buffer available (resize race): try again shortly.
             self.w.dirty = true;

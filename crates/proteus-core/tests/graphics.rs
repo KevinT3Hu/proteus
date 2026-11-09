@@ -456,3 +456,66 @@ fn frame_commands_wait_for_decodes() {
     assert_eq!(out(&mut t), "\x1b_Gi=5;OK\x1b\\\x1b_Gi=5;OK\x1b\\");
     assert_eq!(t.images().image_by_id(5).unwrap().frame_count(), 3);
 }
+
+#[test]
+fn background_decode_runs_when_placement_fails() {
+    let (c, woken) = background();
+    let mut t = term_with(20, 10, c);
+    // x at the image width leaves an empty source rectangle.
+    feed(&mut t, &apc("a=T,f=100,i=6,x=30", &png(30, 40, [1, 2, 3, 255])));
+    settle(&mut t, &woken, 1);
+    let img = t.images().image_by_id(6).unwrap();
+    assert!(!img.is_loading());
+    assert!(t.images().placements().is_empty());
+    assert!(out(&mut t).starts_with("\x1b_Gi=6;EINVAL"));
+}
+
+#[test]
+fn frame_count_is_capped() {
+    let mut t = term(20, 10);
+    feed(&mut t, &apc("a=t,f=24,s=1,v=1,i=1,q=2", &[0; 3]));
+    let frame = apc("a=f,i=1,f=24,s=1,v=1,q=1", &[1; 3]);
+    t.advance(frame.repeat(proteus_core::graphics::MAX_FRAMES - 1).as_bytes());
+    assert_eq!(out(&mut t), "");
+    let img = t.images().image_by_id(1).unwrap();
+    assert_eq!(img.frame_count(), proteus_core::graphics::MAX_FRAMES);
+    // Tiny frames are charged a fixed overhead each.
+    assert_eq!(t.images().bytes(), 4 + (proteus_core::graphics::MAX_FRAMES - 1) * 64);
+    feed(&mut t, &frame);
+    assert!(out(&mut t).starts_with("\x1b_Gi=1;ENOSPC"));
+    feed(&mut t, &apc("a=d,d=f,i=1", b""));
+    assert_eq!(t.images().bytes(), 4);
+}
+
+#[test]
+fn gapless_animation_does_not_spin() {
+    let mut t = term(20, 10);
+    feed(&mut t, &apc("a=T,f=24,s=1,v=1,i=1,q=2", &[0; 3]));
+    feed(&mut t, &apc("a=f,i=1,f=24,s=1,v=1,z=-1,q=2", &[1; 3]));
+    feed(&mut t, &apc("a=a,i=1,s=3", b""));
+    let generation = t.images().image_by_id(1).unwrap().generation();
+    assert_eq!(t.tick_images(Instant::now()), None);
+    assert_eq!(t.images().image_by_id(1).unwrap().generation(), generation);
+}
+
+#[test]
+fn compose_within_one_frame() {
+    let mut t = term(20, 10);
+    let px = [1, 1, 1, 255, 2, 2, 2, 255, 3, 3, 3, 255];
+    feed(&mut t, &apc("a=t,f=32,s=3,v=1,i=1,q=2", &px));
+    feed(&mut t, &apc("a=c,i=1,r=1,c=1,w=1,h=1,X=0,x=2,C=1,q=2", b""));
+    assert_eq!(&t.images().image_by_id(1).unwrap().pixels().unwrap()[8..12], &[1, 1, 1, 255]);
+    feed(&mut t, &apc("a=c,i=1,r=1,c=1,w=2,h=1,X=0,x=1,C=1", b""));
+    assert!(out(&mut t).contains("EINVAL"));
+}
+
+#[test]
+fn unfinished_iterm_multipart_is_dropped() {
+    let mut t = term(40, 10);
+    let data = B64.encode(png(30, 10, [0, 0, 255, 255]));
+    let (a, b) = data.split_at(20);
+    feed(&mut t, "\x1b]1337;MultipartFile=inline=1\x07");
+    feed(&mut t, &format!("\x1b]1337;FilePart={a}\x07\x1b]1337;ReportCellSize\x07"));
+    feed(&mut t, &format!("\x1b]1337;FilePart={b}\x07\x1b]1337;FileEnd\x07"));
+    assert!(t.images().is_empty());
+}

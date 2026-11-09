@@ -7,12 +7,13 @@ if set -q PROTEUS_FISH_XDG_DATA_DIR
     for d in $dirs
         test "$d" = "$PROTEUS_FISH_XDG_DATA_DIR"; or set -a keep $d
     end
-    if test (count $keep) -gt 0
-        set -gx XDG_DATA_DIRS (string join : -- $keep)
-    else
+    if set -q PROTEUS_FISH_XDG_DATA_DIRS_UNSET; or test (count $keep) -eq 0
         set -e XDG_DATA_DIRS
+    else
+        set -gx XDG_DATA_DIRS (string join : -- $keep)
     end
     set -e PROTEUS_FISH_XDG_DATA_DIR
+    set -e PROTEUS_FISH_XDG_DATA_DIRS_UNSET
 end
 
 status is-interactive; or exit 0

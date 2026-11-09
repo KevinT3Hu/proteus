@@ -291,6 +291,45 @@ fn explicit_cmdline_wins() {
 }
 
 #[test]
+fn cmdlines_with_control_chars_are_dropped() {
+    let mut t = term(30, 5);
+    for bad in ["ls%0Arm%20-rf%20~", "ls%0D", "ls%09-l", "ls%7F", "ls%C2%85x", "ls%1B[8m"] {
+        feed(&mut t, &format!("\x1b]133;A\x07$ \x1b]133;B\x07ls\r\n\x1b]133;C;cmdline_url={bad}\x07"));
+        let b = t.blocks().last().unwrap();
+        assert_eq!((b.command.as_deref(), b.state), (Some("ls"), BlockState::Running), "{bad}");
+    }
+    feed(&mut t, "\x1b]133;A\x07$ \x1b]633;E;echo \u{85}rm\x07\x1b]133;C\x07");
+    let b = t.blocks().last().unwrap();
+    assert_eq!((b.command.as_deref(), b.state), (None, BlockState::Running));
+    feed(&mut t, "\x1b]133;A\x07$ \x1b]633;E;echo a\\x3bb \u{e9}\x07\x1b]133;C\x07");
+    assert_eq!(t.blocks().last().unwrap().command.as_deref(), Some("echo a;b \u{e9}"));
+    feed(&mut t, "\x1b]133;A\x07$ \x1b]133;C;cmdline_url=git%20log%20%27%C3%A9%27\x07");
+    assert_eq!(t.blocks().last().unwrap().command.as_deref(), Some("git log '\u{e9}'"));
+}
+
+#[test]
+fn rep_is_bounded_and_needs_a_preceding_char() {
+    let mut t = term(10, 5);
+    feed(&mut t, "a\x1b[3b\x1b[3b");
+    assert_eq!(t.row_text(0), "aaaa");
+    feed(&mut t, "\r\nb\r\x1b[5b");
+    assert_eq!(t.row_text(1), "b");
+    feed(&mut t, "\x1b[2;3r\x1b[2Hc\x1b[65535b");
+    assert_eq!(t.screen_text(), "aaaa\ncccccccccc\nc");
+}
+
+#[test]
+fn ris_on_alt_screen_keeps_line_numbers_increasing() {
+    let mut t = Terminal::new(10, 3, Config { scrollback: 100, ..Default::default() });
+    feed(&mut t, &"x\r\n".repeat(50));
+    feed(&mut t, "\x1b[?1049h");
+    let end = t.primary_grid().end_line();
+    feed(&mut t, "\x1bc");
+    assert!(!t.is_alt_screen());
+    assert!(t.grid().first_line() >= end, "{} < {end}", t.grid().first_line());
+}
+
+#[test]
 fn resize_reflows_and_remaps_blocks() {
     let mut t = term(10, 5);
     run_cmd(&mut t, "x", "0123456789abcde\r\n", 0);

@@ -182,6 +182,19 @@ pub(crate) enum ToPlugin {
     Ui(SurfaceId, UiEvent),
 }
 
+/// Pane events queued for a plugin, by (pane, kind): a newer one replaces
+/// the queued one instead of taking another slot.
+type Pending = Arc<Mutex<HashMap<(PaneId, u8), Option<Event>>>>;
+
+fn coalesced(e: &Event) -> Option<(PaneId, u8)> {
+    match e {
+        Event::Bell(p) => Some((*p, 0)),
+        Event::TitleChanged((p, _)) => Some((*p, 1)),
+        Event::CwdChanged((p, _)) => Some((*p, 2)),
+        _ => None,
+    }
+}
+
 /// Sends events to a plugin from helper threads (processes, HTTP, file
 /// watches).
 #[derive(Clone)]
@@ -189,19 +202,28 @@ pub struct Poster {
     tx: mpsc::SyncSender<ToPlugin>,
     backlog: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
+    pending: Pending,
 }
 
 impl Poster {
-    /// False once the plugin is gone.
+    /// Waits while the plugin's queue is full. False once the plugin is gone.
     pub fn event(&self, e: Event) -> bool {
-        if self.stop.load(Ordering::Relaxed) {
-            return false;
+        self.event_until(e, &AtomicBool::new(false))
+    }
+
+    fn event_until(&self, e: Event, cancel: &AtomicBool) -> bool {
+        let mut m = ToPlugin::Event(e);
+        loop {
+            if self.stopped() || cancel.load(Ordering::Relaxed) {
+                return false;
+            }
+            match self.tx.try_send(m) {
+                Ok(()) => return true,
+                Err(mpsc::TrySendError::Full(back)) => m = back,
+                Err(mpsc::TrySendError::Disconnected(_)) => return false,
+            }
+            std::thread::sleep(Duration::from_millis(5));
         }
-        if self.tx.try_send(ToPlugin::Event(e)).is_err() {
-            self.stop.store(true, Ordering::Release);
-            return false;
-        }
-        true
     }
 
     /// An event carrying `n` bytes of output: waits while the plugin is
@@ -225,15 +247,18 @@ impl Poster {
             return false;
         }
         self.backlog.fetch_add(n, Ordering::Relaxed);
-        self.event(e)
+        self.event_until(e, cancel)
     }
 
     #[cfg(test)]
     pub(crate) fn testing() -> (Self, mpsc::Receiver<ToPlugin>) {
-        let (tx, rx) = mpsc::sync_channel(256);
-        (Self { tx, backlog: Arc::default(), stop: Arc::default() }, rx)
+        let (tx, rx) = mpsc::sync_channel(QUEUE);
+        (Self { tx, backlog: Arc::default(), stop: Arc::default(), pending: Arc::default() }, rx)
     }
 }
+
+/// Messages queued for one plugin.
+const QUEUE: usize = 256;
 
 /// What to run.
 pub struct Spec {
@@ -283,10 +308,12 @@ impl Runtime {
     /// Start an instance in a new thread. `init` runs there; the outcome
     /// arrives at `sink` as [`FromPlugin::Started`] or `Failed`.
     pub fn start(&self, spec: Spec, sink: Sink) -> Result<Handle, String> {
-        let (tx, rx) = mpsc::sync_channel(256);
+        let (tx, rx) = mpsc::sync_channel(QUEUE);
         let stop = Arc::new(AtomicBool::new(false));
         let key = spec.key.clone();
-        let poster = Poster { tx: tx.clone(), backlog: Arc::default(), stop: stop.clone() };
+        let granted = spec.granted.clone();
+        let pending = Pending::default();
+        let poster = Poster { tx: tx.clone(), backlog: Arc::default(), stop: stop.clone(), pending: pending.clone() };
         let (engine, cache) = (self.engine.clone(), self.cache.clone());
         std::thread::Builder::new()
             .name(format!("plugin {}", spec.key.id))
@@ -299,7 +326,7 @@ impl Runtime {
                 sink(key, msg);
             })
             .map_err(|e| e.to_string())?;
-        Ok(Handle { key, tx, stop })
+        Ok(Handle { key, tx, stop, granted, pending, dropped: Arc::default() })
     }
 }
 
@@ -308,19 +335,44 @@ pub struct Handle {
     pub key: Key,
     tx: mpsc::SyncSender<ToPlugin>,
     stop: Arc<AtomicBool>,
+    granted: Permissions,
+    pending: Pending,
+    dropped: Arc<AtomicUsize>,
 }
 
 impl Handle {
+    /// Events its permissions do not cover are not sent; when its queue is
+    /// full the event is dropped (the terminal never waits for a plugin).
     pub fn event(&self, e: Event) {
-        if self.tx.try_send(ToPlugin::Event(e)).is_err() {
-            self.stop();
+        if !allowed(&e, &self.granted) {
+            return;
+        }
+        let Some(k) = coalesced(&e) else { return self.send(ToPlugin::Event(e)) };
+        let Ok(mut pending) = self.pending.lock() else { return };
+        if let Some(queued) = pending.get_mut(&k) {
+            *queued = Some(e);
+            return;
+        }
+        if self.tx.try_send(ToPlugin::Event(e)).is_ok() {
+            pending.insert(k, None);
+        } else {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
 
     pub fn ui(&self, s: SurfaceId, e: UiEvent) {
-        if self.tx.try_send(ToPlugin::Ui(s, e)).is_err() {
-            self.stop();
+        self.send(ToPlugin::Ui(s, e));
+    }
+
+    fn send(&self, m: ToPlugin) {
+        if self.tx.try_send(m).is_err() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Events and UI events dropped because the plugin was behind.
+    pub fn dropped(&self) -> usize {
+        self.dropped.load(Ordering::Relaxed)
     }
 
     /// Stop it, interrupting a call in progress within a tick.
@@ -347,6 +399,8 @@ struct State {
     /// time spent in the host).
     call_start: Instant,
     stop: Arc<AtomicBool>,
+    /// Why the host stopped it (a failure, not a requested stop).
+    fault: Option<String>,
     /// id → (due, repeat interval).
     timers: BTreeMap<TimerId, (Instant, Option<Duration>)>,
     next_timer: TimerId,
@@ -443,8 +497,10 @@ impl State {
         }
         self.rate_calls += 1;
         if self.rate_calls > 2000 || call_bytes(&call) > 4 << 20 {
+            let e = "plugin exceeded host call rate or message size limit".to_string();
+            self.fault = Some(e.clone());
             self.stop.store(true, Ordering::Release);
-            return Err("plugin exceeded host call rate or message size limit".into());
+            return Err(e);
         }
         // Every call is acknowledged after consumption, including drawing and
         // logging. A plugin can have only one host message in flight.
@@ -845,7 +901,8 @@ impl proteus::plugin::host::Host for State {
             return Err(denied("network"));
         }
         let uri = net::check(&self.granted.network, &request.url)?;
-        self.blocking(move || net::fetch(uri, request))?
+        let stop = self.stop.clone();
+        self.blocking(move || net::fetch(uri, request, stop))?
     }
 
     fn http_stream(&mut self, request: HttpRequest) -> Result<RequestId, String> {
@@ -954,7 +1011,15 @@ impl proteus::plugin::host::Host for State {
             if meta.is_file() && (meta.permissions().mode() & 0o111 != 0 || launcher) {
                 return Err("open: executable files and launchers cannot be opened".into());
             }
-            (format!("/proc/{}/fd/{}", std::process::id(), pinned.file.as_raw_fd()), Some(pinned.file))
+            let file = if meta.is_dir() {
+                pinned.file
+            } else if meta.is_file() {
+                let copy = self.access.writable(&pinned.original);
+                Arc::new(self.excluded(|_| files::open_snapshot(&pinned, &pinned.original, copy))?)
+            } else {
+                return Err("open: not a file or directory".into());
+            };
+            (format!("/proc/{}/fd/{}", std::process::id(), file.as_raw_fd()), Some(file))
         };
         self.rpc(Call::Open(target.0, target.1)).map(|_| ())
     }
@@ -1117,6 +1182,9 @@ async fn until_stopped<T>(
 }
 
 fn trap_message(e: &wasmtime::Error, state: &State) -> String {
+    if let Some(f) = &state.fault {
+        return f.clone();
+    }
     if state.stop.load(Ordering::Relaxed) {
         return "stopped".into();
     }
@@ -1198,20 +1266,18 @@ fn run(
         wasi.inherit_stderr();
     }
     std::fs::create_dir_all(&spec.data_dir).map_err(|e| format!("{}: {e}", spec.data_dir.display()))?;
-    wasi.preopened_dir(&spec.data_dir, "/data", FsPerms::ReadWrite)
-        .map_err(|e| format!("{}: {e}", spec.data_dir.display()))?;
     for f in &spec.granted.fs {
         f.validate_directory()?;
-        let perms = if f.write { FsPerms::ReadWrite } else { FsPerms::ReadOnly };
-        let host = f.host_path()?;
-        // Seen at its real path. Missing directories are left out (the
-        // plugin gets "not found").
-        if host.is_dir() {
-            let guest = host.display().to_string();
-            wasi.preopened_dir(&host, &guest, perms).map_err(|e| format!("{}: {e}", host.display()))?;
-        }
+    }
+    let access = Access::new(spec.data_dir.clone(), &spec.granted.fs)?;
+    // Seen at their real paths, through the descriptors checked above.
+    // Missing directories are left out (the plugin gets "not found").
+    for (guest, host, write) in access.preopens() {
+        let perms = if write { FsPerms::ReadWrite } else { FsPerms::ReadOnly };
+        wasi.preopened_dir(&host, &guest, perms).map_err(|e| format!("{guest}: {e}"))?;
     }
     let backlog = post.backlog.clone();
+    let pending = post.pending.clone();
     let state = State {
         config: spec.config.to_string(),
         key: spec.key.clone(),
@@ -1226,9 +1292,10 @@ fn run(
         limits: Limits::new(spec.memory),
         call_start: Instant::now(),
         stop: post.stop.clone(),
+        fault: None,
         timers: BTreeMap::new(),
         next_timer: 0,
-        access: Access::new(spec.data_dir.clone(), &spec.granted.fs)?,
+        access,
         post,
         storage: Storage::new(spec.storage.clone()),
         processes: Processes::default(),
@@ -1276,13 +1343,17 @@ fn run(
 
     loop {
         if store.data().stop.load(Ordering::Relaxed) {
-            return Ok(());
+            return store.data().fault.clone().map_or(Ok(()), Err);
         }
         match next_wake(&rx, &store.data().timers) {
             Wake::Message(ToPlugin::Event(e)) => {
                 if let Event::ProcessOutput(ProcessOutput { data, .. }) | Event::HttpBody((_, data)) = &e {
                     backlog.fetch_sub(data.len(), Ordering::Relaxed);
                 }
+                let e = match coalesced(&e) {
+                    Some(k) => pending.lock().ok().and_then(|mut p| p.remove(&k)).flatten().unwrap_or(e),
+                    None => e,
+                };
                 if allowed(&e, &spec.granted) {
                     guarded!(store, plugin.call_on_event(&mut store, &e));
                 }
@@ -1354,6 +1425,7 @@ mod tests {
             limits: Limits::new(MEMORY),
             call_start: Instant::now(),
             stop: post.stop.clone(),
+            fault: None,
             timers: BTreeMap::new(),
             next_timer: 0,
             post,
@@ -1404,13 +1476,23 @@ mod tests {
     }
 
     #[test]
-    fn event_flood_stops_instead_of_growing_or_blocking_the_gui() {
-        let (post, _events) = Poster::testing();
-        for i in 0..256 {
-            assert!(post.event(Event::Timer(i)));
+    fn helper_floods_wait_for_the_plugin_instead_of_stopping_it() {
+        let (post, events) = Poster::testing();
+        let p = post.clone();
+        let worker = std::thread::spawn(move || (0..QUEUE as u32 + 100).all(|i| p.event(Event::Timer(i))));
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!post.stopped());
+        let got: Vec<_> = (0..QUEUE + 100).map(|_| events.recv_timeout(Duration::from_secs(1)).unwrap()).collect();
+        assert!(worker.join().unwrap());
+        assert!(matches!(got.last(), Some(ToPlugin::Event(Event::Timer(i))) if *i == QUEUE as u32 + 99));
+        for _ in 0..QUEUE {
+            assert!(post.event(Event::Timer(0)));
         }
-        assert!(!post.event(Event::Timer(257)));
-        assert!(post.stopped());
+        let p = post.clone();
+        let worker = std::thread::spawn(move || p.event(Event::Timer(1)));
+        std::thread::sleep(Duration::from_millis(20));
+        post.stop.store(true, Ordering::Relaxed);
+        assert!(!worker.join().unwrap(), "a stopped plugin releases waiting helpers");
     }
 
     #[test]

@@ -9,6 +9,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
+/// FNV-1a: stable across builds and Rust versions, for naming files.
+pub fn stable_hash(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3))
+}
+
+/// An exclusive lock from [`StateFile::lock`], released on drop.
+pub struct Lock(File);
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        let _ = rustix::fs::flock(&self.0, rustix::fs::FlockOperation::Unlock);
+    }
+}
+
 pub struct StateFile {
     dir: File,
     name: OsString,
@@ -62,8 +76,9 @@ impl StateFile {
     }
 
     /// Lock the stable sidecar inode, never the file replaced by rename.
-    /// Locks are released automatically when the returned File is dropped.
-    pub fn lock(&self, nonblocking: bool) -> io::Result<File> {
+    /// Dropping the guard unlocks explicitly: a child forked meanwhile holds
+    /// the same open file description until it execs.
+    pub fn lock(&self, nonblocking: bool) -> io::Result<Lock> {
         let mut name = self.name.clone();
         name.push(".lock");
         let lock = self.open_private(&name, OFlags::RDWR | OFlags::CREATE)?;
@@ -73,7 +88,7 @@ impl StateFile {
             rustix::fs::FlockOperation::LockExclusive
         };
         rustix::fs::flock(&lock, op)?;
-        Ok(lock)
+        Ok(Lock(lock))
     }
 
     /// Missing is distinct from corrupt/unreadable. Never read an unbounded
@@ -232,6 +247,13 @@ mod tests {
         assert!(StateFile::new(&path).unwrap().lock(true).is_err());
         drop(lock);
         assert!(file.lock(true).is_ok());
+        // A descriptor inherited by a child that has not exec'd yet.
+        let lock = file.lock(true).unwrap();
+        let inherited = lock.0.try_clone().unwrap();
+        drop(lock);
+        assert!(file.lock(true).is_ok());
+        drop(inherited);
+        assert_eq!(stable_hash(b"a"), 0xaf63_dc4c_8601_ec8c);
         file.remove().unwrap();
         let victim = dir.join("victim");
         std::fs::write(&victim, "safe").unwrap();

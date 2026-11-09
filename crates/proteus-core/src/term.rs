@@ -964,9 +964,9 @@ impl Terminal {
         self.linefeed();
     }
 
-    fn repeat(&mut self, n: usize) {
-        if let Some((c, w)) = self.last_char {
-            for _ in 0..n.min(self.cols() * self.lines()) {
+    fn repeat(&mut self, last: Option<(char, usize)>, n: usize) {
+        if let Some((c, w)) = last {
+            for _ in 0..n.min(self.cols() * (self.bottom - self.top + 1)) {
                 self.put_char(c, w);
             }
         }
@@ -1332,7 +1332,15 @@ impl Terminal {
         fresh.notify_times = std::mem::take(&mut self.notify_times);
         fresh.cell_px = self.cell_px;
         fresh.dark = self.dark;
-        fresh.grid.set_first_line(self.grid.end_line());
+        fresh.local = self.local;
+        fresh.cwd = self.cwd.take();
+        fresh.apc = self.apc;
+        fresh.apc_buf = std::mem::take(&mut self.apc_buf);
+        fresh.apc_overflow = self.apc_overflow;
+        fresh.osc_len = self.osc_len;
+        fresh.osc_head = std::mem::take(&mut self.osc_head);
+        fresh.osc_drop = self.osc_drop;
+        fresh.grid.set_first_line(self.grid.end_line().max(self.inactive.end_line()));
         *self = fresh;
         self.events.push(Event::TitleChanged(String::new()));
     }
@@ -1718,6 +1726,12 @@ fn truncated(mut s: String, max: usize) -> String {
     s
 }
 
+/// A command line reported by the program; one with control characters
+/// could hide lines from what is shown and is dropped.
+fn command_text(s: String) -> Option<String> {
+    (!s.chars().any(char::is_control)).then(|| truncated(s, MAX_TEXT))
+}
+
 // --- OSC handlers ---------------------------------------------------------
 
 impl Terminal {
@@ -1878,7 +1892,7 @@ impl Terminal {
             b'B' => self.mark_input(),
             b'C' => {
                 let cmd = kv("cmdline_url=").map(|s| text::percent_decode(&s)).or_else(|| kv("cmdline="));
-                self.mark_output(cmd.map(|c| truncated(c, MAX_TEXT)));
+                self.mark_output(cmd.and_then(command_text));
             }
             b'D' => {
                 let code = params.get(2).and_then(|p| lossy(p).trim().parse::<i32>().ok());
@@ -1888,7 +1902,7 @@ impl Terminal {
                 let cmd = join_params(params, 2);
                 // Only the first `;` separates the nonce; VS Code escapes the rest.
                 let cmd = cmd.split(';').next().unwrap_or_default();
-                self.pending_command = Some(truncated(cmd.replace("\\x3b", ";").replace("\\\\", "\\"), MAX_TEXT));
+                self.pending_command = command_text(cmd.replace("\\x3b", ";").replace("\\\\", "\\"));
             }
             _ => {}
         }
@@ -2114,6 +2128,7 @@ impl Perform for Terminal {
     }
 
     fn execute(&mut self, byte: u8) {
+        self.last_char = None;
         match byte {
             0x07 => self.events.push(Event::Bell),
             0x08 => self.move_left(1),
@@ -2142,6 +2157,7 @@ impl Perform for Terminal {
     }
 
     fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
+        self.last_char = None;
         if ignore {
             return;
         }
@@ -2168,6 +2184,7 @@ impl Perform for Terminal {
     }
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
+        let last = self.last_char.take();
         if ignore {
             return;
         }
@@ -2210,7 +2227,7 @@ impl Perform for Terminal {
             ([], 'T') if args.len() <= 1 => self.scroll_down(arg(0, 1)),
             ([], 'X') => self.erase_chars(arg(0, 1)),
             ([], 'Z') => self.tab_backward(arg(0, 1)),
-            ([], 'b') => self.repeat(arg(0, 1)),
+            ([], 'b') => self.repeat(last, arg(0, 1)),
             ([], 'c') if raw(0) == 0 => self.reply("\x1b[?62;4;22;52c"),
             ([b'>'], 'c') if raw(0) == 0 => {
                 let v = version_number();
@@ -2258,6 +2275,7 @@ impl Perform for Terminal {
     }
 
     fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
+        self.last_char = None;
         if std::mem::take(&mut self.osc_drop) {
             return;
         }
@@ -2266,6 +2284,7 @@ impl Perform for Terminal {
     }
 
     fn hook(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
+        self.last_char = None;
         let kind = match (intermediates, action) {
             (b"+", 'q') => Some(DcsKind::XtGetTcap),
             (b"$", 'q') => Some(DcsKind::Decrqss),

@@ -40,68 +40,114 @@ impl App {
         }
     }
 
+    /// Start the grace period of the front prompt once it is on screen.
+    pub(super) fn prompt_drawn(&mut self) {
+        let front = self.w.prompts.front().map(std::mem::discriminant);
+        self.w.prompt_shown = match (front, self.w.prompt_shown) {
+            (None, _) => None,
+            (Some(d), Some((s, t))) if s == d => Some((s, t)),
+            (Some(d), _) => Some((d, Instant::now())),
+        };
+    }
+
     pub(super) fn answer_prompt(&mut self, key: input::Key) {
         use input::Key;
+        let Some(front) = self.w.prompts.front() else { return };
+        if graced(front, self.w.prompt_shown, Instant::now()) {
+            return;
+        }
         let Some(p) = self.w.prompts.pop_front() else { return };
         let yes = matches!(key, Key::Char('y' | 'Y'));
         let no = matches!(key, Key::Char('n' | 'N') | Key::Escape);
-        match p {
+        let enter = matches!(key, Key::Enter);
+        let keep = match p {
             Prompt::ClipboardRead(id, kind, terminator, shown, title) => match key {
-                // Keys typed just before it appeared are not answers.
-                _ if shown.elapsed() < PROMPT_GRACE => {
-                    self.w.prompts.push_front(Prompt::ClipboardRead(id, kind, terminator, shown, title))
-                }
+                _ if shown.elapsed() < PROMPT_GRACE => Some(Prompt::ClipboardRead(id, kind, terminator, shown, title)),
                 // Shift+A: lowercase `a` is too easily typed by accident.
                 Key::Char('A') => {
                     self.osc52_always = true;
                     self.read_clipboard(kind, ClipTarget::Osc52(id, kind, terminator));
+                    None
                 }
-                _ if yes => self.read_clipboard(kind, ClipTarget::Osc52(id, kind, terminator)),
-                Key::Enter => {}
-                _ if no => {}
-                _ => self.w.prompts.push_front(Prompt::ClipboardRead(id, kind, terminator, shown, title)),
+                _ if yes => {
+                    self.read_clipboard(kind, ClipTarget::Osc52(id, kind, terminator));
+                    None
+                }
+                Key::Enter => None,
+                _ if no => None,
+                _ => Some(Prompt::ClipboardRead(id, kind, terminator, shown, title)),
             },
             Prompt::Paste(id, text) => match key {
-                Key::Enter => self.paste_now(id, &text),
-                _ if yes => self.paste_now(id, &text),
-                _ if no => {}
-                _ => self.w.prompts.push_front(Prompt::Paste(id, text)),
+                _ if yes || enter => {
+                    self.paste_now(id, &text);
+                    None
+                }
+                _ if no => None,
+                _ => Some(Prompt::Paste(id, text)),
             },
             Prompt::Close(ids, msg) => match key {
-                Key::Enter => ids.into_iter().for_each(|id| self.close_pane(id)),
-                _ if yes => ids.into_iter().for_each(|id| self.close_pane(id)),
-                _ if no => {}
-                _ => self.w.prompts.push_front(Prompt::Close(ids, msg)),
+                _ if yes || enter => {
+                    ids.into_iter().for_each(|id| self.close_pane(id));
+                    None
+                }
+                _ if no => None,
+                _ => Some(Prompt::Close(ids, msg)),
             },
             Prompt::Quit(msg) => match key {
-                Key::Enter | Key::Char('y' | 'Y') => {
+                _ if yes || enter => {
                     self.quit_requested = true;
                     self.exit = true;
+                    None
                 }
-                _ if no => {}
-                _ => self.w.prompts.push_front(Prompt::Quit(msg)),
+                _ if no => None,
+                _ => Some(Prompt::Quit(msg)),
             },
             Prompt::Restore(spec) => match key {
-                Key::Enter => self.restore(&spec),
-                _ if yes => self.restore(&spec),
-                _ if no => {}
-                _ => self.w.prompts.push_front(Prompt::Restore(spec)),
+                _ if yes || enter => {
+                    self.restore(&spec);
+                    None
+                }
+                _ if no => None,
+                _ => Some(Prompt::Restore(spec)),
             },
             Prompt::PluginConfirm(n, q) => match key {
-                Key::Enter => self.plugin_answer(n, Some("yes".into())),
-                _ if yes => self.plugin_answer(n, Some("yes".into())),
-                _ if no => self.plugin_answer(n, None),
-                _ => self.w.prompts.push_front(Prompt::PluginConfirm(n, q)),
+                _ if yes => {
+                    self.plugin_answer(n, Some("yes".into()));
+                    None
+                }
+                _ if no => {
+                    self.plugin_answer(n, None);
+                    None
+                }
+                _ => Some(Prompt::PluginConfirm(n, q)),
             },
             Prompt::PluginPermissions(entry) => match key {
-                _ if yes => self.plugin_permissions_answer(*entry, true),
-                _ if no => self.plugin_permissions_answer(*entry, false),
-                _ => self.w.prompts.push_front(Prompt::PluginPermissions(entry)),
+                _ if yes => {
+                    self.plugin_permissions_answer(*entry, true);
+                    None
+                }
+                _ if no => {
+                    self.plugin_permissions_answer(*entry, false);
+                    None
+                }
+                _ => Some(Prompt::PluginPermissions(entry)),
             },
-            Prompt::Notice(_) => {}
+            Prompt::Notice(_) => None,
+        };
+        match keep {
+            Some(p) => self.w.prompts.push_front(p),
+            None => self.w.prompt_shown = None,
         }
         self.w.dirty = true;
     }
+}
+
+/// Whether keys are ignored by prompt `p` (drawn as `shown`): prompts not
+/// raised by something the user just did take no answers until they have
+/// been on screen for [`PROMPT_GRACE`].
+fn graced(p: &Prompt, shown: Option<(std::mem::Discriminant<Prompt>, Instant)>, now: Instant) -> bool {
+    matches!(p, Prompt::Restore(_) | Prompt::PluginConfirm(..) | Prompt::PluginPermissions(_))
+        && !shown.is_some_and(|(d, t)| d == std::mem::discriminant(p) && now.duration_since(t) >= PROMPT_GRACE)
 }
 
 /// Whether pasting `text` should be confirmed. Bracketed paste is exempt
@@ -182,6 +228,10 @@ impl Prompt {
                     detail.push_str(". ");
                     detail.push_str(&catalog.t("prompt-plugin-run-command-warning", &[]));
                 }
+                if e.granted.open_pane {
+                    detail.push_str(". ");
+                    detail.push_str(&catalog.t("prompt-plugin-open-pane-warning", &[]));
+                }
                 if e.granted.writes_startup_files() {
                     detail.push_str(". ");
                     detail.push_str(&catalog.t("prompt-plugin-startup-files-warning", &[]));
@@ -211,6 +261,23 @@ mod tests {
         let overlay = Prompt::PluginConfirm(1, "plugin's own text".into()).overlay(&catalog);
         assert_eq!(overlay.title, "plugin's own text");
         assert_eq!(overlay.keys, "[y] 是   [n] 否");
+    }
+
+    #[test]
+    fn unrequested_prompts_ignore_keys_until_shown_for_a_while() {
+        let now = Instant::now();
+        let ask = Prompt::PluginConfirm(1, "q".into());
+        let d = std::mem::discriminant(&ask);
+        let early = now - PROMPT_GRACE / 2;
+        let late = now - PROMPT_GRACE * 2;
+        assert!(graced(&ask, None, now));
+        assert!(graced(&ask, Some((d, early)), now));
+        assert!(!graced(&ask, Some((d, late)), now));
+        let notice = Prompt::Notice("n".into());
+        assert!(graced(&ask, Some((std::mem::discriminant(&notice), late)), now));
+        assert!(!graced(&notice, None, now));
+        assert!(!graced(&Prompt::Paste(1, "x".into()), None, now));
+        assert!(graced(&Prompt::Restore(LayoutSpec::default()), None, now));
     }
 
     #[test]

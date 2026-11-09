@@ -16,6 +16,8 @@ use crate::manifest::FsGrant;
 pub struct Access {
     pub data_dir: PathBuf,
     roots: Vec<(PathBuf, Arc<std::fs::File>, bool)>,
+    /// Where the plugin sees each root.
+    guests: Vec<String>,
 }
 
 /// `..` and `.` removed without touching the disk.
@@ -48,29 +50,83 @@ fn real(p: &Path, follow: bool) -> Option<PathBuf> {
 }
 
 impl Access {
+    /// Grant roots are opened once, here. A symlink on the way to a root
+    /// that lies inside a writable root could have been planted by the
+    /// plugin (to widen a grant on its next start), so it is refused, as is
+    /// any grant inside another writable one.
     pub fn new(data_dir: PathBuf, fs: &[FsGrant]) -> Result<Self, String> {
         use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, openat2};
-        let mut roots = Vec::new();
-        let mut grants = vec![(data_dir.clone(), true)];
+        let data_dir = lexical(&data_dir).filter(|p| p.is_absolute()).ok_or("the data directory must be absolute")?;
+        let mut grants = vec![(data_dir.clone(), "/data".to_string(), true)];
         for g in fs {
-            grants.push((g.host_path()?, g.write));
+            let host = g.host_path()?;
+            let host = lexical(&host).ok_or_else(|| format!("fs: `{}`: not a path", g.path))?;
+            grants.push((host.clone(), host.display().to_string(), g.write));
         }
-        for (path, write) in grants {
+        let mut found = Vec::new();
+        for (i, (path, guest, write)) in grants.into_iter().enumerate() {
             if !path.exists() {
                 continue;
             }
-            let path = path.canonicalize().map_err(|e| e.to_string())?;
+            let real = path.canonicalize().map_err(|e| format!("{}: {e}", path.display()))?;
+            found.push((i, path, real, guest, write));
+        }
+        for (i, path, real, _, _) in &found {
+            let outer = found.iter().find(|(j, _, r, _, w)| *w && *j != 0 && *i != 0 && j != i && real.starts_with(r));
+            if let Some((_, other, ..)) = outer {
+                return Err(format!(
+                    "fs: `{}` is inside the read-write `{}`; nested grants are not supported",
+                    path.display(),
+                    other.display()
+                ));
+            }
+            let writable = |p: &Path| found.iter().any(|(_, _, r, _, w)| *w && p.starts_with(r));
+            for link in path.ancestors().filter(|a| std::fs::symlink_metadata(a).is_ok_and(|m| m.is_symlink())) {
+                let parent = link.parent().and_then(|p| p.canonicalize().ok());
+                if parent.is_none_or(|p| writable(&p)) {
+                    return Err(format!(
+                        "{}: {} is a symlink inside a writable directory; refusing to follow it",
+                        path.display(),
+                        link.display()
+                    ));
+                }
+            }
+        }
+        let mut roots = Vec::new();
+        let mut guests = Vec::new();
+        for (_, _, real, guest, write) in found {
             let fd = openat2(
                 CWD,
-                &path,
+                &real,
                 OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
                 Mode::empty(),
                 ResolveFlags::NO_SYMLINKS,
             )
-            .map_err(|e| e.to_string())?;
-            roots.push((path, Arc::new(std::fs::File::from(fd)), write));
+            .map_err(|e| format!("{}: {e}", real.display()))?;
+            roots.push((real, Arc::new(std::fs::File::from(fd)), write));
+            guests.push(guest);
         }
-        Ok(Self { data_dir: data_dir.canonicalize().map_err(|e| e.to_string())?, roots })
+        Ok(Self { data_dir: data_dir.canonicalize().map_err(|e| e.to_string())?, roots, guests })
+    }
+
+    /// The opened roots for WASI: (guest path, host path naming the
+    /// retained descriptor, writable).
+    pub fn preopens(&self) -> Vec<(String, PathBuf, bool)> {
+        use std::os::fd::AsRawFd;
+        self.roots
+            .iter()
+            .zip(&self.guests)
+            .map(|((_, f, w), g)| (g.clone(), PathBuf::from(format!("/proc/self/fd/{}", f.as_raw_fd())), *w))
+            .collect()
+    }
+
+    /// Is `host` (resolved) under a writable root, the innermost deciding?
+    pub fn writable(&self, host: &Path) -> bool {
+        self.roots
+            .iter()
+            .filter(|(root, _, _)| host.starts_with(root))
+            .max_by_key(|(root, _, _)| root.components().count())
+            .is_some_and(|(_, _, w)| *w)
     }
 
     /// Host path for `path` as the plugin names it; `write` needs an `rw`
@@ -513,6 +569,92 @@ pub fn mime_type(path: &Path) -> Result<String, String> {
     mime_type_named(path, path)
 }
 
+/// The type of content the desktop may open for a plugin: a document,
+/// image or media file, never a program, launcher or markup that a handler
+/// chosen by content sniffing could run.
+pub fn openable(head: &[u8]) -> Result<&'static str, String> {
+    const MAGIC: [(&[u8], &str); 10] = [
+        (b"\x89PNG\r\n\x1a\n", "image/png"),
+        (b"\xff\xd8\xff", "image/jpeg"),
+        (b"GIF8", "image/gif"),
+        (b"%PDF-", "application/pdf"),
+        (b"ID3", "audio/mpeg"),
+        (b"\xff\xfb", "audio/mpeg"),
+        (b"\xff\xf3", "audio/mpeg"),
+        (b"OggS", "audio/ogg"),
+        (b"fLaC", "audio/flac"),
+        (b"\x1a\x45\xdf\xa3", "video/webm"),
+    ];
+    let riff = |kind: &[u8]| head.len() >= 12 && &head[..4] == b"RIFF" && &head[8..12] == kind;
+    if riff(b"WEBP") {
+        return Ok("image/webp");
+    }
+    if riff(b"WAVE") {
+        return Ok("audio/wav");
+    }
+    if head.len() >= 12 && &head[4..8] == b"ftyp" {
+        return Ok("video/mp4");
+    }
+    if let Some((_, m)) = MAGIC.iter().find(|(magic, _)| head.starts_with(magic)) {
+        return Ok(m);
+    }
+    let text = head.strip_prefix(b"\xef\xbb\xbf".as_slice()).unwrap_or(head);
+    let utf8 = match std::str::from_utf8(text) {
+        Ok(_) => true,
+        Err(e) => e.error_len().is_none(),
+    };
+    let control = text.iter().any(|&b| (b < 0x20 && !b"\t\n\r\x0c".contains(&b)) || b == 0x7f);
+    let start = text.trim_ascii_start();
+    let active = start.starts_with(b"<")
+        || start.starts_with(b"#!")
+        || start.get(..15).is_some_and(|s| s.eq_ignore_ascii_case(b"[desktop entry]"));
+    if utf8 && !control && !active {
+        return Ok("text/plain");
+    }
+    Err("open: only documents, images, audio and video can be opened".into())
+}
+
+/// Largest file copied for `open` out of a directory the plugin can write.
+pub const MAX_OPEN_COPY: u64 = 256 << 20;
+
+/// `path` (a regular file) opened for the desktop once its content passed
+/// [`openable`]. When the plugin could rewrite it (`copy`), a sealed
+/// in-memory copy is checked and handed out instead, so what is opened is
+/// what was checked.
+pub fn open_snapshot(path: &Path, name: &Path, copy: bool) -> Result<std::fs::File, String> {
+    use rustix::fs::{MemfdFlags, SealFlags, fcntl_add_seals, memfd_create};
+    use std::io::{Read, Seek};
+    use std::os::unix::fs::FileExt;
+    let io = |e: std::io::Error| format!("open: {}: {e}", name.display());
+    let head = |f: &std::fs::File| -> Result<Vec<u8>, String> {
+        let mut head = vec![0; 4096];
+        let n = f.read_at(&mut head, 0).map_err(io)?;
+        head.truncate(n);
+        Ok(head)
+    };
+    let mut file = std::fs::File::open(path).map_err(io)?;
+    openable(&head(&file)?)?;
+    if !copy {
+        return Ok(file);
+    }
+    if file.metadata().map_err(io)?.len() > MAX_OPEN_COPY {
+        return Err(format!("open: files over {} MiB in writable directories cannot be opened", MAX_OPEN_COPY >> 20));
+    }
+    let label = name.file_name().map_or("open".into(), |n| n.to_string_lossy().into_owned());
+    let mem =
+        memfd_create(label.as_str(), MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING).map_err(|e| e.to_string())?;
+    let mut mem = std::fs::File::from(mem);
+    let n = std::io::copy(&mut (&mut file).take(MAX_OPEN_COPY + 1), &mut mem).map_err(io)?;
+    if n > MAX_OPEN_COPY {
+        return Err(format!("open: files over {} MiB in writable directories cannot be opened", MAX_OPEN_COPY >> 20));
+    }
+    fcntl_add_seals(&mem, SealFlags::WRITE | SealFlags::GROW | SealFlags::SHRINK | SealFlags::SEAL)
+        .map_err(|e| e.to_string())?;
+    openable(&head(&mem)?)?;
+    mem.rewind().map_err(io)?;
+    Ok(mem)
+}
+
 pub fn mime_type_named(path: &Path, original: &Path) -> Result<String, String> {
     let meta = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
     if meta.is_dir() {
@@ -575,6 +717,77 @@ mod tests {
         std::os::unix::fs::symlink(&outside, &data).unwrap();
         assert!(access.pin("/data/file", false, true).is_err());
         assert_eq!(std::fs::read_to_string(outside.join("file")).unwrap(), "outside");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn grants_through_plugin_writable_symlinks_or_nested_in_writable_grants_are_refused() {
+        let root = std::env::temp_dir().join(format!("proteus-fs-links-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (notes, outside) = (root.join("notes"), root.join("outside"));
+        std::fs::create_dir_all(notes.join("cache")).unwrap();
+        std::fs::create_dir_all(root.join("data")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let rw = |p: &Path| FsGrant { path: p.display().to_string(), write: true };
+        let data = root.join("data");
+        assert!(Access::new(data.clone(), &[rw(&notes), rw(&notes.join("cache"))]).is_err());
+        // The plugin swaps a directory it can write for a symlink.
+        std::fs::remove_dir(notes.join("cache")).unwrap();
+        std::os::unix::fs::symlink("..", notes.join("cache")).unwrap();
+        let err = Access::new(data.clone(), &[rw(&notes), rw(&notes.join("cache"))]).err().unwrap();
+        assert!(err.contains("nested") || err.contains("symlink"), "{err}");
+        std::os::unix::fs::symlink(&outside, notes.join("data")).unwrap();
+        assert!(Access::new(notes.join("data"), &[rw(&notes)]).err().unwrap().contains("symlink"));
+        // Symlinks the plugin cannot write, like a symlinked home, are fine.
+        std::os::unix::fs::symlink(&outside, root.join("home")).unwrap();
+        let a = Access::new(data, &[rw(&root.join("home")), rw(&notes)]).unwrap();
+        let preopens = a.preopens();
+        assert_eq!(
+            preopens.iter().map(|p| p.0.as_str()).collect::<Vec<_>>(),
+            ["/data".to_string(), root.join("home").display().to_string(), notes.display().to_string()]
+        );
+        assert!(preopens[1].1.starts_with("/proc/self/fd"));
+        assert_eq!(std::fs::canonicalize(&preopens[1].1).unwrap(), outside.canonicalize().unwrap());
+        assert!(a.writable(&outside.canonicalize().unwrap().join("x")));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn only_documents_and_media_are_opened() {
+        for ok in [&b"\x89PNG\r\n\x1a\n...."[..], b"%PDF-1.7", b"ID3\x04", b"hello\n\tworld", b"\xef\xbb\xbftext", b""]
+        {
+            assert!(openable(ok).is_ok(), "{ok:?}");
+        }
+        assert_eq!(openable(b"\0\0\0\x18ftypmp42").unwrap(), "video/mp4");
+        for bad in [
+            &b"MZ\x90\0\x03"[..],
+            b"PK\x03\x04\x14\0",
+            b"\x7fELF\x02",
+            b"#!/bin/sh\nrm -rf ~",
+            b"  <html><script>",
+            b"<?xml version='1.0'?><svg/>",
+            b"[Desktop Entry]\nExec=sh",
+            b"text with \x1b[31m escape",
+            b"\xca\xfe\xba\xbe",
+        ] {
+            assert!(openable(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn writable_files_are_opened_from_a_sealed_copy() {
+        let root = std::env::temp_dir().join(format!("proteus-open-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("doc.txt");
+        std::fs::write(&file, "checked").unwrap();
+        let copy = open_snapshot(&file, &file, true).unwrap();
+        std::fs::write(&file, "#!/bin/sh\nswapped").unwrap();
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut &copy, &mut text).unwrap();
+        assert_eq!(text, "checked");
+        assert!(std::io::Write::write_all(&mut &copy, b"x").is_err(), "sealed");
+        assert!(open_snapshot(&file, &file, false).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 

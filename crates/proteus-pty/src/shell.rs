@@ -111,10 +111,11 @@ pub fn inject(spec: &mut CommandSpec, dir: &Path) -> Option<Shell> {
         }
         Shell::Fish => {
             let ours = dir.as_os_str().to_owned();
-            let rest = spec
-                .get_env("XDG_DATA_DIRS")
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| "/usr/local/share:/usr/share".into());
+            let original = spec.get_env("XDG_DATA_DIRS").filter(|v| !v.is_empty());
+            if original.is_none() {
+                spec.set_env("PROTEUS_FISH_XDG_DATA_DIRS_UNSET", "1");
+            }
+            let rest = original.unwrap_or_else(|| "/usr/local/share:/usr/share".into());
             let mut v = OsString::from(&ours);
             v.push(":");
             v.push(rest);
@@ -126,31 +127,38 @@ pub fn inject(spec: &mut CommandSpec, dir: &Path) -> Option<Shell> {
     Some(shell)
 }
 
-/// Compile the `proteus` terminfo entry into `dir` with `tic` (once). On
-/// success, returns the directory to put in `TERMINFO_DIRS`.
+/// Compile the `proteus` terminfo entry under `dir` with `tic`, once per
+/// version of the source. On success, returns the directory to put in
+/// `TERMINFO_DIRS`.
 pub fn install_terminfo(dir: &Path) -> Option<PathBuf> {
+    let out = dir.join(format!("{:016x}", crate::persistence::stable_hash(crate::TERMINFO_SRC.as_bytes())));
     // ncurses uses either `p/proteus` or the hex layout `70/proteus`.
-    if dir.join("p/proteus").is_file() || dir.join("70/proteus").is_file() {
-        return Some(dir.to_path_buf());
+    let installed = || out.join("p/proteus").is_file() || out.join("70/proteus").is_file();
+    if installed() {
+        return Some(out);
     }
     std::fs::create_dir_all(dir).ok()?;
-    // A unique name: instances starting together must not share or remove
-    // each other's source file while `tic` reads it.
+    // Build privately, then publish the complete database with one rename:
+    // instances starting together never see or remove a partial one.
     static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let src = dir.join(format!(".proteus.terminfo.{}.{seq}", std::process::id()));
-    std::fs::write(&src, crate::TERMINFO_SRC).ok()?;
-    let ok = Command::new("tic")
-        .arg("-x")
-        .arg("-o")
-        .arg(dir)
-        .arg(&src)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
-    let _ = std::fs::remove_file(&src);
-    ok.then(|| dir.to_path_buf())
+    let tmp = dir.join(format!(".build-{}-{seq}", std::process::id()));
+    std::fs::create_dir(&tmp).ok()?;
+    let src = tmp.join("proteus.terminfo");
+    let ok = std::fs::write(&src, crate::TERMINFO_SRC).is_ok()
+        && std::fs::create_dir(tmp.join("db")).is_ok()
+        && Command::new("tic")
+            .arg("-x")
+            .arg("-o")
+            .arg(tmp.join("db"))
+            .arg(&src)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+        && (std::fs::rename(tmp.join("db"), &out).is_ok() || installed());
+    let _ = std::fs::remove_dir_all(&tmp);
+    ok.then_some(out)
 }
 
 /// Use `TERM=proteus` if its terminfo is available in `terminfo_dir`;
@@ -206,6 +214,21 @@ mod tests {
     }
 
     #[test]
+    fn terminfo_is_published_per_source_version() {
+        let root = std::env::temp_dir().join(format!("proteus-terminfo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let Some(out) = install_terminfo(&root) else {
+            eprintln!("skipping: tic unavailable");
+            return;
+        };
+        assert_eq!(out.parent(), Some(root.as_path()));
+        assert!(out.join("p/proteus").is_file() || out.join("70/proteus").is_file());
+        assert_eq!(install_terminfo(&root), Some(out));
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn inject_per_shell() {
         let dir = Path::new("/run/x");
         let mut bash = CommandSpec::new("/bin/bash");
@@ -223,6 +246,11 @@ mod tests {
         let mut fish = CommandSpec::new("fish").env("XDG_DATA_DIRS", "/a");
         inject(&mut fish, dir);
         assert_eq!(fish.get_env("XDG_DATA_DIRS"), Some("/run/x:/a".into()));
+        assert_eq!(fish.get_env("PROTEUS_FISH_XDG_DATA_DIRS_UNSET"), None);
+        let mut fish = CommandSpec::new("fish");
+        fish.remove_env("XDG_DATA_DIRS");
+        inject(&mut fish, dir);
+        assert_eq!(fish.get_env("PROTEUS_FISH_XDG_DATA_DIRS_UNSET"), Some("1".into()));
 
         assert_eq!(inject(&mut CommandSpec::new("nu"), dir), None);
     }

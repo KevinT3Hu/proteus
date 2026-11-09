@@ -4,7 +4,7 @@
 # only $ENV, so this file switches POSIX mode back off and sources the usual
 # startup files itself before installing the hooks.
 
-if [[ -n "$PROTEUS_BASH_INJECT" ]]; then
+if [[ -n "${PROTEUS_BASH_INJECT-}" ]]; then
     builtin set +o posix
     builtin unset ENV PROTEUS_BASH_INJECT
     if [[ -n "${PROTEUS_BASH_ENV+X}" ]]; then
@@ -27,7 +27,7 @@ if [[ -n "$PROTEUS_BASH_INJECT" ]]; then
 fi
 
 
-if [[ "$-" == *i* && -z "$__proteus_loaded" && "${BASH_VERSINFO[0]:-0}${BASH_VERSINFO[1]:-0}" -ge 44 ]]; then
+if [[ "$-" == *i* && -z "${__proteus_loaded-}" && "${BASH_VERSINFO[0]:-0}${BASH_VERSINFO[1]:-0}" -ge 44 ]]; then
     __proteus_loaded=1
     __proteus_executing=""
 
@@ -63,20 +63,20 @@ if [[ "$-" == *i* && -z "$__proteus_loaded" && "${BASH_VERSINFO[0]:-0}${BASH_VER
     # PS0 is expanded in the parent shell right before a command runs (also for
     # subshells and pipelines, unlike a DEBUG trap). The array subscript sets the
     # "executing" flag as a side effect of the expansion.
-    __proteus_ps0='${__proteus_unused[__proteus_executing=1]}\e]133;C\a'
+    __proteus_ps0='${__proteus_unused[__proteus_executing=1]-}\e]133;C\a'
 
     # Runs last in PROMPT_COMMAND: (re)apply marks; prompt frameworks may rewrite PS1/PS0.
     __proteus_ps1() {
-        if [[ "$PS1" != *'133;A'* ]]; then
-            PS1='\[\e]133;A\a\]'"$PS1"'\[\e]133;B\a\]'
+        if [[ "${PS1-}" != *'133;A'* ]]; then
+            PS1='\[\e]133;A\a\]'"${PS1-}"'\[\e]133;B\a\]'
         fi
         # The PS0 mark relies on parameter expansion in prompts (promptvars);
         # without it the text would be printed literally before each command.
         if builtin shopt -q promptvars; then
-            if [[ "$PS0" != *'133;C'* ]]; then
-                PS0="$__proteus_ps0$PS0"
+            if [[ "${PS0-}" != *'133;C'* ]]; then
+                PS0="$__proteus_ps0${PS0-}"
             fi
-        elif [[ "$PS0" == "$__proteus_ps0"* ]]; then
+        elif [[ "${PS0-}" == "$__proteus_ps0"* ]]; then
             PS0="${PS0#"$__proteus_ps0"}"
         fi
     }
@@ -87,7 +87,7 @@ if [[ "$-" == *i* && -z "$__proteus_loaded" && "${BASH_VERSINFO[0]:-0}${BASH_VER
     elif [[ "$(builtin declare -p PROMPT_COMMAND 2>/dev/null)" == "declare -a"* ]]; then
         PROMPT_COMMAND=(__proteus_precmd "${PROMPT_COMMAND[@]}" __proteus_ps1)
     else
-        __proteus_pc="$PROMPT_COMMAND"
+        __proteus_pc="${PROMPT_COMMAND-}"
         while [[ "$__proteus_pc" == *[$'; \n\t'] ]]; do __proteus_pc="${__proteus_pc%?}"; done
         PROMPT_COMMAND="__proteus_precmd${__proteus_pc:+;$__proteus_pc};__proteus_ps1"
         builtin unset __proteus_pc

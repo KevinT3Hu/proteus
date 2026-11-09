@@ -2,11 +2,10 @@
 //! [`LayoutSpec`] as tabs, describing the window as one, and keeping the
 //! session file up to date.
 
-use proteus_pty::persistence::StateFile;
+use proteus_pty::persistence::{Lock, StateFile};
 use std::ffi::OsString;
-use std::fs::File;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use std::time::Duration;
 
@@ -24,7 +23,7 @@ use crate::spec::{self, FloatSpec, LayoutSpec, NodeSpec, PaneSpec, TabSpec};
 /// saves and restores; later ones run without a session.
 pub struct SessionStore {
     path: PathBuf,
-    _lock: File,
+    _lock: Lock,
     file: StateFile,
     /// Only a fully synchronized save may populate this cache.
     last: Option<String>,
@@ -140,6 +139,16 @@ impl SessionStore {
 /// `argv` as a shell command line (see [`super::hint::shell_quote`]).
 pub fn shell_join(argv: &[String]) -> String {
     argv.iter().map(|a| super::hint::shell_quote(a)).collect::<Vec<_>>().join(" ")
+}
+
+/// The lock lives in the private `lock_dir`, keyed by path, so that saving
+/// into a project leaves nothing beside the layout.
+fn write_layout(path: &Path, text: &str, lock_dir: &Path) -> io::Result<()> {
+    let path = std::path::absolute(path)?;
+    let key = proteus_pty::persistence::stable_hash(path.as_os_str().as_encoded_bytes());
+    let file = StateFile::in_directory(&path)?;
+    let _lock = StateFile::new(&lock_dir.join(format!("layout-{key:016x}")))?.lock(false)?;
+    file.write(text.as_bytes())
 }
 
 impl App {
@@ -350,10 +359,7 @@ impl App {
     pub(super) fn save_layout(&mut self, name: &str) {
         let Some(path) = spec::resolve(name) else { return self.notice("no config directory for layouts".into()) };
         let text = spec::to_lua(&self.current_spec(false));
-        let res = StateFile::in_directory(&path).and_then(|file| {
-            let _lock = file.lock(false)?;
-            file.write(text.as_bytes())
-        });
+        let res = write_layout(&path, &text, &proteus_pty::shell::runtime_dir());
         match res {
             Ok(()) => self.notice(format!("Layout saved to {}", path.display())),
             Err(e) => self.notice(format!("cannot save layout: {}: {e}", path.display())),
@@ -516,6 +522,19 @@ mod tests {
         assert_eq!(std::fs::read(&session.path).unwrap(), bytes);
         drop(session);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn explicit_layout_paths_get_no_sidecar_lock() {
+        let root = std::env::temp_dir().join(format!("proteus-layout-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        write_layout(&root.join("dev.lua"), "return {tabs={{}}}", &root.join("locks")).unwrap();
+        let names: Vec<_> = std::fs::read_dir(&root).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert_eq!(std::fs::read_to_string(root.join("dev.lua")).unwrap(), "return {tabs={{}}}");
+        assert_eq!(std::fs::read_dir(root.join("locks")).unwrap().count(), 1);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

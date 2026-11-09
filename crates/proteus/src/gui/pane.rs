@@ -2,6 +2,7 @@
 //! that forwards output to the event loop; or a plugin's pane surface,
 //! whose terminal the plugin's frames are painted into.
 
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::sync::{
@@ -52,11 +53,16 @@ pub struct Pane {
     pub plugin: Option<(String, String)>,
     /// Size (cols, rows, cell) to apply once its hidden tab is shown.
     deferred_size: Option<(u16, u16, (u32, u32))>,
-    /// Foreground process group and whether it runs on this machine.
-    fg_local: Option<(i32, bool)>,
+    /// Foreground process group, whether the pane's output is local, and
+    /// when that was checked.
+    fg_local: Option<(i32, bool, Instant)>,
 }
 
-/// Foreground programs whose output comes from another machine.
+/// How long [`Pane::update_locality`] trusts its last look at `/proc`.
+const LOCALITY_TTL: Duration = Duration::from_millis(250);
+
+/// Programs (`comm`, at most 15 bytes) whose output comes from another
+/// machine, or from wherever a multiplexer session runs.
 const REMOTE_PROGRAMS: &[&str] = &[
     "ssh",
     "autossh",
@@ -80,7 +86,60 @@ const REMOTE_PROGRAMS: &[&str] = &[
     "vagrant",
     "minicom",
     "picocom",
+    "tsh",
+    "gcloud",
+    "aws",
+    "session-manager",
+    "waypipe",
+    "tmux",
+    "screen",
+    "zellij",
+    "abduco",
+    "dtach",
 ];
+
+/// A process: pid, parent, session id, `comm`.
+type Proc = (i32, i32, i32, String);
+
+/// Every process in `/proc`.
+fn processes() -> Vec<Proc> {
+    let Ok(dir) = std::fs::read_dir("/proc") else { return Vec::new() };
+    dir.flatten()
+        .filter_map(|e| {
+            let pid: i32 = e.file_name().to_str()?.parse().ok()?;
+            let stat = std::fs::read_to_string(e.path().join("stat")).ok()?;
+            parse_stat(pid, &stat)
+        })
+        .collect()
+}
+
+/// `pid (comm) state ppid pgrp session ...`
+fn parse_stat(pid: i32, stat: &str) -> Option<Proc> {
+    let (open, close) = (stat.find('(')?, stat.rfind(')')?);
+    let comm = stat.get(open + 1..close)?.to_string();
+    let mut rest = stat.get(close + 1..)?.split_whitespace().skip(1);
+    let ppid = rest.next()?.parse().ok()?;
+    let session = rest.nth(1)?.parse().ok()?;
+    Some((pid, ppid, session, comm))
+}
+
+/// Whether a process in session `shell` (the shell is its leader) or
+/// descending from the shell runs a [`REMOTE_PROGRAMS`] entry.
+fn remote_in_session(procs: &[Proc], shell: i32) -> bool {
+    let mut children: HashMap<i32, Vec<i32>> = HashMap::new();
+    for p in procs {
+        children.entry(p.1).or_default().push(p.0);
+    }
+    let mut ours: HashSet<i32> = HashSet::new();
+    let mut stack: Vec<i32> = procs.iter().filter(|p| p.2 == shell).map(|p| p.0).chain([shell]).collect();
+    while let Some(pid) = stack.pop() {
+        if ours.insert(pid) {
+            stack.extend(children.get(&pid).into_iter().flatten());
+        }
+    }
+    let remote = |comm: &str| REMOTE_PROGRAMS.contains(&comm.split(':').next().unwrap_or(comm));
+    procs.iter().any(|p| ours.contains(&p.0) && remote(&p.3))
+}
 
 impl Pane {
     pub fn spawn(
@@ -261,21 +320,21 @@ impl Pane {
         self.pty = None;
     }
 
-    /// Hang up and collect the exit status, waiting briefly.
+    /// Hang up and collect the exit status if the child is already gone,
+    /// without waiting: 0 while it still runs (it is reaped once it exits).
     pub fn finish(&mut self) -> i32 {
         let Some(pty) = &mut self.pty else { return 0 };
-        use std::os::unix::process::ExitStatusExt;
-        if let Ok(Some(st)) = pty.try_wait() {
-            return st.code().unwrap_or_else(|| 128 + st.signal().unwrap_or(0));
+        if let Some(code) = exited(pty) {
+            return code;
         }
         pty.hangup();
-        for _ in 0..50 {
-            if let Ok(Some(st)) = pty.try_wait() {
-                return st.code().unwrap_or_else(|| 128 + st.signal().unwrap_or(0));
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        0
+        exited(pty).unwrap_or(0)
+    }
+
+    /// Hang up and wait up to `grace` for the exit status; then kill the
+    /// session and wait up to `grace` again.
+    pub fn reap(&mut self, grace: Duration) -> i32 {
+        self.pty.as_mut().map_or(0, |pty| reap(pty, grace))
     }
 
     /// User-given name, else OSC 0/2 title, else foreground process name
@@ -303,17 +362,17 @@ impl Pane {
     }
 
     /// Tell the terminal whether its output comes from this machine: SSH
-    /// panes and remote-access programs in the foreground do not.
+    /// panes, and panes where any process of the shell's session or below
+    /// it is a remote-access program or a multiplexer client, do not.
     pub fn update_locality(&mut self) {
         let local = self.remote.is_none()
-            && match self.pty.as_ref().and_then(|p| p.foreground_pgrp()) {
+            && match self.pty.as_ref().and_then(|p| Some((p.foreground_pgrp()?, p.child_pid()))) {
                 None => false,
-                Some(pgrp) => match self.fg_local {
-                    Some((cached, local)) if cached == pgrp => local,
+                Some((pgrp, shell)) => match self.fg_local {
+                    Some((cached, local, at)) if cached == pgrp && at.elapsed() < LOCALITY_TTL => local,
                     _ => {
-                        let comm = std::fs::read_to_string(format!("/proc/{pgrp}/comm"));
-                        let local = comm.is_ok_and(|c| !REMOTE_PROGRAMS.contains(&c.trim_end()));
-                        self.fg_local = Some((pgrp, local));
+                        let local = !remote_in_session(&processes(), shell);
+                        self.fg_local = Some((pgrp, local, Instant::now()));
                         local
                     }
                 },
@@ -396,6 +455,40 @@ impl Drop for Pane {
     }
 }
 
+/// Exit status of a child that has exited (128 + signal if killed).
+fn exited(pty: &mut Pty) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    let st = pty.try_wait().ok()??;
+    Some(st.code().unwrap_or_else(|| 128 + st.signal().unwrap_or(0)))
+}
+
+fn reap(pty: &mut Pty, grace: Duration) -> i32 {
+    let wait = |pty: &mut Pty| {
+        let until = Instant::now() + grace;
+        loop {
+            match exited(pty) {
+                Some(code) => return Some(code),
+                None if Instant::now() < until => std::thread::sleep(Duration::from_millis(5)),
+                None => return None,
+            }
+        }
+    };
+    if let Some(code) = exited(pty) {
+        return code;
+    }
+    pty.hangup();
+    if let Some(code) = wait(pty) {
+        return code;
+    }
+    use rustix::process::{Pid, Signal, kill_process_group};
+    for pgrp in [Some(pty.child_pid()), pty.foreground_pgrp()].into_iter().flatten() {
+        if let Some(pid) = Pid::from_raw(pgrp) {
+            let _ = kill_process_group(pid, Signal::KILL);
+        }
+    }
+    wait(pty).unwrap_or(128 + 9)
+}
+
 /// Last path component, or `~` for the home directory itself.
 fn home_relative(p: &std::path::Path) -> String {
     let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -403,4 +496,42 @@ fn home_relative(p: &std::path::Path) -> String {
         return "~".into();
     }
     p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.display().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stat_lines() {
+        let s = "42 (my prog) x) S 7 42 40 34816 42 4194560 0 0";
+        assert_eq!(parse_stat(42, s), Some((42, 7, 40, "my prog) x".into())));
+        assert_eq!(parse_stat(1, "1 (init"), None);
+    }
+
+    #[test]
+    fn remote_programs_anywhere_in_the_session_count() {
+        let p = |pid, ppid, sid, comm: &str| (pid, ppid, sid, comm.to_string());
+        let base = vec![p(1, 0, 1, "systemd"), p(10, 1, 10, "bash"), p(11, 10, 10, "myssh.sh"), p(20, 1, 20, "ssh")];
+        assert!(!remote_in_session(&base, 10));
+        let mut wrapped = base.clone();
+        wrapped.push(p(12, 11, 10, "ssh"));
+        assert!(remote_in_session(&wrapped, 10));
+        let mut sudo = base.clone();
+        sudo.extend([p(12, 10, 10, "sudo"), p(13, 12, 13, "ssh")]);
+        assert!(remote_in_session(&sudo, 10));
+        let mut tmux = base;
+        tmux.push(p(12, 10, 10, "tmux: client"));
+        assert!(remote_in_session(&tmux, 10));
+    }
+
+    #[test]
+    fn reaping_a_child_that_ignores_hangup_is_bounded() {
+        let spec = proteus_pty::CommandSpec::new("/bin/sh").args(["-c", "trap '' HUP; while :; do sleep 1; done"]);
+        let mut pty = Pty::spawn(&spec, WindowSize::new(80, 24)).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        let start = Instant::now();
+        assert_eq!(reap(&mut pty, Duration::from_millis(200)), 128 + 9);
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
 }

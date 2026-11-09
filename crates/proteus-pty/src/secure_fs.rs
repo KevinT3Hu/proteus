@@ -25,7 +25,7 @@ pub fn trusted_dir(path: &Path) -> io::Result<File> {
 
 /// A user private group (as created with umask 002 setups): named after the
 /// effective user, with no other members and no other user's primary group.
-fn is_private_group(gid: u32) -> bool {
+pub fn is_private_group(gid: u32) -> bool {
     static PRIVATE: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
     *PRIVATE.get_or_init(|| {
         let passwd = std::fs::read_to_string("/etc/passwd").ok()?;

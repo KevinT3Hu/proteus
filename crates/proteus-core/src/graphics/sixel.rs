@@ -77,6 +77,8 @@ pub(crate) struct SixelDecoder {
     buf: Vec<u32>,
     stride: usize,
     rows: usize,
+    /// Size declared by the raster attributes.
+    raster: (usize, usize),
     max_pixels: usize,
     budget: Option<Arc<ImageBudget>>,
     /// Bytes of `buf` reserved in `budget`.
@@ -168,6 +170,7 @@ impl SixelDecoder {
             buf: Vec::new(),
             stride: 0,
             rows: 0,
+            raster: (0, 0),
             max_pixels: max_bytes / 4,
             budget,
             reserved: 0,
@@ -248,11 +251,7 @@ impl SixelDecoder {
     fn raster(&mut self, p: &[u32]) {
         // Pan;Pad;Ph;Pv — pixel aspect is ignored (square pixels).
         if p.len() >= 4 {
-            let (w, h) = (p[2] as usize, p[3] as usize);
-            if self.reserve(w, h) {
-                self.width = self.width.max(w);
-                self.height = self.height.max(h);
-            }
+            self.raster = (p[2] as usize, p[3] as usize);
         }
     }
 
@@ -329,12 +328,23 @@ impl SixelDecoder {
         if w == 0 || h == 0 {
             return None;
         }
+        let (rw, rh) = (self.raster.0.max(w), self.raster.1.max(h));
+        let fits = rw <= MAX_SIDE
+            && rh <= MAX_SIDE
+            && rw * rh <= self.max_pixels
+            && self.budget.as_ref().is_none_or(|b| b.used().saturating_sub(self.reserved) + rw * rh * 4 <= b.limit());
+        let (w, h) = if fits { (rw, rh) } else { (w, h) };
         let bg = if self.transparent { 0 } else { self.palette[0] };
         let mut rgba = Vec::with_capacity(w * h * 4);
         for y in 0..h {
-            for &px in &self.buf[y * self.stride..y * self.stride + w] {
+            let row =
+                if y < self.rows { &self.buf[y * self.stride..y * self.stride + w.min(self.stride)] } else { &[] };
+            for &px in row {
                 let px = if px == 0 { bg } else { px };
                 rgba.extend_from_slice(&px.to_le_bytes());
+            }
+            for _ in row.len()..w {
+                rgba.extend_from_slice(&bg.to_le_bytes());
             }
         }
         Some(Sixel { width: w as u32, height: h as u32, rgba })
@@ -416,6 +426,18 @@ mod tests {
         let s = d.finish().unwrap();
         assert_eq!((s.width, s.height), (16383, 6));
         assert!(start.elapsed() < std::time::Duration::from_secs(2), "{:?}", start.elapsed());
+    }
+
+    #[test]
+    fn raster_size_alone_allocates_nothing() {
+        let budget = ImageBudget::new(256 << 20);
+        let mut d = SixelDecoder::new(0, 64 << 20, Some(budget.clone()));
+        for b in "\"1;1;4000;4000".bytes() {
+            d.put(b);
+        }
+        assert_eq!(budget.used(), 0);
+        assert!(d.buf.is_empty());
+        assert!(d.finish().is_none());
     }
 
     #[test]

@@ -63,6 +63,37 @@ fn oversized_osc_strings_are_dropped_and_parsing_recovers() {
 }
 
 #[test]
+fn ris_keeps_the_oversized_osc_guard() {
+    let mut t = term(20, 5);
+    t.advance(b"\x1bc\x1b]2;");
+    for _ in 0..(64 << 20) / 8192 {
+        t.advance(&[b'y'; 8192]);
+    }
+    t.advance(b"\x07after");
+    assert_eq!(t.title(), "");
+    assert_eq!(t.row_text(0), "after");
+}
+
+#[test]
+fn ris_keeps_file_media_disabled() {
+    let mut t = term(20, 5);
+    let path = std::env::temp_dir().join(format!("proteus-hostile-ris-{}.rgba", std::process::id()));
+    std::fs::write(&path, [1, 2, 3, 4]).unwrap();
+    let name = B64.encode(path.to_str().unwrap());
+    let send =
+        |t: &mut Terminal, pre: &str| reply(t, format!("{pre}\x1b_Ga=t,t=f,f=32,s=1,v=1,i=1;{name}\x1b\\").as_bytes());
+    t.set_local(false);
+    let failed = send(&mut t, "");
+    assert_ne!(failed, "\x1b_Gi=1;OK\x1b\\");
+    assert_eq!(send(&mut t, "\x1bc"), failed);
+    t.set_local(true);
+    t.advance(b"\x1b]7;file://elsewhere.example/tmp\x07");
+    assert_eq!(send(&mut t, "\x1bc"), failed);
+    assert!(t.images().image_by_id(1).is_none());
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
 fn large_but_allowed_osc_still_works() {
     let mut t = term(20, 5);
     let text = "z".repeat(1 << 20);

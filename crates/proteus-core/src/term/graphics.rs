@@ -11,8 +11,9 @@ use crate::graphics::kitty::{self, Command, Error, err};
 use crate::graphics::media::{self, Medium};
 use crate::graphics::sixel::SixelDecoder;
 use crate::graphics::{
-    AnimationState, DEFAULT_GAP, DecodeError, DecodedImage, FALLBACK_CELL_PX, Fit, Frame, Image, ImageStore, ImageView,
-    MAX_RELATIVE_DEPTH, Placement, PxRect, Source, Upload, decode_image, image_dimensions, run_in_background,
+    AnimationState, DEFAULT_GAP, DecodeError, DecodedImage, FALLBACK_CELL_PX, FRAME_OVERHEAD, Fit, Frame, Image,
+    ImageStore, ImageView, MAX_FRAMES, MAX_RELATIVE_DEPTH, Placement, PxRect, Source, Upload, decode_image,
+    image_dimensions, run_in_background,
 };
 use crate::modes::TermMode;
 use base64::Engine as _;
@@ -56,6 +57,8 @@ pub(super) struct HeldReply {
     id: u32,
     number: u32,
     pid: u32,
+    /// Outcome of the placement made before decoding.
+    put: Result<(), Error>,
 }
 
 /// Result of a background decode.
@@ -235,12 +238,15 @@ impl Terminal {
                     self.apc = Apc::BodyEsc;
                 }
                 Apc::BodyEsc => {
-                    let data = std::mem::take(&mut self.apc_buf);
+                    let mut data = std::mem::take(&mut self.apc_buf);
                     if !std::mem::take(&mut self.apc_overflow) {
                         self.apc_dispatch(&data);
                     }
+                    data.clear();
+                    if data.capacity() > OSC_SHRINK {
+                        data = Vec::new();
+                    }
                     self.apc_buf = data;
-                    self.apc_buf.clear();
                     if bytes[i] == b'\\' {
                         self.advance_parser(parser, b"\x1b\\");
                         start = i + 1;
@@ -402,7 +408,9 @@ impl Terminal {
                 && (self.images.image(key).is_some_and(|i| i.is_loading())
                     || self.decodes.deferred.iter().any(|(k, _)| *k == key))
             {
-                if self.decodes.deferred.len() >= MAX_DEFERRED {
+                let held: usize = self.decodes.deferred.iter().map(|(_, c)| c.payload.len()).sum();
+                let max = self.config.graphics.max_image_bytes / 3 * 4 + 8192;
+                if self.decodes.deferred.len() >= MAX_DEFERRED || held + cmd.payload.len() > max {
                     self.kitty_reply(&cmd, id, number, 0, Err(err("EBUSY", "Too many commands wait for a decode")));
                 } else {
                     self.decodes.deferred.push((key, cmd));
@@ -587,18 +595,20 @@ impl Terminal {
         }
         let key = self.images.insert(Image::loading(id, number, Source::Kitty, w, h));
         let mut pid = 0;
+        let mut put = Ok(());
         if cmd.action() == b'T' {
             pid = cmd.placement();
-            if let Err(e) = self.kitty_put(&cmd, Some(key)) {
-                if id == 0 {
-                    self.images.remove_image(key);
-                }
+            put = self.kitty_put(&cmd, Some(key));
+            if id == 0
+                && let Err(e) = put
+            {
+                self.images.remove_image(key);
                 return self.kitty_reply(&cmd, id, number, pid, Err(e));
             }
         }
         let mut held = cmd;
         held.payload = Vec::new();
-        self.decode_later(key, data, Some(HeldReply { cmd: held, id, number, pid }));
+        self.decode_later(key, data, Some(HeldReply { cmd: held, id, number, pid, put }));
     }
 
     // --- background decoding -------------------------------------------------
@@ -607,16 +617,20 @@ impl Terminal {
         let tx = self.decodes.tx.clone();
         let waker = self.config.graphics.waker.clone();
         let configured_max = self.config.graphics.max_image_bytes;
-        let max = if data.starts_with(b"GIF8") {
-            configured_max
+        let frame = image_dimensions(&data)
+            .and_then(|(w, h)| (w as usize).checked_mul(h as usize)?.checked_mul(4))
+            .unwrap_or(1 << 20)
+            .min(configured_max);
+        // Each GIF frame takes at least 12 bytes (image descriptor and data);
+        // its decoder composites onto a canvas besides the frame.
+        let (max, scratch) = if data.starts_with(b"GIF8") {
+            (frame.saturating_mul(data.len() / 12 + 1).min(configured_max), frame.saturating_mul(2))
         } else {
-            image_dimensions(&data)
-                .and_then(|(w, h)| (w as usize).checked_mul(h as usize)?.checked_mul(4))
-                .unwrap_or(1 << 20)
-                .min(configured_max)
+            (frame, frame)
         };
         self.decodes.pending += 1;
-        let Some(permit) = crate::graphics::reserve_decode(data.len().saturating_add(max.saturating_mul(2))) else {
+        let need = data.len().saturating_add(max).saturating_add(scratch);
+        let Some(permit) = crate::graphics::reserve_decode(need) else {
             self.finish_decode(Decoded { key, _permit: None, result: Err(DecodeError::TooLarge), reply });
             return;
         };
@@ -638,6 +652,22 @@ impl Terminal {
                 Ok(d) => self.finish_decode(d),
                 Err(_) => break,
             }
+        }
+        self.prune_deferred();
+    }
+
+    /// Drop commands waiting for images that were removed meanwhile.
+    fn prune_deferred(&mut self) {
+        let (a, b) = (&self.images, &self.images_inactive);
+        let waiting = |k: u64| a.image(k).or_else(|| b.image(k)).is_some_and(|i| i.is_loading());
+        if self.decodes.deferred.iter().all(|(k, _)| waiting(*k)) {
+            return;
+        }
+        let (keep, gone): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.decodes.deferred).into_iter().partition(|(k, _)| waiting(*k));
+        self.decodes.deferred = keep;
+        for (_, cmd) in gone {
+            self.kitty_reply(&cmd, cmd.id(), cmd.number(), 0, Err(err("ENOENT", "Image not found")));
         }
     }
 
@@ -671,8 +701,9 @@ impl Terminal {
                     img.loading = false;
                     img.generation += 1;
                     // Animated (iTerm2 GIF): the other frames need room too.
-                    let rest: Vec<(Vec<u8>, u32)> = if d.reply.is_none() { frames.collect() } else { Vec::new() };
-                    let need = rest.len() * img.frame_bytes();
+                    let rest: Vec<(Vec<u8>, u32)> =
+                        if d.reply.is_none() { frames.take(MAX_FRAMES - 1).collect() } else { Vec::new() };
+                    let need = rest.len() * img.extra_frame_bytes();
                     if !rest.is_empty() && store.reserve(need, other, &self.config.graphics, Some(key)).is_ok() {
                         let img = store.image_mut(key).expect("protected from eviction");
                         img.frames[0].gap = gif_gap(delay);
@@ -688,7 +719,7 @@ impl Terminal {
             store.free_anonymous();
         }
         if let Some(r) = d.reply {
-            self.kitty_reply(&r.cmd, r.id, r.number, r.pid, outcome);
+            self.kitty_reply(&r.cmd, r.id, r.number, r.pid, outcome.and(r.put));
         }
         if self.decodes.deferred.iter().any(|(k, _)| *k == key) {
             let (ready, rest) = std::mem::take(&mut self.decodes.deferred).into_iter().partition(|(k, _)| *k == key);
@@ -837,7 +868,7 @@ impl Terminal {
         if img.frames.len() < 2 {
             return;
         }
-        let freed = (img.frames.len() - 1) * img.frame_bytes();
+        let freed = (img.frames.len() - 1) * img.extra_frame_bytes();
         let freed = if img.evicted { 0 } else { freed };
         img.frames.truncate(1);
         img.current = 0;
@@ -852,6 +883,9 @@ impl Terminal {
         let img = self.images.image(key).ok_or_else(|| err("ENOENT", "Image not found"))?;
         if img.evicted {
             return Err(err("ENOSPC", "Image data was evicted"));
+        }
+        if cmd.u(b'r') == 0 && img.frames.len() >= MAX_FRAMES {
+            return Err(err("ENOSPC", "Too many frames"));
         }
         let (iw, ih) = img.size();
         let px = self.kitty_pixels(cmd, (iw, ih))?;
@@ -875,6 +909,7 @@ impl Terminal {
                 img.generation += 1;
             }
         } else {
+            let extra = img.extra_frame_bytes();
             let base = cmd.u(b'c') as usize;
             let mut canvas = if base > 0 {
                 img.frames.get(base - 1).ok_or_else(|| err("ENOENT", "Base frame not found"))?.pixels.clone()
@@ -883,7 +918,7 @@ impl Terminal {
             };
             kitty::compose(&mut canvas, iw, &px.rgba, px.width, rect, x, y, replace);
             let other = self.images_inactive.bytes();
-            self.images.reserve(canvas.len(), other, &self.config.graphics, Some(key))?;
+            self.images.reserve(extra, other, &self.config.graphics, Some(key))?;
             let img = self.images.image_mut(key).expect("protected from eviction");
             img.frames.push(Frame { pixels: canvas, gap: if gap != 0 { gap } else { DEFAULT_GAP } });
         }
@@ -953,9 +988,25 @@ impl Terminal {
         if src == dst && overlap {
             return Err(err("EINVAL", "Source and destination overlap"));
         }
-        let source = img.frames[src - 1].pixels.clone();
-        let rect = PxRect { x: sx, y: sy, w, h };
-        kitty::compose(&mut img.frames[dst - 1].pixels, iw, &source, iw, rect, dx, dy, cmd.u(b'C') == 1);
+        let replace = cmd.u(b'C') == 1;
+        if src == dst {
+            let f = &mut img.frames[src - 1].pixels;
+            let (iw, sx, sy, w) = (iw as usize, sx as usize, sy as usize, w as usize);
+            let mut rows = Vec::with_capacity(w * h as usize * 4);
+            for y in sy..sy + h as usize {
+                let s = (y * iw + sx) * 4;
+                let Some(row) = f.get(s..s + w * 4) else { break };
+                rows.extend_from_slice(row);
+            }
+            let rect = PxRect { x: 0, y: 0, w: w as u32, h };
+            kitty::compose(f, iw as u32, &rows, w as u32, rect, dx, dy, replace);
+        } else {
+            let (a, b) = img.frames.split_at_mut(src.max(dst) - 1);
+            let (lo, hi) = (&mut a[src.min(dst) - 1].pixels, &mut b[0].pixels);
+            let (source, dest) = if src < dst { (lo, hi) } else { (hi, lo) };
+            let rect = PxRect { x: sx, y: sy, w, h };
+            kitty::compose(dest, iw, source, iw, rect, dx, dy, replace);
+        }
         if dst - 1 == img.current {
             img.generation += 1;
             self.damage.images = true;
@@ -970,6 +1021,9 @@ impl Terminal {
         let mut changed = false;
         for img in self.images.images_mut() {
             if img.state == AnimationState::Stopped || img.frames.len() < 2 || img.evicted {
+                continue;
+            }
+            if img.frames.iter().all(|f| f.gap <= 0) {
                 continue;
             }
             let mut shown = *img.shown_at.get_or_insert(now);
@@ -1038,7 +1092,9 @@ impl Terminal {
         self.images.remove_covered(line, col, cols, rows);
 
         // Still being decoded: room for the first frame.
-        let need = frames.as_ref().map_or(w as usize * h as usize * 4, |f| f.iter().map(|f| f.0.len()).sum());
+        let frame = w as usize * h as usize * 4;
+        let extra = frames.as_ref().map_or(0, |f| f.len().saturating_sub(1));
+        let need = frame + extra * frame.max(FRAME_OVERHEAD);
         let other = self.images_inactive.bytes();
         if self.images.reserve(need, other, &self.config.graphics, None).is_err() {
             return None;
@@ -1083,6 +1139,9 @@ impl Terminal {
     pub(super) fn osc_iterm(&mut self, params: &[&[u8]], term: Terminator) {
         let body = join_params(params, 1);
         let max = self.config.graphics.max_image_bytes / 3 * 4 + 8192;
+        if !body.starts_with("FilePart=") && body != "FileEnd" {
+            self.iterm_multipart = None;
+        }
         if let Some(rest) = body.strip_prefix("File=") {
             let (args, data) = rest.split_once(':').unwrap_or((rest, ""));
             self.iterm_file(args, data.as_bytes());
@@ -1197,5 +1256,31 @@ impl Terminal {
             _ => "1".to_string(),
         };
         self.reply(&format!("\x1b[?{item};{body}S"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Config;
+
+    #[test]
+    fn deferred_commands_are_capped_and_dropped_with_their_image() {
+        let mut config = Config::default();
+        config.graphics.max_image_bytes = 4096;
+        let mut t = Terminal::new(20, 5, config);
+        let cfg = t.config.graphics.clone();
+        t.images.reserve(16, 0, &cfg, None).unwrap();
+        t.images.insert(Image::loading(9, 0, Source::Kitty, 2, 2));
+        let frame = format!("\x1b_Ga=f,i=9,s=2,v=2;{}\x1b\\", "AAAA".repeat(3000));
+        t.advance(frame.as_bytes());
+        assert_eq!(t.decodes.deferred.len(), 1);
+        t.advance(frame.as_bytes());
+        assert_eq!(t.decodes.deferred.len(), 1);
+        assert!(String::from_utf8(t.take_pty_output()).unwrap().starts_with("\x1b_Gi=9;EBUSY"));
+        t.advance(b"\x1b_Ga=d,d=I,i=9\x1b\\");
+        t.advance(b"");
+        assert!(t.decodes.deferred.is_empty());
+        assert!(String::from_utf8(t.take_pty_output()).unwrap().starts_with("\x1b_Gi=9;ENOENT"));
     }
 }

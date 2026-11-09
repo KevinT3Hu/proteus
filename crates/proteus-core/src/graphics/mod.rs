@@ -33,6 +33,10 @@ pub const MAX_RELATIVE_DEPTH: usize = 8;
 pub const MAX_IMAGES: usize = 4096;
 /// Most placements one screen holds; the oldest go first.
 pub const MAX_PLACEMENTS: usize = 4096;
+/// Most animation frames one image holds.
+pub const MAX_FRAMES: usize = 4096;
+/// Least bytes charged for each frame after the first.
+pub(crate) const FRAME_OVERHEAD: usize = 64;
 
 /// Graphics policy and resource limits.
 #[derive(Debug, Clone)]
@@ -238,8 +242,16 @@ impl Image {
     pub(crate) fn frame_bytes(&self) -> usize {
         self.width as usize * self.height as usize * 4
     }
+    /// Bytes charged for each frame after the first.
+    pub(crate) fn extra_frame_bytes(&self) -> usize {
+        self.frame_bytes().max(FRAME_OVERHEAD)
+    }
     pub(crate) fn bytes(&self) -> usize {
-        if self.evicted { 0 } else { self.frames.len() * self.frame_bytes() }
+        if self.evicted {
+            0
+        } else {
+            self.frame_bytes() + self.frames.len().saturating_sub(1) * self.extra_frame_bytes()
+        }
     }
     fn touch(&self) {
         self.last_used.store(now_tick(), Ordering::Relaxed);
@@ -859,17 +871,19 @@ impl ImageStore {
         let mut out: Vec<(ImageView<'a>, u64)> = Vec::new();
         // Origin (absolute line, col) of each virtual placement shown on screen.
         let mut origins: HashMap<(u64, u32), (i64, i64)> = HashMap::new();
+        // Virtual placements by (image, id); id 0 finds the first of the image.
+        let mut virtuals: HashMap<(u64, u32), &Placement> = HashMap::new();
+        for p in self.placements.iter().filter(|p| p.is_virtual) {
+            if p.id != 0 {
+                virtuals.entry((p.image, p.id)).or_insert(p);
+            }
+            virtuals.entry((p.image, 0)).or_insert(p);
+        }
 
         for y in 0..grid.lines() {
             for run in placeholder::runs(grid.viewport_row(y), styles) {
                 let Some(&key) = self.by_id.get(&run.image_id) else { continue };
-                let Some(vp) = self
-                    .placements
-                    .iter()
-                    .find(|p| p.image == key && p.is_virtual && (run.placement_id == 0 || p.id == run.placement_id))
-                else {
-                    continue;
-                };
+                let Some(&vp) = virtuals.get(&(key, run.placement_id)) else { continue };
                 let Some(img) = self.images.get(&key) else { continue };
                 let origin = (top + y as i64 - run.row as i64, run.x as i64 - run.col as i64);
                 origins

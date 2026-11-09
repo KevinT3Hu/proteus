@@ -782,4 +782,33 @@ mod validation_tests {
         assert!(Batch::in_directory(&root, true, Path::new("/source"), &"x".repeat(8192)).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn remote_discovery_skips_files_others_can_change() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("proteus-ssh-discovery-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let inner = root.join("trusted/shared");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(root.join("trusted").join(crate::project::FILE), "name='trusted'\npresets=['rust']").unwrap();
+        let untrusted = inner.join(crate::project::FILE);
+        std::fs::write(&untrusted, "name='untrusted'\npresets=['rust']").unwrap();
+        std::fs::set_permissions(&untrusted, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let run = || {
+            let cwd = inner.to_str().unwrap();
+            std::process::Command::new("sh").arg("-c").arg(workspace_command(cwd)).output().ok()
+        };
+        if std::process::Command::new("python3").arg("-c").arg("").status().is_ok_and(|s| s.success()) {
+            let out = run().unwrap();
+            assert!(out.status.success(), "{out:?}");
+            let workspace = parse_workspace(&out.stdout).unwrap().unwrap();
+            assert_eq!(workspace.name, "trusted");
+            std::fs::remove_file(&untrusted).unwrap();
+            std::os::unix::fs::symlink("/etc/passwd", &untrusted).unwrap();
+            assert!(!run().unwrap().status.success());
+        } else {
+            eprintln!("skipping: python3 unavailable");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

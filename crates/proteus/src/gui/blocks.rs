@@ -65,6 +65,12 @@ pub fn summary(b: &Block) -> String {
     parts.join(" · ")
 }
 
+/// A recorded command that can be typed again as it is: one line with no
+/// control characters (escape sequences would reach the shell as keys).
+fn rerunnable(cmd: &str) -> bool {
+    !cmd.chars().any(char::is_control)
+}
+
 /// Status shown right of a pinned command: `running · 4.2s`, `✗ exit 2 · 1.3s`.
 fn status(b: &Block) -> String {
     let state = match (b.state, b.exit_code) {
@@ -532,6 +538,9 @@ impl App {
         else {
             return self.notice(self.cfg.i18n.t("ui-no-command-to-run-again", &[]));
         };
+        if !rerunnable(&cmd) {
+            return;
+        }
         if let Some(name) = self.panes[&id].busy(&[]) {
             return self.notice(format!("{name} is running in this pane"));
         }
@@ -584,6 +593,16 @@ fn part_name(p: Part) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_plain_commands_are_run_again() {
+        assert!(rerunnable("make -j8 && ./run 'a b'"));
+        assert!(rerunnable("echo 中文"));
+        assert!(!rerunnable("ls\nrm -rf ~"));
+        assert!(!rerunnable("ls\x1b[201~; rm x"));
+        assert!(!rerunnable("ls\u{9b}2J"));
+        assert!(!rerunnable("ls\rrm"));
+    }
 
     #[test]
     fn durations() {

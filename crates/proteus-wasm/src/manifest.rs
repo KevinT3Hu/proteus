@@ -194,17 +194,25 @@ mod fs_list {
 }
 
 impl Permissions {
-    /// A read-only directory inside a read-write one cannot be enforced:
-    /// the plugin reaches it through the outer grant.
+    /// A directory inside a read-write one cannot be enforced as its own
+    /// grant: the plugin reaches it through the outer grant, and can replace
+    /// it with a symlink that the inner grant would follow on its next start.
     pub fn validate_fs_nesting(&self) -> Result<(), String> {
-        for inner in self.fs.iter().filter(|g| !g.write) {
+        for (i, inner) in self.fs.iter().enumerate() {
             let inner_path = inner.host_path()?;
-            for outer in self.fs.iter().filter(|g| g.write) {
+            for outer in self.fs.iter().enumerate().filter(|(j, g)| g.write && *j != i).map(|(_, g)| g) {
                 if inner_path.starts_with(outer.host_path()?) {
-                    return Err(format!(
-                        "fs: `{}` is read-only but inside the read-write `{}`; the plugin could still write it",
-                        inner.path, outer.path
-                    ));
+                    return Err(if inner.write {
+                        format!(
+                            "fs: `{}` is inside the read-write `{}`; nested grants are not supported",
+                            inner.path, outer.path
+                        )
+                    } else {
+                        format!(
+                            "fs: `{}` is read-only but inside the read-write `{}`; the plugin could still write it",
+                            inner.path, outer.path
+                        )
+                    });
                 }
             }
         }
@@ -233,7 +241,8 @@ impl Permissions {
         .into_iter()
         .flatten()
         .collect();
-        self.fs.iter().filter(|g| g.write).filter_map(|g| g.host_path().ok()).any(|g| {
+        let written = self.fs.iter().filter(|g| g.write).filter_map(|g| g.host_path().ok());
+        written.flat_map(|g| [g.canonicalize().ok(), Some(g)]).flatten().any(|g| {
             let dotfile = home.as_ref().is_some_and(|h| {
                 h.starts_with(&g)
                     || g.strip_prefix(h)
@@ -261,7 +270,7 @@ impl Permissions {
             v.push("type into your panes (it can run commands as you)".into());
         }
         if self.open_pane {
-            v.push("open panes running programs".into());
+            v.push("open panes running any program (it can run any code as you)".into());
         }
         for f in &self.fs {
             let how = if f.write { "read and change" } else { "read" };
@@ -412,13 +421,16 @@ pub fn valid_action_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 100 && id.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))
 }
 
-/// IDs are names, never filesystem paths.
+/// IDs are names, never filesystem paths, and never collide with another
+/// plugin's files next to its data directory (`ID.storage.toml` and its
+/// sidecars).
 pub fn valid_plugin_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
         && id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "-_.".contains(c))
         && !id.starts_with('.')
         && !id.contains("..")
+        && !id.contains(".storage.toml")
 }
 
 impl Manifest {
@@ -514,8 +526,17 @@ mod tests {
             ..Default::default()
         };
         assert!(p(&["/srv:rw", "/srv/secret:r"]).validate_fs_nesting().is_err());
+        assert!(p(&["/srv:rw", "/srv/cache:rw"]).validate_fs_nesting().is_err());
         assert!(p(&["/srv:r", "/srv/notes:rw"]).validate_fs_nesting().is_ok());
         assert!(p(&["/srv:rw", "/srvx:r"]).validate_fs_nesting().is_ok());
+    }
+
+    #[test]
+    fn ids_cannot_name_another_plugins_storage() {
+        assert!(valid_plugin_id("a") && valid_plugin_id("a.storage"));
+        for id in ["a.storage.toml", "a.storage.toml.lock", "a.storage.toml.corrupt-1-2"] {
+            assert!(!valid_plugin_id(id), "{id}");
+        }
     }
 
     #[test]

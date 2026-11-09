@@ -32,6 +32,8 @@ const RESTART_DELAY: Duration = Duration::from_secs(1);
 pub(super) const CONFIG: &str = "";
 /// Surfaces one plugin may have open.
 const MAX_SURFACES: usize = 8;
+/// How long a file opened for a plugin stays available after the opener exits.
+const OPEN_GRACE: Duration = Duration::from_secs(30);
 
 /// Surface parts of a frame: sidebars, floats, chrome rectangles, labels.
 type SurfaceParts =
@@ -320,6 +322,28 @@ fn plugin_event(ev: &ScriptEvent) -> Option<Event> {
         "bell" => Event::Bell(pane()?),
         _ => return None,
     })
+}
+
+/// The pane whose contents an event reveals (commands, titles, directories).
+fn content_pane(e: &Event) -> Option<PaneId> {
+    match e {
+        Event::CwdChanged((p, _))
+        | Event::TitleChanged((p, _))
+        | Event::CommandStarted((p, _))
+        | Event::Bell(p)
+        | Event::BlockStateChanged((p, _)) => Some(*p),
+        Event::CommandFinished(c) => Some(c.pane),
+        _ => None,
+    }
+}
+
+/// What plugins may see of a private pane: where it is, not what runs in it.
+fn redact(mut i: types::PaneInfo) -> types::PaneInfo {
+    i.title = i.name.clone().unwrap_or_default();
+    i.cwd = None;
+    i.process = None;
+    i.command = None;
+    i
 }
 
 impl App {
@@ -613,12 +637,16 @@ impl App {
         }
     }
 
-    /// Send a terminal event to the plugins.
+    /// Send a terminal event to the plugins. Private panes tell them
+    /// nothing about what runs in them.
     pub(super) fn plugins_event(&self, ev: &ScriptEvent) {
         if self.pl.running.is_empty() {
             return;
         }
         let Some(e) = plugin_event(ev) else { return };
+        if content_pane(&e).is_some_and(|p| self.panes.get(&p).is_some_and(|p| p.private)) {
+            return;
+        }
         for r in self.pl.running.values().filter(|r| r.started) {
             r.handle.event(e.clone());
         }
@@ -798,7 +826,7 @@ impl App {
         use crate::script::Host as _;
         let pane_info = |app: &App, id: PaneId| -> Option<types::PaneInfo> {
             let i = app.pane_info(id)?;
-            Some(types::PaneInfo {
+            let info = types::PaneInfo {
                 id: i.id,
                 title: i.title,
                 name: i.name,
@@ -811,7 +839,8 @@ impl App {
                 floating: i.floating,
                 cols: i.cols as u32,
                 rows: i.rows as u32,
-            })
+            };
+            Some(if app.panes.get(&id).is_some_and(|p| p.private) { redact(info) } else { info })
         };
         let exists = |app: &App, id: PaneId| {
             if app.panes.contains_key(&id) { Ok(()) } else { Err(format!("no pane {id}")) }
@@ -840,6 +869,9 @@ impl App {
             Call::GetPane(id) => Ok(Reply::Pane(pane_info(self, id))),
             Call::PaneRemote(id) => {
                 exists(self, id)?;
+                if private(self, id).is_err() {
+                    return Ok(Reply::Remote(None));
+                }
                 Ok(Reply::Remote(self.pane_info(id).and_then(|i| i.remote)))
             }
             Call::FocusedPane => Ok(Reply::Id(self.focused())),
@@ -1030,8 +1062,11 @@ impl App {
                 std::thread::Builder::new()
                     .name("plugin-open".into())
                     .spawn(move || {
-                        let _guard = (file, permit);
                         let _ = child.wait();
+                        drop(permit);
+                        // Some openers hand the path to an application and exit at once.
+                        std::thread::sleep(OPEN_GRACE);
+                        drop(file);
                     })
                     .map_err(|e| e.to_string())?;
                 Ok(Reply::Unit)
@@ -1796,5 +1831,35 @@ mod tests {
         assert_eq!((c.pane, c.command.as_deref(), c.exit_code, c.duration_ms), (3, Some("make"), Some(2), Some(1500)));
         assert!(matches!(plugin_event(&ScriptEvent::new("bell").pane(1)), Some(Event::Bell(1))));
         assert!(plugin_event(&ScriptEvent::new("config_changed")).is_none());
+    }
+
+    #[test]
+    fn private_panes_reveal_nothing_that_runs_in_them() {
+        let started = plugin_event(&ScriptEvent::new("command_started").pane(4).with("command", Val::Str("pw".into())));
+        let finished =
+            plugin_event(&ScriptEvent::new("command_finished").pane(4).with("command", Val::Str("x".into())));
+        let title = plugin_event(&ScriptEvent::new("title_changed").pane(4).with("title", Val::Str("t".into())));
+        let cwd = plugin_event(&ScriptEvent::new("cwd_changed").pane(4).with("cwd", Val::Str("/s".into())));
+        for e in [started, finished, title, cwd] {
+            assert_eq!(content_pane(&e.unwrap()), Some(4));
+        }
+        assert_eq!(content_pane(&Event::PaneOpened(4)), None);
+        let info = types::PaneInfo {
+            id: 4,
+            title: "ssh secret-host".into(),
+            name: None,
+            cwd: Some("/srv/secret".into()),
+            process: Some("ssh".into()),
+            command: Some("ssh secret-host".into()),
+            window: 1,
+            tab: 1,
+            focused: true,
+            floating: false,
+            cols: 80,
+            rows: 24,
+        };
+        let r = redact(info);
+        assert_eq!((r.title.as_str(), r.cwd, r.process, r.command), ("", None, None, None));
+        assert_eq!((r.id, r.cols, r.focused), (4, 80, true));
     }
 }

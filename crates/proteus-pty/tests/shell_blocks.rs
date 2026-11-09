@@ -13,12 +13,19 @@ use proteus_pty::{CommandSpec, Pty, WindowSize};
 /// Run `shell`, typing each input once a prompt is shown (or output went
 /// quiet), and return a report of the blocks.
 fn run_shell(shell: &str, inputs: &[&str]) -> Option<String> {
+    run_shell_with(shell, |_, _| {}, inputs)
+}
+
+/// Like [`run_shell`]; `setup` may add rc files to the isolated HOME.
+fn run_shell_with(shell: &str, setup: impl FnOnce(&Path, &mut CommandSpec), inputs: &[&str]) -> Option<String> {
     if !Path::new(shell).exists() {
         eprintln!("skipping: {shell} not installed");
         return None;
     }
     // Isolated HOME so the user's rc files don't affect the result.
-    let tag = format!("{}-{}", std::process::id(), shell.replace('/', "_"));
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tag = format!("{}-{seq}-{}", std::process::id(), shell.replace('/', "_"));
     let home = std::env::temp_dir().join(format!("proteus-e2e-{tag}"));
     proteus_pty::secure_fs::private_dir(&home).unwrap();
     let mut spec = CommandSpec::new(shell)
@@ -26,6 +33,7 @@ fn run_shell(shell: &str, inputs: &[&str]) -> Option<String> {
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("XDG_RUNTIME_DIR", &home);
     spec.remove_env("ZDOTDIR");
+    setup(&home, &mut spec);
     let dir = home.join("shell-integration");
     shell::install(&dir).unwrap();
     assert!(shell::inject(&mut spec, &dir).is_some(), "no integration for {shell}");
@@ -96,6 +104,27 @@ fn check_blocks(text: &str) {
 fn bash_blocks() {
     if let Some(t) = run_shell("/bin/bash", &["echo one\r", "(exit 3)\r", "cd /tmp\r", "true\r", "exit\r"]) {
         check_blocks(&t);
+    }
+}
+
+#[test]
+fn bash_blocks_under_nounset() {
+    let rc = |home: &Path, _: &mut CommandSpec| {
+        std::fs::write(home.join(".bashrc"), "set -u\nunset PS0 PROMPT_COMMAND\n").unwrap();
+    };
+    let inputs = ["echo one\r", "(exit 3)\r", "cd /tmp\r", "true\r", "exit\r"];
+    if let Some(t) = run_shell_with("/bin/bash", rc, &inputs) {
+        check_blocks(&t);
+        assert!(!t.contains("unbound variable"), "{t}");
+    }
+}
+
+#[test]
+fn fish_restores_unset_xdg_data_dirs() {
+    let unset = |_: &Path, spec: &mut CommandSpec| spec.remove_env("XDG_DATA_DIRS");
+    let probe = "set -q XDG_DATA_DIRS; and echo xdg-set; or echo xdg-unset\r";
+    if let Some(t) = run_shell_with("/usr/bin/fish", unset, &[probe, "exit\r"]) {
+        assert!(t.contains("    | xdg-unset"), "{t}");
     }
 }
 

@@ -41,6 +41,11 @@ __proteus_precmd() {
 
 __proteus_preexec() {
     __proteus_executing=1
+    # Encoding is quadratic in zsh; a huge pasted command keeps no cmdline.
+    if (( ${#1} > 4096 )); then
+        builtin printf '\e]133;C\a'
+        return
+    fi
     __proteus_urlencode "$1"
     builtin printf '\e]133;C;cmdline_url=%s\a' "$REPLY"
 }

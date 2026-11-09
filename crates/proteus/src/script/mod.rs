@@ -22,8 +22,9 @@ use crate::spec::Cmd;
 
 mod ui;
 
-/// Index of a registered Lua function (see [`Action::Lua`]).
-pub type FnId = u16;
+/// A registered Lua function (see [`Action::Lua`]): slot in the low 16
+/// bits, the slot's generation above, so ids of released functions lapse.
+pub type FnId = u32;
 
 /// Events `p.on` accepts.
 pub const EVENTS: &[&str] = &[
@@ -48,6 +49,8 @@ pub const RUNAWAY: Duration = Duration::from_secs(2);
 pub const LOAD_LIMIT: Duration = Duration::from_secs(5);
 /// Shortest timer interval.
 const MIN_TIMER: f64 = 0.01;
+/// Memory the Lua state may use.
+const MEMORY_LIMIT: usize = 512 << 20;
 
 const HOST: &str = "proteus.host";
 const PRELUDE: &str = include_str!("prelude.lua");
@@ -80,7 +83,9 @@ pub struct Message {
 
 #[derive(Default)]
 struct Registry {
-    functions: Vec<Function>,
+    /// Generation and function of each slot (`None`: free).
+    functions: Vec<(u16, Option<Function>)>,
+    free: Vec<u16>,
     hooks: Vec<(&'static str, FnId)>,
     segments: Vec<(Side, FnId)>,
     palette: Vec<(String, FnId)>,
@@ -96,10 +101,37 @@ struct Registry {
 
 impl Registry {
     fn add(&mut self, f: Function) -> mlua::Result<FnId> {
-        let id =
-            FnId::try_from(self.functions.len()).map_err(|_| mlua::Error::runtime("too many registered functions"))?;
-        self.functions.push(f);
-        Ok(id)
+        let slot = match self.free.pop() {
+            Some(s) => s,
+            None => {
+                let s = u16::try_from(self.functions.len())
+                    .map_err(|_| mlua::Error::runtime("too many registered functions"))?;
+                self.functions.push((0, None));
+                s
+            }
+        };
+        let e = &mut self.functions[slot as usize];
+        e.1 = Some(f);
+        Ok(FnId::from(e.0) << 16 | FnId::from(slot))
+    }
+
+    fn get(&self, id: FnId) -> Option<&Function> {
+        match self.functions.get((id & 0xffff) as usize) {
+            Some((g, f)) if FnId::from(*g) == id >> 16 => f.as_ref(),
+            _ => None,
+        }
+    }
+
+    fn release(&mut self, id: FnId) {
+        let slot = (id & 0xffff) as u16;
+        if let Some(e) = self.functions.get_mut(slot as usize)
+            && FnId::from(e.0) == id >> 16
+            && e.1.take().is_some()
+        {
+            e.0 = e.0.wrapping_add(1);
+            self.free.push(slot);
+            self.slow.remove(&id);
+        }
     }
 }
 
@@ -256,6 +288,7 @@ impl Script {
     /// permissions the user approved.
     pub fn new(dir: Option<&Path>) -> Result<Script, String> {
         let lua = Lua::new_with(StdLib::ALL_SAFE, LuaOptions::default()).map_err(|e| e.to_string())?;
+        lua.set_memory_limit(MEMORY_LIMIT).map_err(|e| e.to_string())?;
         let reg = Rc::new(RefCell::new(Registry::default()));
         let deadline: Rc<Cell<Option<Instant>>> = Rc::new(Cell::new(None));
         let d = deadline.clone();
@@ -312,6 +345,8 @@ impl Script {
                     }
                     let mut r = r.borrow_mut();
                     let id = r.add(f)?;
+                    let old: Vec<FnId> = r.palette.iter().filter(|e| e.0 == name).map(|e| e.1).collect();
+                    old.into_iter().for_each(|f| r.release(f));
                     r.palette.retain(|e| e.0 != name);
                     r.palette.push((name, id));
                     Ok(())
@@ -341,20 +376,24 @@ impl Script {
             })?;
             let r = reg.clone();
             let stop = lua.create_function(move |_, id: u32| {
-                r.borrow_mut().timers.remove(&id);
+                let mut r = r.borrow_mut();
+                if let Some((f, ..)) = r.timers.remove(&id) {
+                    r.release(f);
+                }
                 Ok(())
             })?;
             let r = reg.clone();
             let on_ui = lua.create_function(move |_, (id, f): (u32, Option<Function>)| {
                 let mut r = r.borrow_mut();
-                match f {
+                let old = match f {
                     Some(f) => {
                         let fid = r.add(f)?;
-                        r.surfaces.insert(id, fid);
+                        r.surfaces.insert(id, fid)
                     }
-                    None => {
-                        r.surfaces.remove(&id);
-                    }
+                    None => r.surfaces.remove(&id),
+                };
+                if let Some(old) = old {
+                    r.release(old);
                 }
                 Ok(())
             })?;
@@ -452,6 +491,9 @@ impl Script {
             self.reg.borrow_mut().timers.remove(&id);
         }
         self.invoke(host, f, Value::Nil);
+        if !repeat {
+            self.reg.borrow_mut().release(f);
+        }
         repeat && self.reg.borrow().timers.contains_key(&id)
     }
 
@@ -469,6 +511,9 @@ impl Script {
                 self.invoke(host, f, Value::Table(t));
             }
             Err(err) => self.message(format!("Lua: {}", clean(&err)), true),
+        }
+        if closed {
+            self.reg.borrow_mut().release(f);
         }
         true
     }
@@ -536,7 +581,7 @@ impl Script {
     /// Call function `f` with the host reachable; errors and slowness
     /// become messages. `None` if it failed.
     fn invoke(&self, host: &mut dyn Host, f: FnId, arg: Value) -> Option<Value> {
-        let func = self.reg.borrow().functions.get(f as usize).cloned()?;
+        let func = self.reg.borrow().get(f).cloned()?;
         let start = Instant::now();
         self.host_time.set(Duration::ZERO);
         let r = self.with_host(host, |_| func.call::<Value>(arg));
@@ -1028,6 +1073,49 @@ mod tests {
         assert!(!s.timer_fired(&mut h, timers[1].id));
         assert_eq!(h.log.last().unwrap(), "notify once false None");
         assert!(!s.timer_fired(&mut h, timers[1].id));
+    }
+
+    #[test]
+    fn released_functions_free_their_slots() {
+        let s = script(
+            r#"
+            local p = require("proteus")
+            for _ = 1, 100000 do p.every(1, print):stop() end
+            for _ = 1, 100000 do p.after(1, print):stop() end
+            n = 0
+            local function tick() n = n + 1; p.after(1, tick) end
+            p.after(1, tick)
+        "#,
+        );
+        let mut h = mock();
+        assert_eq!(s.take_new_timers().len(), 200_001);
+        let mut id = s.reg.borrow().timers.keys().copied().next().unwrap();
+        for _ in 0..70_000 {
+            assert!(!s.timer_fired(&mut h, id));
+            let t = s.take_new_timers();
+            assert_eq!(t.len(), 1);
+            id = t[0].id;
+        }
+        assert!(s.take_messages().is_empty());
+        assert!(s.reg.borrow().functions.len() <= 3);
+        let n: i64 = s.lua.globals().get("n").unwrap();
+        assert_eq!(n, 70_000);
+        let mut r = s.reg.borrow_mut();
+        let f: Function = s.lua.globals().get("print").unwrap();
+        let a = r.add(f.clone()).unwrap();
+        r.release(a);
+        let b = r.add(f).unwrap();
+        assert_eq!(a & 0xffff, b & 0xffff);
+        assert!(r.get(a).is_none() && r.get(b).is_some());
+        r.release(a);
+        assert!(r.get(b).is_some());
+    }
+
+    #[test]
+    fn memory_is_limited() {
+        let s = Script::new(None).unwrap();
+        let e = s.exec(r#"local s = ("x"):rep(2^30)"#, Path::new("/x/init.lua")).unwrap_err();
+        assert!(e.contains("memory"), "{e}");
     }
 
     #[test]

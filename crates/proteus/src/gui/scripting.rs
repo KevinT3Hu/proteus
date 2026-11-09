@@ -107,7 +107,9 @@ impl App {
     pub(super) fn emit(&mut self, ev: ScriptEvent) {
         self.sc.segments_due = true;
         self.plugins_event(&ev);
-        if self.sc.hooks.contains(&ev.name) {
+        if self.sc.hooks.contains(&ev.name)
+            && let Some(ev) = coalesce(&mut self.sc.queue, ev)
+        {
             self.sc.queue.push_back(ScriptCall::Event(ev));
         }
     }
@@ -195,9 +197,15 @@ impl App {
         let mut n = 0;
         while let Some(call) = self.sc.queue.pop_front() {
             n += 1;
-            if n > MAX_CALLS {
-                self.sc.queue.clear();
+            if n == MAX_CALLS {
+                self.sc.queue.retain(|c| !matches!(c, ScriptCall::Event(_)));
                 self.toast("Lua: hooks keep causing events; the rest were dropped".into(), true, None);
+            }
+            if n >= MAX_CALLS && matches!(call, ScriptCall::Event(_)) {
+                continue;
+            }
+            if n > 2 * MAX_CALLS {
+                self.sc.queue.push_front(call);
                 break;
             }
             match call {
@@ -548,6 +556,28 @@ impl App {
     }
 }
 
+/// Fold `ev` into a queued event of the same pane that it supersedes
+/// (title, cwd: the latest wins; bells: one is enough). Returns it if it
+/// still needs queueing.
+fn coalesce(queue: &mut VecDeque<ScriptCall>, ev: ScriptEvent) -> Option<ScriptEvent> {
+    if !matches!(ev.name, "title_changed" | "cwd_changed" | "bell") {
+        return Some(ev);
+    }
+    let pane = |e: &ScriptEvent| e.fields.iter().find(|f| f.0 == "pane").map(|f| f.1.clone());
+    let p = pane(&ev);
+    let queued = queue.iter_mut().find_map(|c| match c {
+        ScriptCall::Event(e) if e.name == ev.name && pane(e) == p => Some(e),
+        _ => None,
+    });
+    match queued {
+        Some(e) => {
+            *e = ev;
+            None
+        }
+        None => Some(ev),
+    }
+}
+
 /// Split a line into pieces at most `cols` wide, at spaces where possible.
 fn wrap(line: &str, cols: usize) -> Vec<String> {
     use unicode_segmentation::UnicodeSegmentation;
@@ -679,7 +709,7 @@ impl Host for App {
 
     fn close(&mut self, id: PaneId) {
         if self.activate_pane(id) {
-            self.request_close(vec![id], "this pane");
+            self.request_close(vec![id], "ui-this-pane");
         }
     }
 
@@ -775,7 +805,40 @@ impl Host for App {
 
 #[cfg(test)]
 mod tests {
-    use super::{config_dirs, wrap};
+    use super::{ScriptCall, coalesce, config_dirs, wrap};
+    use crate::script::{ScriptEvent, Val};
+    use std::collections::VecDeque;
+
+    #[test]
+    fn title_cwd_and_bell_hooks_coalesce_per_pane() {
+        let mut q = VecDeque::new();
+        q.push_back(ScriptCall::Fn(0, Some(1)));
+        let title = |p, t: &str| ScriptEvent::new("title_changed").pane(p).with("title", Val::Str(t.into()));
+        for ev in [
+            title(1, "a"),
+            ScriptEvent::new("bell").pane(1),
+            title(2, "x"),
+            title(1, "b"),
+            ScriptEvent::new("bell").pane(1),
+            ScriptEvent::new("command_started").pane(1),
+            ScriptEvent::new("command_started").pane(1),
+        ] {
+            if let Some(ev) = coalesce(&mut q, ev) {
+                q.push_back(ScriptCall::Event(ev));
+            }
+        }
+        let names: Vec<String> = q
+            .iter()
+            .map(|c| match c {
+                ScriptCall::Event(e) => match &e.fields[..] {
+                    [_, (_, Val::Str(t))] => format!("{} {t}", e.name),
+                    _ => e.name.to_string(),
+                },
+                _ => "fn".into(),
+            })
+            .collect();
+        assert_eq!(names, ["fn", "title_changed b", "bell", "title_changed x", "command_started", "command_started"]);
+    }
 
     #[test]
     fn config_modules_are_watched_recursively_without_loading_directories() {

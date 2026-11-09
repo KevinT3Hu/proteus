@@ -106,15 +106,16 @@ impl Cache {
         if !remote && source.rev.is_some() {
             return Err("rev is only supported for Git URLs".into());
         }
-        let mut path = if !remote {
+        let base = if !remote {
             PathBuf::from(raw)
         } else {
             let key = sha256(format!("{}\0{:?}", raw, source.rev).as_bytes());
             let slot = self.root.join("sources").join(key);
-            std::fs::create_dir_all(&slot).map_err(|e| e.to_string())?;
-            let _guard = cache_lock(&slot)?;
             let suffix = raw.split(['?', '#']).next().unwrap_or(raw);
             let direct = suffix.ends_with(".wasm");
+            check_transport(source, direct)?;
+            std::fs::create_dir_all(&slot).map_err(|e| e.to_string())?;
+            let _guard = cache_lock(&slot)?;
             if direct {
                 if source.rev.is_some() {
                     return Err("rev is only supported for Git sources".into());
@@ -123,6 +124,7 @@ impl Cache {
                 if !file.exists() {
                     let cfg = ureq::Agent::config_builder()
                         .timeout_global(Some(Duration::from_secs(60)))
+                        .https_only(source.sha256.is_none())
                         .tls_config(
                             ureq::tls::TlsConfig::builder().root_certs(ureq::tls::RootCerts::PlatformVerifier).build(),
                         )
@@ -164,13 +166,18 @@ impl Cache {
                 checkout
             }
         };
+        let mut path = base.clone();
         if let Some(subdir) = &source.subdir {
             if subdir.is_absolute() || subdir.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
                 return Err("plugin subdir must be relative and cannot contain '..'".into());
             }
             path = path.join(subdir);
         }
-        path.canonicalize().map_err(|e| format!("{}: {e}", path.display()))
+        let real = path.canonicalize().map_err(|e| format!("{}: {e}", path.display()))?;
+        if source.subdir.is_some() && !real.starts_with(base.canonicalize().map_err(|e| e.to_string())?) {
+            return Err(format!("{}: plugin subdir leads outside the source", path.display()));
+        }
+        Ok(real)
     }
 
     /// Rust source is always built through Cargo's incremental cache, never a stale sibling WASM.
@@ -258,7 +265,7 @@ impl Cache {
             .arg(&manifest)
             .arg("--target-dir")
             .arg(slot.join("target"));
-        let out = cmd.output().map_err(|e| format!("cargo build: {e}"))?;
+        let out = timed(&mut cmd, BUILD_TIMEOUT).map_err(|e| format!("cargo build: {e}"))?;
         if !out.status.success() {
             return Err(format!(
                 "plugin build in {} failed (requires the wasm32-wasip2 Rust target):\n{}",
@@ -290,9 +297,77 @@ impl Cache {
     }
 }
 
+const GIT_TIMEOUT: Duration = Duration::from_secs(600);
+const BUILD_TIMEOUT: Duration = Duration::from_secs(1800);
+
+fn full_commit(rev: Option<&str>) -> bool {
+    rev.is_some_and(|r| matches!(r.len(), 40 | 64) && r.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Unauthenticated transports only with a pin: a checksum for a WASM URL,
+/// a full commit hash for Git.
+fn check_transport(source: &Source, direct: bool) -> Result<(), String> {
+    let raw = &source.source;
+    let plain = raw.starts_with("http://") || raw.starts_with("git://");
+    if direct && !raw.starts_with("https://") && source.sha256.is_none() {
+        return Err(format!("{raw}: WASM URLs must use https:// unless sha256 is set"));
+    }
+    if !direct && plain && !full_commit(source.rev.as_deref()) {
+        return Err(format!("{raw}: unencrypted Git URLs need rev set to a full commit hash; use https:// or ssh://"));
+    }
+    Ok(())
+}
+
+/// Git without prompts (the cache lock is held meanwhile) and with a time limit.
 fn command(cmd: &mut Command, label: &str) -> Result<(), String> {
-    let out = cmd.output().map_err(|e| format!("{label}: {e}"))?;
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    if std::env::var_os("GIT_SSH_COMMAND").is_none() && std::env::var_os("GIT_SSH").is_none() {
+        cmd.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+    }
+    let out = timed(cmd, GIT_TIMEOUT).map_err(|e| format!("{label}: {e}"))?;
     if out.status.success() { Ok(()) } else { Err(format!("{label}: {}", String::from_utf8_lossy(&out.stderr))) }
+}
+
+/// `cmd`'s output; its process group is killed after `limit`.
+fn timed(cmd: &mut Command, limit: Duration) -> Result<std::process::Output, String> {
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    fn collect(r: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut v = Vec::new();
+            if let Some(mut r) = r {
+                let _ = r.read_to_end(&mut v);
+            }
+            v
+        })
+    }
+    let (stdout, stderr) = (collect(child.stdout.take()), collect(child.stderr.take()));
+    let end = std::time::Instant::now() + limit;
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            break status;
+        }
+        if std::time::Instant::now() >= end {
+            let pid = rustix::process::Pid::from_child(&child);
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+            let _ = child.wait();
+            return Err(format!("timed out after {} s", limit.as_secs()));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    })
 }
 fn cache_lock(dir: &Path) -> Result<std::fs::File, String> {
     let f = std::fs::File::options()
@@ -505,10 +580,52 @@ mod tests {
             conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n\0asm\x0d\0\x01\0")
                 .unwrap();
         });
-        let source = Source { source: url, id: Some("remote.test".into()), ..Default::default() };
+        let source = Source {
+            source: url,
+            id: Some("remote.test".into()),
+            sha256: Some(sha256(b"\0asm\x0d\0\x01\0")),
+            ..Default::default()
+        };
         let first = t.cache().resolve(&source).unwrap();
         worker.join().unwrap();
         assert_eq!(t.cache().resolve(&source).unwrap(), first);
+    }
+
+    #[test]
+    fn unauthenticated_transports_need_a_pin() {
+        let t = Temp::new();
+        let url = |s: &str| Source { source: s.into(), ..Default::default() };
+        assert!(t.cache().resolve(&url("http://example.invalid/p.wasm")).unwrap_err().contains("https://"));
+        for git in ["http://example.invalid/p.git", "git://example.invalid/p.git"] {
+            let e = t.cache().resolve(&url(git)).unwrap_err();
+            assert!(e.contains("full commit hash"), "{e}");
+            let short = Source { rev: Some("main".into()), ..url(git) };
+            assert!(t.cache().resolve(&short).unwrap_err().contains("full commit hash"));
+            let pinned = Source { rev: Some("a".repeat(40)), ..url(git) };
+            assert!(check_transport(&pinned, false).is_ok());
+        }
+        assert!(check_transport(&url("https://example.invalid/p.git"), false).is_ok());
+        assert!(check_transport(&url("git@example.invalid:p.git"), false).is_ok());
+        assert!(check_transport(&url("https://example.invalid/p.wasm"), true).is_ok());
+    }
+
+    #[test]
+    fn subdirectories_cannot_leave_the_source_through_symlinks() {
+        let t = Temp::new();
+        let p = t.package();
+        std::os::unix::fs::symlink(&t.0, p.join("up")).unwrap();
+        let source = Source { source: p.display().to_string(), subdir: Some("up".into()), ..Default::default() };
+        assert!(t.cache().resolve(&source).unwrap_err().contains("outside the source"));
+    }
+
+    #[test]
+    fn slow_commands_are_killed() {
+        let t = std::time::Instant::now();
+        let e = timed(Command::new("sh").args(["-c", "sleep 30 & sleep 30"]), Duration::from_millis(200)).unwrap_err();
+        assert!(e.contains("timed out"), "{e}");
+        assert!(t.elapsed() < Duration::from_secs(5));
+        let out = timed(Command::new("echo").arg("hi"), Duration::from_secs(10)).unwrap();
+        assert_eq!(out.stdout, b"hi\n");
     }
     #[test]
     fn rust_source_never_falls_back_to_a_stale_prebuilt_component() {

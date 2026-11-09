@@ -391,6 +391,33 @@ fn tab(t: &Table, at: &str) -> Result<TabSpec, String> {
     Ok(TabSpec { name, cwd, focus, zoomed, root, floating, show_floating })
 }
 
+/// The instruction hook cannot interrupt a single C call: drop the pattern
+/// matchers (whose backtracking is unbounded) and bound `string.rep`.
+fn sandbox_strings(lua: &Lua) -> mlua::Result<()> {
+    const MAX_REP: usize = 1 << 20;
+    let string: mlua::Table = lua.globals().get("string")?;
+    for name in ["find", "match", "gmatch", "gsub"] {
+        string.raw_set(name, Value::Nil)?;
+    }
+    let rep = lua.create_function(|lua, (s, n, sep): (mlua::LuaString, i64, Option<mlua::LuaString>)| {
+        let (s, sep) = (s.as_bytes().to_vec(), sep.map(|s| s.as_bytes().to_vec()).unwrap_or_default());
+        let n = usize::try_from(n).unwrap_or(0);
+        let len = s.len().checked_mul(n).and_then(|l| l.checked_add(sep.len().checked_mul(n.saturating_sub(1))?));
+        if len.is_none_or(|l| l > MAX_REP) {
+            return Err(mlua::Error::runtime("string.rep result exceeds 1 MiB"));
+        }
+        let mut out = Vec::with_capacity(len.unwrap_or(0));
+        for i in 0..n {
+            if i > 0 {
+                out.extend_from_slice(&sep);
+            }
+            out.extend_from_slice(&s);
+        }
+        lua.create_string(out)
+    })?;
+    string.raw_set("rep", rep)
+}
+
 /// Evaluate layout (or session) source. `chunk` names it in errors.
 pub fn parse(src: &str, chunk: &str) -> Result<LayoutSpec, String> {
     if src.len() > 1 << 20 {
@@ -401,6 +428,7 @@ pub fn parse(src: &str, chunk: &str) -> Result<LayoutSpec, String> {
     let lua = Lua::new_with(StdLib::TABLE | StdLib::STRING | StdLib::MATH, LuaOptions::default())
         .map_err(|e| e.to_string())?;
     lua.set_memory_limit(16 << 20).map_err(|e| e.to_string())?;
+    sandbox_strings(&lua).map_err(|e| e.to_string())?;
     let start = std::time::Instant::now();
     lua.set_hook(mlua::HookTriggers::new().every_nth_instruction(1000), move |_, _| {
         if start.elapsed() > std::time::Duration::from_millis(100) {
@@ -760,6 +788,15 @@ mod tests {
     fn runaway_allocating_cyclic_and_deep_layouts_are_rejected() {
         assert!(parse("while true do end", "loop").is_err());
         assert!(parse("return string.rep('x', 32 * 1024 * 1024)", "allocation").is_err());
+        let start = std::time::Instant::now();
+        assert!(parse("return ('a'):rep(2000):find(('a-'):rep(15)..'b')", "backtracking").is_err());
+        assert!(parse("return ('x'):gsub('x', 'y')", "gsub").is_err());
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        assert!(parse("return ('x'):rep(1024 * 1024, ',')", "separator").is_err());
+        assert!(
+            parse("return {tabs={{name=('ab'):rep(3, '-')}}}", "rep").unwrap().windows[0][0].name.as_deref()
+                == Some("ab-ab-ab")
+        );
         assert!(parse("local t = {}; t[1] = t; return {tabs={t}}", "cycle").is_err());
         assert!(parse("local t = {}; for i=1,100 do t={t} end; return {tabs={t}}", "deep").is_err());
         assert!(parse("local t = {}; for i=1,20000 do t[i]=i end; return {tabs={t}}", "large").is_err());

@@ -107,6 +107,7 @@ prompt-confirm-keys = [y] 是   [n] 否
 prompt-plugin-permissions = 插件 { $plugin }（{ $source }）请求以下权限。允许并记住？
 prompt-plugin-permissions-keys = [y] 允许   [n] 不启动
 prompt-plugin-run-command-warning = 它可运行的程序不会检查参数，可以以你的身份运行任意代码。
+prompt-plugin-open-pane-warning = 它打开的窗格可以运行任意程序，因此可以以你的身份运行任意代码。
 prompt-plugin-startup-files-warning = 它可以修改你的启动文件和 Proteus 配置，因此可以以你的身份运行任意代码。
 ui-command-failed-exit-code = 命令失败（退出码 { $code }）
 ui-command-finished = 命令已完成
