@@ -1,4 +1,4 @@
-/// The Proteus plugin API, version 1 (docs/design/05-scripting.md).
+/// The Proteus plugin API, version 1 (see crates/proteus-plugin/README.md).
 ///
 /// A plugin is a component (`wasm32-wasip2`) exporting `init`, `on-event`
 /// and `on-ui`. Calls into the host that need a permission the user did

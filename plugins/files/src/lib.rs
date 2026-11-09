@@ -1,4 +1,4 @@
-//! `proteus.files`: the first-party file manager (docs/design/03-file-manager.md).
+//! `proteus.files`: the first-party file manager (docs/files.md).
 //!
 //! Three surfaces: a sidebar (`Alt+e`, a tree that follows the focused
 //! pane's directory), a pane (`E` in Pane mode or a layout, Miller
