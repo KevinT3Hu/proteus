@@ -107,6 +107,8 @@ enum Mark {
     /// Output rows (only drawn for failed or running commands).
     Output(Rgb),
     Fold,
+    /// The block at the Scroll cursor, which block actions apply to.
+    Current(bool),
 }
 
 impl App {
@@ -145,14 +147,18 @@ impl App {
             return Vec::new();
         }
         let red = t.palette().indexed(1);
+        let current =
+            self.w.copy.as_ref().filter(|c| c.pane == id).and_then(|c| t.blocks().at_line(c.cursor.line)).map(|b| b.id);
         let mut cache: Option<(BlockId, (Line, Line))> = None;
         let mut kinds: Vec<Mark> = Vec::with_capacity(rows.0.len());
         for row in &rows.0 {
             let m = match *row {
                 Row::Empty => Mark::None,
+                Row::Fold { block, .. } if Some(block) == current => Mark::Current(false),
                 Row::Fold { .. } => Mark::Fold,
                 Row::Line(l) => match t.blocks().at_line(l) {
                     None => Mark::None,
+                    Some(b) if Some(b.id) == current => Mark::Current(b.state == BlockState::Running),
                     Some(b) => {
                         let ext = match cache {
                             Some((bid, e)) if bid == b.id => e,
@@ -198,23 +204,30 @@ impl App {
             let h = (e - y) as f32 * ch;
             // A one-pixel break between neighboring blocks' marks.
             let h1 = (h - 1.0).max(1.0);
+            let spinner = |out: &mut Vec<_>, c| {
+                let phase =
+                    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() / SPINNER.as_millis()) % 4;
+                let seg = (h1 / 2.0).max(2.0);
+                let step = (h1 - seg) / 3.0;
+                out.push(([x, top + phase as f32 * step, w, seg], c));
+            };
             match k {
                 Mark::None => {}
                 Mark::Prompt(c, running) => {
                     out.push(([x, top, w, h1], if running { theme.dim } else { c }));
                     if running {
                         // Spinner: a segment walking down the mark.
-                        let phase = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .map_or(0, |d| d.as_millis() / SPINNER.as_millis())
-                            % 4;
-                        let seg = (h1 / 2.0).max(2.0);
-                        let step = (h1 - seg) / 3.0;
-                        out.push(([x, top + phase as f32 * step, w, seg], c));
+                        spinner(&mut out, c);
                     }
                 }
                 Mark::Output(c) => out.push(([x, top, thin, h1], c)),
                 Mark::Fold => out.push(([x, top, w, h1], theme.dim)),
+                Mark::Current(running) => {
+                    out.push(([x, top, w, h1], theme.fg));
+                    if running {
+                        spinner(&mut out, theme.accent);
+                    }
+                }
             }
             y = e;
         }

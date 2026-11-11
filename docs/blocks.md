@@ -100,6 +100,7 @@ between panes). Next to every prompt and command, the gutter shows a mark:
 | Dim | The command finished with exit status 0, or its status is unknown. |
 | Red | The command failed (non-zero exit status). Its output rows get a thin red mark too. |
 | Accent color, moving segment | The command is still running. |
+| Foreground color, whole block | In Scroll mode: the block at the cursor, which `[`, `]` move between and the block keys act on. |
 
 Hover over a mark to see a summary such as `✗ exit 2 · 1.3s · make test`.
 Durations are shown as `1.2s`, `42s`, `3m 05s` or `2h 01m`.
