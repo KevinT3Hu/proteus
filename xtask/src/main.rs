@@ -1,3 +1,5 @@
+mod notices;
+
 use sha2::{Digest, Sha256};
 use std::{
     env,
@@ -144,11 +146,15 @@ fn main() -> Result {
         copy(&path, usr.join("share/proteus/branding").join(path.file_name().unwrap()))?;
     }
     copy("examples/workspace/.proteus-workspace", usr.join("share/doc/proteus/examples/.proteus-workspace"))?;
+    copy("LICENSE", usr.join("share/doc/proteus/LICENSE"))?;
+    fs::write(usr.join("share/doc/proteus/THIRD-PARTY-NOTICES.txt"), notices::generate(version, host)?)?;
     normalize_permissions(&stage)?;
     run(Command::new("tar").arg("-czf").arg(dist.join(format!("{name}.tar.gz"))).arg("-C").arg(&dist).arg(&name))?;
     let mut artifacts = vec![format!("{name}.tar.gz")];
     if args.iter().any(|a| a == "--deb") {
         fs::create_dir_all(stage.join("DEBIAN"))?;
+        let copyright = usr.join("share/doc/proteus/copyright");
+        fs::write(&copyright, notices::debian_copyright()?)?;
         fs::write(
             stage.join("DEBIAN/control"),
             format!(
@@ -159,6 +165,7 @@ fn main() -> Result {
         let deb = format!("proteus_{version}_{deb_arch}.deb");
         run(Command::new("dpkg-deb").args(["--root-owner-group", "--build"]).arg(&stage).arg(dist.join(&deb)))?;
         fs::remove_dir_all(stage.join("DEBIAN"))?;
+        fs::remove_file(copyright)?;
         artifacts.push(deb);
     }
     let mut sums = String::new();

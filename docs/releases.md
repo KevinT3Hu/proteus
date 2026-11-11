@@ -38,8 +38,11 @@ older libc versions. Test on each supported distribution before publishing.
 
 Desktop integration uses `dev.proteus.Proteus`, matching the Wayland app ID.
 The supplied SVG is the desktop icon; original logos and wordmarks are included
-under `share/proteus/branding`. Documentation and an example workspace are in
-`share/doc/proteus`. Shell hooks are embedded in the executable; terminfo is
+under `share/proteus/branding`. Documentation, an example workspace, the
+licence (`LICENSE`) and the licences of every bundled third-party component
+(`THIRD-PARTY-NOTICES.txt`) are in `share/doc/proteus`; the Debian package also
+has the `copyright` file there. Packaging fails if a bundled crate's licence
+text cannot be found. Shell hooks are embedded in the executable; terminfo is
 installed automatically in the user's data directory at runtime (requires `tic`).
 The terminfo source is also supplied under `share/proteus`.
 

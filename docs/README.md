@@ -39,3 +39,9 @@ WASM plugins.
 - [Localization](i18n.md): translating Proteus and plugins.
 - [Release packaging](releases.md): building release tarballs and Debian
   packages.
+
+
+## License
+
+Proteus is licensed under the GNU Affero General Public License, version 3 only
+(`AGPL-3.0-only`). See [LICENSE](../LICENSE).
