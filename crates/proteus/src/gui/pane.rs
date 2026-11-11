@@ -22,6 +22,9 @@ use crate::spec::Cmd;
 
 /// How often the fallback title (foreground process) is re-read.
 const PROC_REFRESH: Duration = Duration::from_secs(1);
+/// Pty output sent to the GUI in one message once this much is collected;
+/// below the per-pane budget so several batches can be in flight.
+const READ_BATCH: usize = 32 << 10;
 
 pub struct Pane {
     pub term: Terminal,
@@ -169,34 +172,70 @@ impl Pane {
         std::thread::Builder::new().name(format!("pty-reader-{id}")).spawn(move || {
             let _span = span.entered();
             let mut buf = vec![0u8; 8 * 1024];
+            // Output read but not sent yet: everything the pty has ready goes
+            // out in one message, and while the GUI is behind, output keeps
+            // collecting here instead of in many small messages.
+            let mut batch: Vec<u8> = Vec::new();
+            // Send `batch`, waiting for room if `wait`. `Some(false)`: no room yet.
+            let send = |batch: &mut Vec<u8>, wait: bool| -> Option<bool> {
+                let n = batch.len();
+                let local = if wait {
+                    pending.acquire(n, &stop)?
+                } else {
+                    match pending.try_acquire(n) {
+                        Some(p) => p,
+                        None => return Some(false),
+                    }
+                };
+                let global = match total.try_acquire(n) {
+                    Some(p) => p,
+                    None if wait => total.acquire(n, &stop)?,
+                    None => return Some(false),
+                };
+                tracing::trace!(bytes = n, "pty output");
+                let data = std::mem::take(batch);
+                tx.send(Msg::Pty(id, data, (local, global))).ok().map(|()| true)
+            };
+            let poll = |reader: &std::fs::File, ms: u64| -> rustix::io::Result<()> {
+                let mut polls = [rustix::event::PollFd::new(reader, rustix::event::PollFlags::IN)];
+                let wait = rustix::event::Timespec::try_from(Duration::from_millis(ms)).expect("small timeout");
+                match rustix::event::poll(&mut polls, Some(&wait)) {
+                    Err(rustix::io::Errno::INTR) => Ok(()),
+                    r => r.map(drop),
+                }
+            };
             loop {
                 if stop.load(Ordering::Relaxed) {
                     tracing::trace!("pty reader stopped");
                     return;
                 }
+                if batch.len() >= READ_BATCH {
+                    match send(&mut batch, true) {
+                        Some(true) => continue,
+                        _ => return,
+                    }
+                }
                 match reader.read(&mut buf) {
                     Ok(0) => break,
-                    Ok(n) => {
-                        tracing::trace!(bytes = n, "pty output");
-                        let Some(local) = pending.acquire(n, &stop) else { return };
-                        let Some(global) = total.acquire(n, &stop) else { return };
-                        if tx.send(Msg::Pty(id, buf[..n].to_vec(), (local, global))).is_err() {
-                            return;
-                        }
-                    }
+                    Ok(n) => batch.extend_from_slice(&buf[..n]),
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        // Readiness wakes immediately on output; the bounded
-                        // timeout only exists to notice a closed pane.
-                        let mut polls = [rustix::event::PollFd::new(&reader, rustix::event::PollFlags::IN)];
-                        let wait = rustix::event::Timespec::try_from(Duration::from_millis(50)).expect("small timeout");
-                        if let Err(e) = rustix::event::poll(&mut polls, Some(&wait))
-                            && e != rustix::io::Errno::INTR
-                        {
+                        // Nothing more is ready. Readiness wakes immediately on
+                        // output; the timeouts only exist to notice a closed
+                        // pane, or room for the batch.
+                        let ms = if batch.is_empty() {
+                            50
+                        } else {
+                            match send(&mut batch, false) {
+                                None => return,
+                                Some(true) => continue,
+                                Some(false) => 2,
+                            }
+                        };
+                        if let Err(e) = poll(&reader, ms) {
                             tracing::warn!("pty poll failed: {e}");
                             break;
                         }
-                        continue;
                     }
                     Err(e) => {
                         // EIO is how the master reports that the child side closed.
@@ -208,6 +247,9 @@ impl Pane {
                         break;
                     }
                 }
+            }
+            if !batch.is_empty() && send(&mut batch, true).is_none() {
+                return;
             }
             let _ = tx.send(Msg::PtyClosed(id));
         })?;
