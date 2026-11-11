@@ -2,7 +2,7 @@
 
 mod graphics;
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::ops::Range;
 use std::time::Instant;
 
@@ -1140,8 +1140,9 @@ impl Terminal {
                 // Like kitty: clearing the screen clears its images too.
                 let (a, b) = (self.grid.abs_line(0) as i64, self.grid.abs_line(lines - 1) as i64 + 1);
                 let s = &self.images;
-                let doomed: Vec<u64> =
-                    s.placements().iter().filter(|p| s.intersects_lines(p, a, b)).map(|p| p.seq).collect();
+                let index = s.placement_index();
+                let doomed: HashSet<u64> =
+                    s.placements().iter().filter(|p| s.intersects_lines(&index, p, a, b)).map(|p| p.seq).collect();
                 if !doomed.is_empty() {
                     self.images.remove_placements(|p| doomed.contains(&p.seq));
                     self.images.free_anonymous();

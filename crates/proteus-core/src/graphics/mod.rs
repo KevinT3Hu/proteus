@@ -462,12 +462,18 @@ pub struct ImageStore {
     images: HashMap<u64, Image>,
     by_id: HashMap<u32, u64>,
     placements: Vec<Placement>,
+    /// A lower bound on the bottom line of every anchored placement, so
+    /// [`ImageStore::prune`] can skip its scan on most linefeeds.
+    prune_floor: i64,
     bytes: usize,
     budget: Option<Arc<ImageBudget>>,
     next_id: u32,
     seq: u64,
     pub(crate) upload: Option<Upload>,
 }
+
+/// Placement positions by `(image, id)`; id 0 maps to the image's first placement.
+pub(crate) struct PlacementIndex(HashMap<(u64, u32), usize>);
 
 impl Drop for ImageStore {
     fn drop(&mut self) {
@@ -483,6 +489,7 @@ impl ImageStore {
             images: HashMap::new(),
             by_id: HashMap::new(),
             placements: Vec::new(),
+            prune_floor: i64::MIN,
             bytes: 0,
             budget,
             next_id: 0x7000_0000,
@@ -535,10 +542,6 @@ impl ImageStore {
                 return self.next_id;
             }
         }
-    }
-
-    fn has_placements(&self, key: u64) -> bool {
-        self.placements.iter().any(|p| p.image == key)
     }
 
     /// Make room for `need` more bytes, given `other` bytes held by the pane's
@@ -595,6 +598,17 @@ impl ImageStore {
         self.placements.iter().map(|p| p.image).collect()
     }
 
+    /// Positions of placements by `(image, id)`, for resolving many relative
+    /// placements without a linear search each.
+    pub(crate) fn placement_index(&self) -> PlacementIndex {
+        let mut index = HashMap::with_capacity(self.placements.len() * 2);
+        for (i, p) in self.placements.iter().enumerate() {
+            index.entry((p.image, p.id)).or_insert(i);
+            index.entry((p.image, 0)).or_insert(i);
+        }
+        PlacementIndex(index)
+    }
+
     pub(crate) fn release(&mut self, n: usize) {
         self.bytes = self.bytes.saturating_sub(n);
         if let Some(b) = &self.budget {
@@ -633,13 +647,23 @@ impl ImageStore {
     }
 
     pub(crate) fn remove_image(&mut self, key: u64) {
-        if let Some(img) = self.images.remove(&key) {
-            if img.id != 0 && self.by_id.get(&img.id) == Some(&key) {
-                self.by_id.remove(&img.id);
-            }
-            self.release(img.bytes());
+        self.remove_images(&HashSet::from([key]));
+    }
+
+    /// Remove images and their placements in one pass over the placements.
+    pub(crate) fn remove_images(&mut self, keys: &HashSet<u64>) {
+        if keys.is_empty() {
+            return;
         }
-        self.remove_placements(|p| p.image == key);
+        for key in keys {
+            if let Some(img) = self.images.remove(key) {
+                if img.id != 0 && self.by_id.get(&img.id) == Some(key) {
+                    self.by_id.remove(&img.id);
+                }
+                self.release(img.bytes());
+            }
+        }
+        self.remove_placements(|p| keys.contains(&p.image));
     }
 
     fn evict(&mut self, key: u64) {
@@ -655,6 +679,9 @@ impl ImageStore {
     pub(crate) fn add_placement(&mut self, mut p: Placement) {
         self.seq += 1;
         p.seq = self.seq;
+        if !p.is_virtual && p.parent.is_none() {
+            self.prune_floor = self.prune_floor.min(p.line + p.rows as i64);
+        }
         if p.id != 0
             && let Some(old) = self.placements.iter_mut().find(|o| o.image == p.image && o.id == p.id)
         {
@@ -686,8 +713,11 @@ impl ImageStore {
             }
             !rm
         });
+        if affected.is_empty() {
+            return affected;
+        }
         // Cascade to orphaned relative placements.
-        loop {
+        while self.placements.iter().any(|p| p.parent.is_some()) {
             let alive: HashSet<(u64, u32)> = self.placements.iter().map(|q| (q.image, q.id)).collect();
             let before = self.placements.len();
             self.placements.retain(|p| {
@@ -708,21 +738,18 @@ impl ImageStore {
 
     /// Delete the given images if nothing displays them any more.
     pub(crate) fn free_unplaced(&mut self, keys: &[u64]) {
-        for &k in keys {
-            if !self.has_placements(k) {
-                self.remove_image(k);
-            }
-        }
+        let placed = self.placed_keys();
+        let unplaced: HashSet<u64> = keys.iter().copied().filter(|k| !placed.contains(k)).collect();
+        self.remove_images(&unplaced);
     }
 
     /// Drop anonymous images (Sixel, iTerm2, kitty id 0) nothing displays:
     /// they can never be shown again.
     pub(crate) fn free_anonymous(&mut self) {
-        let keys: Vec<u64> =
-            self.images.values().filter(|i| i.id == 0 && !self.has_placements(i.key)).map(|i| i.key).collect();
-        for k in keys {
-            self.remove_image(k);
-        }
+        let placed = self.placed_keys();
+        let keys: HashSet<u64> =
+            self.images.values().filter(|i| i.id == 0 && !placed.contains(&i.key)).map(|i| i.key).collect();
+        self.remove_images(&keys);
     }
 
     pub(crate) fn clear(&mut self) {
@@ -738,6 +765,7 @@ impl ImageStore {
     /// non-virtual parents. `virt` resolves virtual parents.
     fn resolve(
         &self,
+        index: &PlacementIndex,
         p: &Placement,
         depth: usize,
         virt: &dyn Fn(u64, u32) -> Option<(i64, i64)>,
@@ -746,8 +774,9 @@ impl ImageStore {
         if depth >= MAX_RELATIVE_DEPTH {
             return None;
         }
-        let parent = self.find_placement(pk, pid)?;
-        let (l, c) = if parent.is_virtual { virt(pk, parent.id)? } else { self.resolve(parent, depth + 1, virt)? };
+        let parent = &self.placements[*index.0.get(&(pk, pid))?];
+        let (l, c) =
+            if parent.is_virtual { virt(pk, parent.id)? } else { self.resolve(index, parent, depth + 1, virt)? };
         Some((l + p.rel.1 as i64, c + p.rel.0 as i64))
     }
 
@@ -774,26 +803,35 @@ impl ImageStore {
     }
 
     /// Placements (non-virtual) whose cell box contains the absolute cell.
-    pub(crate) fn intersects(&self, p: &Placement, line: Option<i64>, col: Option<i64>) -> bool {
+    pub(crate) fn intersects(
+        &self,
+        index: &PlacementIndex,
+        p: &Placement,
+        line: Option<i64>,
+        col: Option<i64>,
+    ) -> bool {
         if p.is_virtual {
             return false;
         }
-        let Some((l, c)) = self.resolve(p, 0, &|_, _| None) else { return false };
+        let Some((l, c)) = self.resolve(index, p, 0, &|_, _| None) else { return false };
         line.is_none_or(|y| y >= l && y < l + p.rows as i64) && col.is_none_or(|x| x >= c && x < c + p.cols as i64)
     }
 
     /// Placements intersecting absolute lines `[a, b)`.
-    pub(crate) fn intersects_lines(&self, p: &Placement, a: i64, b: i64) -> bool {
+    pub(crate) fn intersects_lines(&self, index: &PlacementIndex, p: &Placement, a: i64, b: i64) -> bool {
         if p.is_virtual {
             return false;
         }
-        let Some((l, _)) = self.resolve(p, 0, &|_, _| None) else { return false };
+        let Some((l, _)) = self.resolve(index, p, 0, &|_, _| None) else { return false };
         l < b && l + p.rows as i64 > a
     }
 
     /// Text in the region `[top, bottom)` moved by `delta` lines. Placements
     /// entirely inside the region move with it and are clipped to it.
     pub(crate) fn scroll_region(&mut self, top: i64, bottom: i64, delta: i64) {
+        if delta < 0 {
+            self.prune_floor = self.prune_floor.saturating_add(delta);
+        }
         let mut gone = false;
         for p in &mut self.placements {
             if p.is_virtual || p.parent.is_some() {
@@ -822,6 +860,7 @@ impl ImageStore {
 
     /// Move every anchored placement by `delta` lines (alternate screen resize).
     pub(crate) fn shift(&mut self, delta: i64) {
+        self.prune_floor = self.prune_floor.saturating_add(delta.min(0));
         for p in &mut self.placements {
             if !p.is_virtual && p.parent.is_none() {
                 p.line += delta;
@@ -832,6 +871,7 @@ impl ImageStore {
 
     /// Follow a reflow: anchors move with their line; columns are clamped.
     pub(crate) fn remap(&mut self, map: &LineMap, cols: usize) {
+        self.prune_floor = i64::MIN;
         let mut gone = false;
         for p in &mut self.placements {
             if p.is_virtual || p.parent.is_some() {
@@ -857,11 +897,21 @@ impl ImageStore {
 
     /// Drop placements entirely above absolute line `first` (fell out of scrollback).
     pub(crate) fn prune(&mut self, first: i64) {
+        if self.prune_floor > first {
+            return;
+        }
         let gone = |p: &Placement| !p.is_virtual && p.parent.is_none() && p.line + p.rows as i64 <= first;
         if self.placements.iter().any(gone) {
             self.remove_placements(gone);
             self.free_anonymous();
         }
+        self.prune_floor = self
+            .placements
+            .iter()
+            .filter(|p| !p.is_virtual && p.parent.is_none())
+            .map(|p| p.line + p.rows as i64)
+            .min()
+            .unwrap_or(i64::MAX);
     }
 
     /// Remove anonymous (Sixel/iTerm2) placements fully covered by a new image
@@ -877,7 +927,7 @@ impl ImageStore {
                 && p.col >= col
                 && p.col + p.cols as usize <= col + cols as usize
         };
-        let doomed: Vec<u64> = self.placements.iter().filter(|p| covered(p)).map(|p| p.seq).collect();
+        let doomed: HashSet<u64> = self.placements.iter().filter(|p| covered(p)).map(|p| p.seq).collect();
         if !doomed.is_empty() {
             self.remove_placements(|p| doomed.contains(&p.seq));
             self.free_anonymous();
@@ -949,9 +999,10 @@ impl ImageStore {
         }
 
         let virt = |k: u64, id: u32| origins.get(&(k, id)).copied();
+        let index = self.placement_index();
         for p in self.placements.iter().filter(|p| !p.is_virtual) {
             let Some(img) = self.images.get(&p.image) else { continue };
-            let Some((line, col)) = self.resolve(p, 0, &virt) else { continue };
+            let Some((line, col)) = self.resolve(&index, p, 0, &virt) else { continue };
             let (rx, ry, rw, rh) = placement_rect(p, cw, ch);
             let mut view = ImageView {
                 key: p.image,

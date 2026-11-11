@@ -2,6 +2,7 @@
 //! and iTerm2 inline images (`OSC 1337 File=`), plus the APC pre-filter that
 //! `vte` lacks.
 
+use std::collections::HashSet;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
@@ -859,14 +860,15 @@ impl Terminal {
         let y = top + cmd.u(b'y') as i64 - 1;
         let z = cmd.i(b'z');
         let s = &self.images;
+        let index = s.placement_index();
         // Placement sequence numbers to delete, plus images to drop outright.
-        let mut doomed: Vec<u64> = Vec::new();
-        let mut drop_images: Vec<u64> = Vec::new();
+        let mut doomed: HashSet<u64> = HashSet::new();
+        let mut drop_images: HashSet<u64> = HashSet::new();
         let mut select = |f: &dyn Fn(&Placement) -> bool| {
             doomed.extend(s.placements().iter().filter(|p| f(p)).map(|p| p.seq));
         };
         match d.to_ascii_lowercase() {
-            b'a' => select(&|p| s.intersects_lines(p, top, bottom)),
+            b'a' => select(&|p| s.intersects_lines(&index, p, top, bottom)),
             b'i' | b'n' => {
                 let key = if d.eq_ignore_ascii_case(&b'i') {
                     s.key_for_id(cmd.id())
@@ -877,18 +879,18 @@ impl Terminal {
                 let pid = cmd.placement();
                 select(&|p| p.image == key && (pid == 0 || p.id == pid));
                 if free && pid == 0 {
-                    drop_images.push(key);
+                    drop_images.insert(key);
                 }
             }
-            b'c' => select(&|p| s.intersects(p, Some(cur.0), Some(cur.1))),
-            b'p' => select(&|p| s.intersects(p, Some(y), Some(x))),
-            b'q' => select(&|p| p.z == z && s.intersects(p, Some(y), Some(x))),
-            b'x' => select(&|p| s.intersects(p, None, Some(x))),
-            b'y' => select(&|p| s.intersects(p, Some(y), None)),
+            b'c' => select(&|p| s.intersects(&index, p, Some(cur.0), Some(cur.1))),
+            b'p' => select(&|p| s.intersects(&index, p, Some(y), Some(x))),
+            b'q' => select(&|p| p.z == z && s.intersects(&index, p, Some(y), Some(x))),
+            b'x' => select(&|p| s.intersects(&index, p, None, Some(x))),
+            b'y' => select(&|p| s.intersects(&index, p, Some(y), None)),
             b'z' => select(&|p| !p.is_virtual && p.z == z),
             b'r' => {
                 let (lo, hi) = (cmd.u(b'x'), cmd.u(b'y'));
-                let keys: Vec<u64> =
+                let keys: HashSet<u64> =
                     s.images().filter(|i| i.id != 0 && i.id >= lo && i.id <= hi).map(|i| i.key).collect();
                 select(&|p| keys.contains(&p.image));
                 if free {
@@ -904,9 +906,7 @@ impl Terminal {
             _ => return,
         }
         let affected = self.images.remove_placements(|p| doomed.contains(&p.seq));
-        for k in drop_images {
-            self.images.remove_image(k);
-        }
+        self.images.remove_images(&drop_images);
         if free {
             self.images.free_unplaced(&affected);
         }
@@ -960,17 +960,21 @@ impl Terminal {
                 img.generation += 1;
             }
         } else {
+            let img = self.images.image(key).expect("checked");
             let extra = img.extra_frame_bytes();
             let base = cmd.u(b'c') as usize;
+            if base > img.frames.len() {
+                return Err(err("ENOENT", "Base frame not found"));
+            }
+            let other = self.images_inactive.bytes();
+            self.images.reserve(extra, other, &self.config.graphics, Some(key))?;
+            let img = self.images.image_mut(key).expect("protected from eviction");
             let mut canvas = if base > 0 {
-                img.frames.get(base - 1).ok_or_else(|| err("ENOENT", "Base frame not found"))?.pixels.clone()
+                img.frames[base - 1].pixels.clone()
             } else {
                 cmd.u(b'Y').to_be_bytes().repeat(iw as usize * ih as usize)
             };
             kitty::compose(&mut canvas, iw, &px.rgba, px.width, rect, x, y, replace);
-            let other = self.images_inactive.bytes();
-            self.images.reserve(extra, other, &self.config.graphics, Some(key))?;
-            let img = self.images.image_mut(key).expect("protected from eviction");
             img.frames.push(Frame { pixels: canvas, gap: if gap != 0 { gap } else { DEFAULT_GAP } });
         }
         self.damage.images = true;
@@ -1114,7 +1118,13 @@ impl Terminal {
 
     pub(super) fn new_sixel(&self, p2: u16) -> Option<Box<SixelDecoder>> {
         let g = &self.config.graphics;
-        g.enabled.then(|| Box::new(SixelDecoder::new(p2, g.max_image_bytes, g.window_budget.clone())))
+        let (cw, ch) = self.cell_pixel_size();
+        let screen = (self.grid.cols() * cw as usize, self.grid.lines() * ch as usize);
+        g.enabled.then(|| {
+            let mut dec = SixelDecoder::new(p2, g.max_image_bytes, g.window_budget.clone());
+            dec.limit_padding(screen.0, screen.1);
+            Box::new(dec)
+        })
     }
 
     pub(super) fn sixel_finish(&mut self, dec: SixelDecoder) {

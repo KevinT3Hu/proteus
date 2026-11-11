@@ -79,6 +79,8 @@ pub(crate) struct SixelDecoder {
     rows: usize,
     /// Size declared by the raster attributes.
     raster: (usize, usize),
+    /// Largest size the raster attributes may pad the drawn pixels to.
+    max_padded: (usize, usize),
     max_pixels: usize,
     budget: Option<Arc<ImageBudget>>,
     /// Bytes of `buf` reserved in `budget`.
@@ -173,6 +175,7 @@ impl SixelDecoder {
             stride: 0,
             rows: 0,
             raster: (0, 0),
+            max_padded: (MAX_SIDE, MAX_SIDE),
             max_pixels: max_bytes / 4,
             budget,
             reserved: 0,
@@ -183,6 +186,13 @@ impl SixelDecoder {
             transparent: p2 == 1,
             clipped: false,
         }
+    }
+
+    /// Limit how far the raster attributes may pad the image beyond the
+    /// pixels actually drawn (normally the screen size), so a few bytes
+    /// cannot declare a huge background-filled image.
+    pub fn limit_padding(&mut self, width: usize, height: usize) {
+        self.max_padded = (width, height);
     }
 
     pub fn put(&mut self, b: u8) {
@@ -340,7 +350,7 @@ impl SixelDecoder {
         if w == 0 || h == 0 {
             return None;
         }
-        let (rw, rh) = (self.raster.0.max(w), self.raster.1.max(h));
+        let (rw, rh) = (self.raster.0.min(self.max_padded.0).max(w), self.raster.1.min(self.max_padded.1).max(h));
         let fits = rw <= MAX_SIDE
             && rh <= MAX_SIDE
             && rw * rh <= self.max_pixels
