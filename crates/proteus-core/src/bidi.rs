@@ -59,7 +59,7 @@ fn may_be_rtl(c: char) -> bool {
 }
 
 fn row_may_be_rtl(row: &crate::cell::Row) -> bool {
-    row.cells.iter().any(|c| {
+    row.cells().iter().any(|c| {
         !c.ch().is_ascii() && may_be_rtl(c.ch())
             || c.has_text() && c.extra().into_iter().chain(c.prefix()).flat_map(str::chars).any(may_be_rtl)
     })
@@ -141,7 +141,7 @@ impl Cache {
             let row = grid.abs_row(line).unwrap();
             let start = text.len();
             let mut atoms = Vec::new();
-            for (col, cell) in row.cells.iter().enumerate() {
+            for (col, cell) in row.cells().iter().enumerate() {
                 if cell.flags().contains(CellFlags::WIDE_SPACER) {
                     continue;
                 }

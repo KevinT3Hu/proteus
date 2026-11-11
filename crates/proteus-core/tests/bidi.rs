@@ -16,7 +16,7 @@ fn display(t: &Terminal, row: usize) -> String {
             continue;
         }
         last = Some(col);
-        let c = &g.row(row).cells[col];
+        let c = &g.row(row).cells()[col];
         if c.is_spacer() {
             continue;
         }
@@ -42,7 +42,7 @@ fn wide_cells_keep_both_halves_and_maps_round_trip() {
     let t = term("אב中גד 👩‍💻", 30);
     let g = t.grid();
     let map = t.visual_row(g.abs_line(0));
-    for (x, c) in g.row(0).cells.iter().enumerate() {
+    for (x, c) in g.row(0).cells().iter().enumerate() {
         if c.is_spacer() {
             continue;
         }

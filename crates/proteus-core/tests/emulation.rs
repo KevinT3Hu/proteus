@@ -40,10 +40,10 @@ fn wide_char_wraps_with_spacer() {
     let mut t = term(5, 3);
     feed(&mut t, "abcd中");
     assert_eq!(t.row_text(0), "abcd");
-    assert!(t.grid().row(0).cells[4].flags().contains(CellFlags::LEADING_WIDE_SPACER));
+    assert!(t.grid().row(0).cells()[4].flags().contains(CellFlags::LEADING_WIDE_SPACER));
     assert_eq!(t.row_text(1), "中");
-    assert!(t.grid().row(1).cells[0].flags().contains(CellFlags::WIDE));
-    assert!(t.grid().row(1).cells[1].flags().contains(CellFlags::WIDE_SPACER));
+    assert!(t.grid().row(1).cells()[0].flags().contains(CellFlags::WIDE));
+    assert!(t.grid().row(1).cells()[1].flags().contains(CellFlags::WIDE_SPACER));
     assert_eq!(t.cursor().x, 2);
 }
 
@@ -59,7 +59,7 @@ fn overwrite_half_of_wide_char() {
 fn combining_marks_join_cell() {
     let mut t = term(10, 2);
     feed(&mut t, "e\u{301}x");
-    let row = &t.grid().row(0).cells;
+    let row = &t.grid().row(0).cells();
     assert_eq!(row[0].ch(), 'e');
     assert_eq!(row[0].extra(), Some("\u{301}"));
     assert_eq!(row[1].ch(), 'x');
@@ -69,12 +69,12 @@ fn combining_marks_join_cell() {
 fn grapheme_mode_vs16_widens() {
     let mut t = term(10, 2);
     feed(&mut t, "\x1b[?2027h\u{2764}\u{fe0f}x");
-    let row = &t.grid().row(0).cells;
+    let row = &t.grid().row(0).cells();
     assert!(row[0].flags().contains(CellFlags::WIDE));
     assert_eq!(row[2].ch(), 'x');
     // ZWJ family is one cluster.
     feed(&mut t, "\r\n\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}y");
-    let row = &t.grid().row(1).cells;
+    let row = &t.grid().row(1).cells();
     assert_eq!(row[0].extra(), Some("\u{200D}\u{1F469}\u{200D}\u{1F467}"));
     assert_eq!(row[2].ch(), 'y');
 }
@@ -146,16 +146,16 @@ fn alt_screen_has_no_scrollback() {
 fn sgr_attributes_and_colors() {
     let mut t = term(20, 2);
     feed(&mut t, "\x1b[1;3;4:3;38;2;10;20;30;48;5;200;58:2::1:2:3mX\x1b[0mY");
-    let s = t.style(t.grid().row(0).cells[0].style).clone();
+    let s = t.style(t.grid().row(0).cells()[0].style).clone();
     assert!(s.attrs.contains(Attrs::BOLD | Attrs::ITALIC));
     assert_eq!(s.underline, Underline::Curly);
     assert_eq!(s.fg, Color::Rgb(Rgb::new(10, 20, 30)));
     assert_eq!(s.bg, Color::Indexed(200));
     assert_eq!(s.underline_color, Color::Rgb(Rgb::new(1, 2, 3)));
-    let y = t.style(t.grid().row(0).cells[1].style);
+    let y = t.style(t.grid().row(0).cells()[1].style);
     assert_eq!(*y, Default::default());
     feed(&mut t, "\x1b[38:5:17;91mZ");
-    let z = t.style(t.grid().row(0).cells[2].style);
+    let z = t.style(t.grid().row(0).cells()[2].style);
     assert_eq!(z.fg, Color::Indexed(9));
 }
 
@@ -163,7 +163,7 @@ fn sgr_attributes_and_colors() {
 fn background_color_erase() {
     let mut t = term(4, 2);
     feed(&mut t, "\x1b[44m\x1b[2J");
-    let s = t.style(t.grid().row(1).cells[3].style);
+    let s = t.style(t.grid().row(1).cells()[3].style);
     assert_eq!(s.bg, Color::Indexed(4));
 }
 
@@ -237,11 +237,11 @@ fn osc7_osc52_osc8() {
     assert!(ev.contains(&Event::ClipboardStore { kind: ClipboardKind::Clipboard, text: "hello".into() }));
     assert!(ev.iter().any(|e| matches!(e, Event::ClipboardLoad { kind: ClipboardKind::Primary, .. })));
     feed(&mut t, "\x1b]8;id=x;https://example.com\x1b\\link\x1b]8;;\x1b\\ no");
-    let cell = &t.grid().row(0).cells[0];
+    let cell = &t.grid().row(0).cells()[0];
     let link = t.style(cell.style).hyperlink.and_then(|id| t.hyperlink(id)).unwrap();
     assert_eq!(link.uri, "https://example.com");
     assert_eq!(link.id.as_deref(), Some("x"));
-    assert!(t.style(t.grid().row(0).cells[5].style).hyperlink.is_none());
+    assert!(t.style(t.grid().row(0).cells()[5].style).hyperlink.is_none());
 }
 
 #[test]
@@ -480,9 +480,9 @@ fn style_compaction_keeps_cell_styles() {
     feed(&mut t, &s);
     assert!(t.styles().len() < 70_000);
     let (x, y) = (t.cursor().x - 1, t.cursor().y);
-    let st = t.style(t.grid().row(y).cells[x].style);
+    let st = t.style(t.grid().row(y).cells()[x].style);
     assert_eq!((st.attrs, st.bg), (Attrs::BOLD, Color::Indexed(4)));
-    let prev = t.style(t.grid().row(y).cells[x - 1].style);
+    let prev = t.style(t.grid().row(y).cells()[x - 1].style);
     assert_eq!(prev.fg, Color::Rgb(Rgb::new(1, 17, 111)));
     // History keeps only the text of its rows, never their trailing blanks.
     feed(&mut t, "\x1b[0m\r\nshort\r\n\r\n\r\n\r\n");

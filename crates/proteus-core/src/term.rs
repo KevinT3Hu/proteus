@@ -603,7 +603,7 @@ impl Terminal {
                     continue;
                 };
                 let mut text = String::new();
-                for (col, cell) in row.cells.iter().enumerate() {
+                for (col, cell) in row.cells().iter().enumerate() {
                     if cell.is_spacer() {
                         continue;
                     }
@@ -781,7 +781,7 @@ impl Terminal {
         let fallback = Style::default();
         for grid in [&mut self.grid, &mut self.inactive] {
             for row in grid.rows_mut() {
-                for cell in &mut row.cells {
+                for cell in row.cells_mut() {
                     let i = cell.style.0 as usize;
                     let id = match remap.get(i) {
                         Some(&id) if id != u32::MAX => id,
@@ -853,7 +853,7 @@ impl Terminal {
         let y = self.cursor.y;
         let x = if self.cursor.pending_wrap { self.cursor.x } else { self.cursor.x.checked_sub(1)? };
         let row = self.grid.row(y);
-        if x > 0 && row.cells[x].flags().contains(CellFlags::WIDE_SPACER) { Some((x - 1, y)) } else { Some((x, y)) }
+        if x > 0 && row.cells()[x].flags().contains(CellFlags::WIDE_SPACER) { Some((x - 1, y)) } else { Some((x, y)) }
     }
 
     /// With mode 2027, a printable char that continues the previous grapheme
@@ -863,7 +863,7 @@ impl Terminal {
             return false;
         }
         let Some((x, y)) = self.prev_cell() else { return false };
-        let cell = &self.grid.row(y).cells[x];
+        let cell = &self.grid.row(y).cells()[x];
         if cell.is_empty() {
             return false;
         }
@@ -906,7 +906,7 @@ impl Terminal {
 
     /// Blank both halves of a wide char occupying column `x`.
     fn clear_wide(&mut self, x: usize, y: usize) {
-        clear_wide(&mut self.grid.row_mut(y).cells, x, self.erase_id);
+        clear_wide(self.grid.row_mut(y).cells_to(x + 2), x, self.erase_id);
     }
 
     fn put_char(&mut self, c: char, width: usize) {
@@ -930,7 +930,8 @@ impl Terminal {
         }
         let (x, y) = (self.cursor.x, self.cursor.y);
         let (style, erase) = (self.style_id, self.erase_id);
-        let row = &mut self.grid.row_mut(y).cells;
+        // Writing at `x` may blank the other half of a wide char on either side.
+        let row = self.grid.row_mut(y).cells_to(x + width + 1);
         if width == 1 && row[x].flags().is_empty() && !row[x].has_text() {
             row[x] = Cell::new(c, style, CellFlags::empty());
         } else {
@@ -1102,9 +1103,7 @@ impl Terminal {
         self.clear_wide(x1 - 1, y);
         let erase = self.erase_id;
         let row = self.grid.row_mut(y);
-        for c in &mut row.cells[x0..x1] {
-            *c = Cell::blank(erase);
-        }
+        row.erase(x0..x1, erase);
         if x1 == cols {
             row.wrapped = false;
         }
@@ -1185,11 +1184,11 @@ impl Terminal {
         let n = n.min(cols - x);
         // Inserting before a lead cell moves the entire character. Only
         // insertion inside its spacer splits the pair.
-        if self.grid.row(y).cells[x].flags().contains(CellFlags::WIDE_SPACER) {
+        if self.grid.row(y).cells()[x].flags().contains(CellFlags::WIDE_SPACER) {
             self.clear_wide(x, y);
         }
         let erase = self.erase_id;
-        let cells = &mut self.grid.row_mut(y).cells;
+        let cells = self.grid.row_mut(y).cells_mut();
         cells[x..].rotate_right(n);
         for c in &mut cells[x..x + n] {
             *c = Cell::blank(erase);
@@ -1209,7 +1208,7 @@ impl Terminal {
         self.clear_wide(x, y);
         self.clear_wide(x + n - 1, y);
         let erase = self.erase_id;
-        let cells = &mut self.grid.row_mut(y).cells;
+        let cells = self.grid.row_mut(y).cells_mut();
         cells[x..].rotate_left(n);
         for c in &mut cells[cols - n..] {
             *c = Cell::blank(erase);
@@ -1354,7 +1353,7 @@ impl Terminal {
         self.mode.remove(TermMode::ORIGIN);
         for y in 0..self.lines() {
             let row = self.grid.row_mut(y);
-            row.cells.fill(Cell::new('E', StyleId::DEFAULT, CellFlags::empty()));
+            row.cells_mut().fill(Cell::new('E', StyleId::DEFAULT, CellFlags::empty()));
             row.wrapped = false;
         }
         self.goto(0, 0);

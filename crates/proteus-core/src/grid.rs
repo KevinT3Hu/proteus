@@ -112,7 +112,7 @@ impl Grid {
         self.dropped = first;
     }
     pub fn cell_mut(&mut self, x: usize, y: usize) -> &mut Cell {
-        &mut self.row_mut(y).cells[x]
+        self.row_mut(y).cell_mut(x)
     }
 
     // --- viewport (scrollback viewing) -----------------------------------
@@ -178,15 +178,19 @@ impl Grid {
     }
 
     /// The top screen row moves into history and a blank row of `style`
-    /// appears at the bottom, reusing a released row's memory if possible.
+    /// appears at the bottom. With history full, the oldest row's memory is
+    /// reused for one of them.
     fn push_screen_row(&mut self, style: StyleId) {
-        let top = self.history_len();
-        let mut buf = self.rows[top].archive();
-        if buf.is_none() && self.rows.len() >= self.lines + self.max_scrollback {
-            buf = self.rows.pop_front().map(|r| r.cells);
+        let mut spare = None;
+        if self.rows.len() >= self.lines + self.max_scrollback {
+            spare = self.rows.pop_front().map(Row::into_cells);
             self.dropped += 1;
         }
-        let mut row = Row { cells: buf.unwrap_or_default(), wrapped: false };
+        let top = self.history_len();
+        let mut row = match self.rows[top].archive(&mut spare) {
+            Some(row) => row,
+            None => Row::from_cells(spare.unwrap_or_default(), false),
+        };
         row.reset(self.cols, style);
         self.rows.push_back(row);
     }
@@ -303,15 +307,15 @@ impl Grid {
             for (k, row) in rows.iter_mut().enumerate().take(end + 1).skip(start) {
                 row_starts.push(cells.len());
                 let is_last = k == end;
-                let mut len = if is_last { row.content_len() } else { row.cells.len() };
-                if !is_last && len > 0 && row.cells[len - 1].flags().contains(CellFlags::LEADING_WIDE_SPACER) {
+                let mut len = if is_last { row.content_len() } else { row.len() };
+                if !is_last && len > 0 && row.cells()[len - 1].flags().contains(CellFlags::LEADING_WIDE_SPACER) {
                     len -= 1;
                 }
                 if k == cursor_idx {
                     cursor_off = Some(cells.len() + cursor_col);
                 }
                 // Free each old row as it is consumed to bound the peak.
-                cells.extend(std::mem::take(&mut row.cells).into_iter().take(len));
+                cells.extend(row.take_cells().into_iter().take(len));
             }
 
             // Rewrap into `cols`. Unwrapped rows are padded at the end, once
@@ -324,7 +328,7 @@ impl Grid {
                 if wrapped {
                     c.resize(cols, Cell::default());
                 }
-                out.push(Row { cells: c, wrapped });
+                out.push(Row::from_cells(c, wrapped));
             };
             let cell_count = cells.len();
             for cell in cells {
@@ -376,9 +380,9 @@ impl Grid {
         let history = out.len() - lines;
         for (n, row) in out.iter_mut().enumerate() {
             if n >= history || row.wrapped {
-                row.cells.resize(cols, Cell::default());
-            } else if row.cells.len() * 4 <= row.cells.capacity() * 3 {
-                row.cells.shrink_to_fit();
+                row.pad_to(cols);
+            } else {
+                row.compact();
             }
         }
 
@@ -468,7 +472,7 @@ mod tests {
         g.cell_mut(1, 1).set_flags(CellFlags::WIDE_SPACER);
         g.reflow(6, 2, 2, 1, false);
         assert_eq!(text(&g, 0), "abc中");
-        assert!(g.row(0).cells[3].flags().contains(CellFlags::WIDE));
+        assert!(g.row(0).cells()[3].flags().contains(CellFlags::WIDE));
     }
 
     #[test]

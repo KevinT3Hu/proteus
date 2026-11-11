@@ -109,7 +109,7 @@ fn long_osc8_ids_and_notifications_are_bounded() {
     let mut t = term(20, 2);
     let id = "i".repeat(10_000);
     t.advance(format!("\x1b]8;id={id};https://example.com\x1b\\L\x1b]8;;\x1b\\").as_bytes());
-    let cell = &t.grid().row(0).cells[0];
+    let cell = &t.grid().row(0).cells()[0];
     let link = t.style(cell.style).hyperlink.and_then(|h| t.hyperlink(h)).unwrap();
     assert_eq!(link.uri, "https://example.com");
     assert!(link.id.is_none());

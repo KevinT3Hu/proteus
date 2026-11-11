@@ -85,7 +85,7 @@ struct Prev {
 pub fn runs(row: &Row, styles: &StyleTable) -> Vec<Run> {
     let mut out: Vec<Run> = Vec::new();
     let mut prev: Option<Prev> = None;
-    for (x, cell) in row.cells.iter().enumerate() {
+    for (x, cell) in row.cells().iter().enumerate() {
         if cell.ch() != PLACEHOLDER {
             continue;
         }

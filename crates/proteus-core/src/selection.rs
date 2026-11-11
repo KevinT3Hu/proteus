@@ -120,12 +120,12 @@ enum Class {
 
 fn class(grid: &Grid, p: Point, separators: &str) -> Option<Class> {
     let row = grid.abs_row(p.line)?;
-    let Some(mut cell) = row.cells.get(p.col) else {
+    let Some(mut cell) = row.cells().get(p.col) else {
         // History rows do not store trailing blanks.
         return (p.col < grid.cols()).then_some(Class::Space);
     };
     if cell.flags().contains(CellFlags::WIDE_SPACER) && p.col > 0 {
-        cell = &row.cells[p.col - 1];
+        cell = &row.cells()[p.col - 1];
     }
     if cell.flags().contains(CellFlags::LEADING_WIDE_SPACER) {
         return Some(Class::Word);

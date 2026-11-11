@@ -174,15 +174,32 @@ impl Cell {
 }
 
 /// A row of cells. `wrapped` means the logical line continues on the next row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Row {
-    pub cells: Vec<Cell>,
+    cells: Vec<Cell>,
     pub wrapped: bool,
+    /// Every cell from this index on is empty ([`Cell::is_empty`]), so
+    /// per-line work only touches the written part of the row. Cells change
+    /// only through `Row` methods, which keep it up to date.
+    blank_from: usize,
 }
+
+impl PartialEq for Row {
+    fn eq(&self, other: &Self) -> bool {
+        self.cells == other.cells && self.wrapped == other.wrapped
+    }
+}
+
+impl Eq for Row {}
 
 impl Row {
     pub fn new(cols: usize, style: StyleId) -> Self {
-        Self { cells: vec![Cell::blank(style); cols], wrapped: false }
+        let blank_from = if style == StyleId::DEFAULT { 0 } else { cols };
+        Self { cells: vec![Cell::blank(style); cols], wrapped: false, blank_from }
+    }
+
+    pub(crate) fn from_cells(cells: Vec<Cell>, wrapped: bool) -> Self {
+        Self { blank_from: cells.len(), cells, wrapped }
     }
 
     pub fn len(&self) -> usize {
@@ -193,23 +210,97 @@ impl Row {
         self.cells.is_empty()
     }
 
+    pub fn cells(&self) -> &[Cell] {
+        &self.cells
+    }
+
+    /// All cells for writing.
+    pub(crate) fn cells_mut(&mut self) -> &mut [Cell] {
+        self.cells_to(self.cells.len())
+    }
+
+    pub(crate) fn cell_mut(&mut self, x: usize) -> &mut Cell {
+        &mut self.cells_to(x + 1)[x]
+    }
+
+    pub(crate) fn into_cells(self) -> Vec<Cell> {
+        self.cells
+    }
+
+    /// Move the cells out, leaving the row without any.
+    pub(crate) fn take_cells(&mut self) -> Vec<Cell> {
+        self.blank_from = 0;
+        std::mem::take(&mut self.cells)
+    }
+
+    /// Pad with empty cells, or cut, to `cols` cells.
+    pub(crate) fn pad_to(&mut self, cols: usize) {
+        self.cells.resize(cols, Cell::default());
+        self.blank_from = self.blank_from.min(cols);
+    }
+
+    /// Give back memory when a quarter or more of the allocation is unused.
+    pub(crate) fn compact(&mut self) {
+        if self.cells.len() * 4 <= self.cells.capacity() * 3 {
+            self.cells.shrink_to_fit();
+        }
+    }
+
+    /// The cells before `end` for writing; the cells from `end` on stay as they are.
+    pub(crate) fn cells_to(&mut self, end: usize) -> &mut [Cell] {
+        let end = end.min(self.cells.len());
+        if end > self.blank_from {
+            self.blank_from = end;
+        }
+        &mut self.cells[..end]
+    }
+
+    /// End of the part of the row that may hold content.
+    fn written(&self) -> usize {
+        let end = self.blank_from.min(self.cells.len());
+        debug_assert!(self.cells[end..].iter().all(Cell::is_empty), "cells past blank_from must be empty");
+        end
+    }
+
     /// Reset every cell to blank with the given style.
     pub fn clear(&mut self, style: StyleId) {
-        self.cells.fill(Cell::blank(style));
+        let end = if style == StyleId::DEFAULT { self.written() } else { self.cells.len() };
+        self.cells[..end].fill(Cell::blank(style));
+        self.blank_from = if style == StyleId::DEFAULT { 0 } else { self.cells.len() };
         self.wrapped = false;
+    }
+
+    /// Blank `range` with `style`.
+    pub(crate) fn erase(&mut self, range: std::ops::Range<usize>, style: StyleId) {
+        let range = range.start.min(self.cells.len())..range.end.min(self.cells.len());
+        self.cells[range.clone()].fill(Cell::blank(style));
+        if style != StyleId::DEFAULT {
+            self.blank_from = self.blank_from.max(range.end);
+        } else if range.end >= self.blank_from {
+            self.blank_from = self.blank_from.min(range.start);
+        }
     }
 
     /// Make this a blank row of `cols` cells, reusing its allocation.
     pub fn reset(&mut self, cols: usize, style: StyleId) {
-        self.cells.clear();
-        self.cells.resize(cols, Cell::blank(style));
+        if style == StyleId::DEFAULT {
+            let end = self.written().min(cols);
+            self.cells[..end].fill(Cell::default());
+            self.cells.resize(cols, Cell::default());
+            self.blank_from = 0;
+        } else {
+            self.cells.clear();
+            self.cells.resize(cols, Cell::blank(style));
+            self.blank_from = cols;
+        }
         self.wrapped = false;
     }
 
-    /// The row moves into history: drop trailing blanks when that saves
-    /// memory. Returns the full-width buffer it gave up (empty) for reuse.
-    /// Soft-wrapped rows keep their width: their trailing blanks are text.
-    pub(crate) fn archive(&mut self) -> Option<Vec<Cell>> {
+    /// The row moves into history: when that saves memory, it keeps only
+    /// its content, in `spare`'s allocation if one is given. Returns the
+    /// full-width row it gave up, now blank, for reuse. Soft-wrapped rows
+    /// keep their width: their trailing blanks are text.
+    pub(crate) fn archive(&mut self, spare: &mut Option<Vec<Cell>>) -> Option<Row> {
         if self.wrapped {
             return None;
         }
@@ -217,15 +308,27 @@ impl Row {
         if len * 4 > self.cells.len() * 3 {
             return None;
         }
-        let mut buf = std::mem::replace(&mut self.cells, Vec::with_capacity(len));
-        buf.truncate(len);
-        self.cells.append(&mut buf);
-        Some(buf)
+        let mut kept = match spare.take() {
+            Some(mut v) => {
+                v.clear();
+                // Rows in history should not hold much more memory than they use.
+                if v.capacity() > len + len / 2 + 8 {
+                    v.shrink_to(len);
+                }
+                v.reserve_exact(len);
+                v
+            }
+            None => Vec::with_capacity(len),
+        };
+        kept.extend(self.cells[..len].iter_mut().map(std::mem::take));
+        let full = std::mem::replace(&mut self.cells, kept);
+        self.blank_from = len;
+        Some(Row { cells: full, wrapped: false, blank_from: 0 })
     }
 
     /// Number of cells up to and including the last non-empty one.
     pub fn content_len(&self) -> usize {
-        self.cells.iter().rposition(|c| !c.is_empty()).map_or(0, |i| i + 1)
+        self.cells[..self.written()].iter().rposition(|c| !c.is_empty()).map_or(0, |i| i + 1)
     }
 
     pub fn is_blank(&self) -> bool {
@@ -248,6 +351,7 @@ impl Row {
     pub fn resize(&mut self, cols: usize, style: StyleId) {
         if cols < self.cells.len() {
             self.cells.truncate(cols);
+            self.blank_from = self.blank_from.min(cols);
             if let Some(last) = self.cells.last_mut()
                 && last.flags().contains(CellFlags::WIDE)
             {
@@ -260,7 +364,11 @@ impl Row {
             {
                 *last = Cell::blank(last.style);
             }
+            self.blank_from = self.written();
             self.cells.resize(cols, Cell::blank(style));
+            if style != StyleId::DEFAULT {
+                self.blank_from = cols;
+            }
         }
     }
 }

@@ -247,7 +247,7 @@ impl App {
             Motion::Left | Motion::Right => {
                 let x = layout.visual(c.cursor.col);
                 let row = t.grid().abs_row(c.cursor.line);
-                let width = row.and_then(|r| r.cells.get(c.cursor.col)).map_or(1, |c| c.width().max(1));
+                let width = row.and_then(|r| r.cells().get(c.cursor.col)).map_or(1, |c| c.width().max(1));
                 let x = if m == Motion::Left { x.saturating_sub(1) } else { (x + width).min(t.cols() - 1) };
                 to = Point::new(c.cursor.line, layout.logical(x));
             }

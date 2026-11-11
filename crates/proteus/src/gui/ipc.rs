@@ -57,7 +57,7 @@ impl App {
                     let Some(row) = grid.abs_row(line) else {
                         continue;
                     };
-                    for cell in &row.cells {
+                    for cell in row.cells() {
                         bytes = bytes.saturating_add(cell.ch().len_utf8() + cell.extra().map_or(0, str::len));
                     }
                     bytes = bytes.saturating_add(1);

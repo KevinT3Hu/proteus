@@ -135,7 +135,7 @@ pub fn logical_line_into(grid: &Grid, line: Line, out: &mut LogicalLine) {
     let mut l = line;
     while let Some(row) = grid.abs_row(l) {
         let len = if row.wrapped { row.len() } else { row.content_len() };
-        for (col, cell) in row.cells[..len].iter().enumerate() {
+        for (col, cell) in row.cells()[..len].iter().enumerate() {
             if cell.is_spacer() {
                 continue;
             }

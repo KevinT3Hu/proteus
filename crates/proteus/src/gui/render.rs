@@ -957,7 +957,7 @@ impl Renderer {
             let layout = t.visual_row(line);
             let key = {
                 let mut h = self.row_hasher.build_hasher();
-                (context, y, line, &row.cells, is_cursor_row).hash(&mut h);
+                (context, y, line, row.cells(), is_cursor_row).hash(&mut h);
                 if let Some(r) = selection.filter(|r| r.start.line <= line && line <= r.end.line) {
                     (r.start, r.end, r.rect).hash(&mut h);
                 }
@@ -993,7 +993,7 @@ impl Renderer {
             let mut x = 0;
             // History rows do not store trailing blanks.
             while x < cols {
-                let cell = row.cells.get(x).unwrap_or(&BLANK_CELL);
+                let cell = row.cells().get(x).unwrap_or(&BLANK_CELL);
                 let flags = cell.flags();
                 let width = if flags.contains(CellFlags::WIDE) { 2 } else { 1 };
                 if flags.contains(CellFlags::WIDE_SPACER) {

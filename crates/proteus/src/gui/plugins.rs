@@ -1611,7 +1611,7 @@ impl App {
                 None => &s.term,
             };
             let logical = t.visual_row(t.grid().viewport_line(row as usize)).logical(col as usize);
-            let cell = t.grid().row(row as usize).cells.get(logical)?;
+            let cell = t.grid().row(row as usize).cells().get(logical)?;
             Some(t.hyperlink(t.style(cell.style).hyperlink?)?.uri.clone())
         });
         if button == PButton::Left
@@ -1924,9 +1924,9 @@ mod tests {
         assert_eq!(t.row_text(0), "ab中文");
         assert_eq!(t.row_text(1), "x]52;c");
         assert_eq!(t.row_text(2), "link");
-        let st = t.style(t.grid().row(0).cells[2].style);
+        let st = t.style(t.grid().row(0).cells()[2].style);
         assert!(st.attrs.contains(proteus_core::style::Attrs::BOLD));
-        let link = t.style(t.grid().row(2).cells[0].style).hyperlink.and_then(|h| t.hyperlink(h)).unwrap();
+        let link = t.style(t.grid().row(2).cells()[0].style).hyperlink.and_then(|h| t.hyperlink(h)).unwrap();
         assert_eq!(link.uri, "https://e.x/q");
         assert_eq!((t.cursor().x, t.cursor().y, t.cursor_visible()), (1, 0, true));
         // Too many rows are cut off.
