@@ -98,17 +98,26 @@ fn refine(kind: &HintKind, s: &str, range: Range<usize>) -> Option<Range<usize>>
     let t = &s[range.clone()];
     match kind {
         HintKind::Url => {
+            // Open minus close brackets in `t[..end]`; only closers are trimmed.
+            let balance =
+                |open: u8, close: u8| t.bytes().fold(0isize, |n, b| n + (b == open) as isize - (b == close) as isize);
+            let (mut parens, mut brackets) = (balance(b'(', b')'), balance(b'[', b']'));
             let mut end = t.len();
-            loop {
-                let cut = &t[..end];
-                let last = cut.chars().last()?;
-                let unbalanced =
-                    |open: char, close: char| last == close && cut.matches(open).count() < cut.matches(close).count();
-                if ".,:;!?'\"".contains(last) || unbalanced('(', ')') || unbalanced('[', ']') {
-                    end -= last.len_utf8();
-                } else {
+            while let Some(last) = t[..end].chars().next_back() {
+                let trim = match last {
+                    ')' => parens < 0,
+                    ']' => brackets < 0,
+                    _ => ".,:;!?'\"".contains(last),
+                };
+                if !trim {
                     break;
                 }
+                match last {
+                    ')' => parens += 1,
+                    ']' => brackets += 1,
+                    _ => {}
+                }
+                end -= last.len_utf8();
             }
             let min = t.find("://").map_or(0, |i| i + 3);
             (end > min).then(|| range.start..range.start + end)

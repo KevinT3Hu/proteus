@@ -91,6 +91,9 @@ impl Cache {
     pub fn clear(&mut self) {
         self.rows.clear();
     }
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
     /// The shared layout of rows shown in logical order.
     pub fn identity(&self) -> Arc<RowLayout> {
         Arc::clone(&self.identity)

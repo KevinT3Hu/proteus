@@ -2,11 +2,12 @@
 //! and iTerm2 inline images (`OSC 1337 File=`), plus the APC pre-filter that
 //! `vte` lacks.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
-use super::{BASE64, Terminal, join_params};
+use super::{BASE64, Terminal, join_params, lossy};
 use crate::event::Terminator;
 use crate::graphics::kitty::{self, Command, Error, err};
 use crate::graphics::media::{self, Medium};
@@ -62,11 +63,118 @@ pub(super) struct HeldReply {
     put: Result<(), Error>,
 }
 
+/// What a background decode is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Purpose {
+    /// Fill in the pixels of a loading image.
+    Fill,
+    /// Only report whether the data decodes (`a=q`).
+    Query,
+    /// Add or edit an animation frame (`a=f`).
+    Frame,
+}
+
+/// Encoded image data to turn into RGBA on a decoder thread.
+struct DecodeJob {
+    data: Vec<u8>,
+    /// zlib compressed (`o=z`).
+    inflate: bool,
+    /// Raw pixels as `(format, width, height)`; `None` for an image file format.
+    raw: Option<(u32, u32, u32)>,
+}
+
+/// Inflated bytes read to find the size of a compressed image file.
+const HEADER_BYTES: usize = 64 << 10;
+
+/// The decode size cap and decoder scratch allowance for an encoded image.
+fn decode_limits(data: &[u8], configured_max: usize) -> (usize, usize) {
+    let frame = image_dimensions(data)
+        .and_then(|(w, h)| (w as usize).checked_mul(h as usize)?.checked_mul(4))
+        .unwrap_or(1 << 20)
+        .min(configured_max);
+    // Each GIF frame takes at least 12 bytes (image descriptor and data);
+    // its decoder composites onto a canvas besides the frame.
+    if data.starts_with(b"GIF8") {
+        (frame.saturating_mul(data.len() / 12 + 1).min(configured_max), frame.saturating_mul(2))
+    } else {
+        (frame, frame)
+    }
+}
+
+fn decode_error(e: DecodeError) -> Error {
+    match e {
+        DecodeError::TooLarge => err("EFBIG", "Image too large"),
+        DecodeError::Invalid(_) => err("EBADPNG", "Failed to decode image"),
+    }
+}
+
+/// Whether the payload of `cmd` is zlib compressed (`o=z`).
+fn kitty_compressed(cmd: &Command) -> Result<bool, Error> {
+    match cmd.ch(b'o', 0) {
+        0 => Ok(false),
+        b'z' => Ok(true),
+        _ => Err(err("EINVAL", "Unknown compression")),
+    }
+}
+
+impl DecodeJob {
+    /// Memory the decode may take besides the input.
+    fn allowance(&self, max: usize) -> usize {
+        let inflated = if self.inflate { max } else { 0 };
+        let output = match self.raw {
+            Some((_, w, h)) => (w as usize).saturating_mul(h as usize).saturating_mul(4).min(max),
+            // The image is unknown until inflated: assume the worst (a GIF).
+            None if self.inflate => max.saturating_mul(3),
+            None => {
+                let (out, scratch) = decode_limits(&self.data, max);
+                out.saturating_add(scratch)
+            }
+        };
+        inflated.saturating_add(output)
+    }
+
+    /// Pixel size of the image, read from its header if need be.
+    fn dimensions(&self) -> Result<(u32, u32), Error> {
+        match self.raw {
+            Some((_, w, h)) if w > 0 && h > 0 => Ok((w, h)),
+            Some(_) => Err(err("EINVAL", "Image dimensions not specified")),
+            None => {
+                let head;
+                let data = if self.inflate {
+                    head = kitty::inflate_head(&self.data, HEADER_BYTES);
+                    &head
+                } else {
+                    &self.data
+                };
+                match image_dimensions(data) {
+                    Some((w, h)) if w > 0 && h > 0 => Ok((w, h)),
+                    _ => {
+                        crate::graphics::log_decode_failure(data, "unreadable or empty image header");
+                        Err(err("EBADPNG", "Failed to decode image"))
+                    }
+                }
+            }
+        }
+    }
+
+    fn run(self, max: usize) -> Result<DecodedImage, Error> {
+        let data = if self.inflate { kitty::inflate(&self.data, max)? } else { self.data };
+        match self.raw {
+            Some((format, w, h)) => {
+                let px = kitty::to_rgba(format, data, w, h, max)?;
+                Ok(DecodedImage { width: px.width, height: px.height, format: None, frames: vec![(px.rgba, 0)] })
+            }
+            None => decode_image(&data, decode_limits(&data, max).0).map_err(decode_error),
+        }
+    }
+}
+
 /// Result of a background decode.
 pub(super) struct Decoded {
     key: u64,
+    purpose: Purpose,
     _permit: Option<crate::graphics::DecodePermit>,
-    result: Result<DecodedImage, DecodeError>,
+    result: Result<DecodedImage, Error>,
     reply: Option<HeldReply>,
 }
 
@@ -77,6 +185,8 @@ pub(super) struct Decodes {
     pending: usize,
     /// Frame and animation commands waiting for their image to decode.
     deferred: Vec<(u64, Command)>,
+    /// Images with a frame being decoded.
+    frames: Vec<u64>,
 }
 
 /// Most commands held back until an image decodes.
@@ -85,7 +195,14 @@ const MAX_DEFERRED: usize = 64;
 impl Default for Decodes {
     fn default() -> Self {
         let (tx, rx) = channel();
-        Self { tx, rx, pending: 0, deferred: Vec::new() }
+        Self { tx, rx, pending: 0, deferred: Vec::new(), frames: Vec::new() }
+    }
+}
+
+impl Decodes {
+    /// Commands needing the pixels of image `key` must wait.
+    fn busy(&self, key: u64) -> bool {
+        self.frames.contains(&key) || self.deferred.iter().any(|(k, _)| *k == key)
     }
 }
 
@@ -112,6 +229,33 @@ fn parse_dim(v: &str) -> Dim {
     } else {
         v.parse().map_or(Dim::Auto, Dim::Cells)
     }
+}
+
+/// Split the parameters after `File=` into the arguments and the data after
+/// the first `:`. The data is borrowed unless it spans several parameters.
+fn split_file<'a>(parts: &[&'a [u8]]) -> (String, Cow<'a, [u8]>) {
+    let colon = parts.iter().enumerate().find_map(|(i, p)| Some((i, p.iter().position(|&b| b == b':')?)));
+    let Some((i, at)) = colon else {
+        return (lossy(&parts.join(&b';')), Cow::Borrowed(&[]));
+    };
+    let mut args = parts[..i].join(&b';');
+    if i > 0 {
+        args.push(b';');
+    }
+    args.extend_from_slice(&parts[i][..at]);
+    let data = &parts[i][at + 1..];
+    let data = match &parts[i + 1..] {
+        [] => Cow::Borrowed(data),
+        rest => {
+            let mut joined = data.to_vec();
+            for p in rest {
+                joined.push(b';');
+                joined.extend_from_slice(p);
+            }
+            Cow::Owned(joined)
+        }
+    };
+    (lossy(&args), data)
 }
 
 impl Terminal {
@@ -245,15 +389,10 @@ impl Terminal {
                     self.apc = Apc::BodyEsc;
                 }
                 Apc::BodyEsc => {
-                    let mut data = std::mem::take(&mut self.apc_buf);
+                    let data = std::mem::take(&mut self.apc_buf);
                     if !std::mem::take(&mut self.apc_overflow) {
-                        self.apc_dispatch(&data);
+                        self.apc_dispatch(data);
                     }
-                    data.clear();
-                    if data.capacity() > OSC_SHRINK {
-                        data = Vec::new();
-                    }
-                    self.apc_buf = data;
                     if bytes[i] == b'\\' {
                         self.advance_parser(parser, b"\x1b\\");
                         start = i + 1;
@@ -277,8 +416,9 @@ impl Terminal {
     /// Only iTerm2 images (OSC 1337) may be as large as an image; everything
     /// else fits the largest clipboard write (OSC 52).
     fn max_osc(&self) -> usize {
-        let image =
-            self.osc_head.starts_with(b"1337;") || (self.osc_head.len() < 5 && b"1337;".starts_with(&self.osc_head));
+        let image = self.config.graphics.enabled
+            && (self.osc_head.starts_with(b"1337;")
+                || (self.osc_head.len() < 5 && b"1337;".starts_with(&self.osc_head)));
         let max =
             if image { super::MAX_OSC52.max(self.config.graphics.max_image_bytes / 3 * 4) } else { super::MAX_OSC52 };
         max + 8192
@@ -295,6 +435,12 @@ impl Terminal {
         if self.apc_overflow {
             return;
         }
+        // Kitty graphics are the only APC strings in use.
+        if !self.config.graphics.enabled {
+            self.apc_overflow = true;
+            self.apc_buf = Vec::new();
+            return;
+        }
         let max = self.config.graphics.max_image_bytes / 3 * 4 + 8192;
         if self.apc_buf.len() + chunk.len() > max {
             tracing::debug!(kind = "apc", size = self.apc_buf.len() + chunk.len(), max, "dropping oversized string");
@@ -305,10 +451,10 @@ impl Terminal {
         }
     }
 
-    fn apc_dispatch(&mut self, data: &[u8]) {
-        if let Some(rest) = data.strip_prefix(b"G")
+    fn apc_dispatch(&mut self, data: Vec<u8>) {
+        if data.first() == Some(&b'G')
             && self.config.graphics.enabled
-            && let Some(cmd) = Command::parse(rest)
+            && let Some(cmd) = Command::parse(data, 1)
         {
             self.kitty(cmd);
         }
@@ -395,7 +541,8 @@ impl Terminal {
             self.images.upload = None;
         }
         if cmd.more() && cmd.ch(b't', b'd') == b'd' && matches!(cmd.action(), b't' | b'T' | b'q' | b'f') {
-            let data = cmd.payload.clone();
+            let mut cmd = cmd;
+            let data = std::mem::take(&mut cmd.payload);
             self.images.upload = Some(Upload { cmd, data });
             return;
         }
@@ -413,8 +560,7 @@ impl Terminal {
         if matches!(cmd.action(), b'f' | b'a' | b'c') {
             self.poll_images();
             if let Ok(key) = self.kitty_lookup(&cmd)
-                && (self.images.image(key).is_some_and(|i| i.is_loading())
-                    || self.decodes.deferred.iter().any(|(k, _)| *k == key))
+                && (self.images.image(key).is_some_and(|i| i.is_loading()) || self.decodes.busy(key))
             {
                 let held: usize = self.decodes.deferred.iter().map(|(_, c)| c.payload.len()).sum();
                 let max = self.config.graphics.max_image_bytes / 3 * 4 + 8192;
@@ -428,6 +574,7 @@ impl Terminal {
         }
         match cmd.action() {
             b't' | b'T' | b'q' => self.kitty_transmit(cmd),
+            b'f' if self.decode_in_background(&cmd) => self.kitty_frame_later(cmd),
             b'f' => {
                 let r = self.kitty_frame(&cmd);
                 self.kitty_reply(&cmd, id, number, 0, r);
@@ -511,6 +658,12 @@ impl Terminal {
 
     /// Payload bytes after medium and compression handling.
     fn kitty_data(&self, cmd: &Command) -> Result<Vec<u8>, Error> {
+        let data = self.kitty_payload(cmd)?;
+        if kitty_compressed(cmd)? { kitty::inflate(&data, self.config.graphics.max_image_bytes) } else { Ok(data) }
+    }
+
+    /// Payload bytes after medium handling, still compressed.
+    fn kitty_payload(&self, cmd: &Command) -> Result<Vec<u8>, Error> {
         let max = self.config.graphics.max_image_bytes;
         let raw = BASE64.decode(&cmd.payload).map_err(|_| err("EINVAL", "Invalid base64 data"))?;
         let medium = match cmd.ch(b't', b'd') {
@@ -539,11 +692,31 @@ impl Terminal {
                 media::read(m, &raw, cmd.u(b'S') as u64, cmd.u(b'O') as u64, max).map_err(|_| bad())?
             }
         };
-        match cmd.ch(b'o', 0) {
-            0 => Ok(data),
-            b'z' => kitty::inflate(&data, max),
-            _ => Err(err("EINVAL", "Unknown compression")),
-        }
+        Ok(data)
+    }
+
+    /// Whether inflating or decoding the payload of `cmd` should happen on a
+    /// decoder thread: small payloads may expand to large images.
+    fn decode_in_background(&self, cmd: &Command) -> bool {
+        let file_format = cmd.has(b'f') && cmd.u(b'f') == 100;
+        (file_format || cmd.ch(b'o', 0) == b'z') && self.config.graphics.waker.is_some()
+    }
+
+    /// Prepare the payload of `cmd` for a decoder thread; raw pixels without
+    /// `s`/`v` take the size `default`.
+    fn kitty_job(&self, cmd: &Command, default: (u32, u32)) -> Result<DecodeJob, Error> {
+        let inflate = kitty_compressed(cmd)?;
+        let format = if cmd.has(b'f') { cmd.u(b'f') } else { 32 };
+        let raw = match format {
+            100 => None,
+            24 | 32 => {
+                let (w, h) = (cmd.u(b's'), cmd.u(b'v'));
+                let (w, h) = if w == 0 && h == 0 { default } else { (w, h) };
+                Some((format, w, h))
+            }
+            _ => return Err(err("EINVAL", "Unknown image format")),
+        };
+        Ok(DecodeJob { data: self.kitty_payload(cmd)?, inflate, raw })
     }
 
     fn kitty_pixels(&self, cmd: &Command, default: (u32, u32)) -> Result<kitty::Pixels, Error> {
@@ -556,9 +729,8 @@ impl Terminal {
 
     fn kitty_transmit(&mut self, cmd: Command) {
         let (id, number) = (cmd.id(), cmd.number());
-        let png = cmd.has(b'f') && cmd.u(b'f') == 100;
-        if png && cmd.action() != b'q' && self.config.graphics.waker.is_some() {
-            return self.kitty_transmit_later(cmd);
+        if self.decode_in_background(&cmd) {
+            return if cmd.action() == b'q' { self.kitty_query_later(cmd) } else { self.kitty_transmit_later(cmd) };
         }
         let px = match self.kitty_pixels(&cmd, (0, 0)) {
             Ok(p) => p,
@@ -594,21 +766,35 @@ impl Terminal {
         }
     }
 
+    /// `a=q` of a compressed image: decode in the background, reply when done.
+    fn kitty_query_later(&mut self, mut cmd: Command) {
+        let (id, number) = (cmd.id(), cmd.number());
+        // Nobody would hear the answer.
+        if (id == 0 && number == 0) || cmd.quiet() >= 2 {
+            return;
+        }
+        match self.kitty_job(&cmd, (0, 0)) {
+            Ok(job) => {
+                cmd.payload = Vec::new();
+                let reply = HeldReply { cmd, id, number, pid: 0, put: Ok(()) };
+                self.decode_later(0, Purpose::Query, job, Some(reply));
+            }
+            Err(e) => self.kitty_reply(&cmd, id, number, 0, Err(e)),
+        }
+    }
+
     /// `a=t`/`a=T` of a compressed image: store and place it with its
     /// declared size right away, decode in the background, reply when done.
     fn kitty_transmit_later(&mut self, cmd: Command) {
         let (id, number) = (cmd.id(), cmd.number());
-        let data = match self.kitty_data(&cmd) {
-            Ok(d) => d,
+        let job = match self.kitty_job(&cmd, (0, 0)) {
+            Ok(j) => j,
             Err(e) => return self.kitty_reply(&cmd, id, number, 0, Err(e)),
         };
         let max = self.config.graphics.max_image_bytes;
-        let (w, h) = match image_dimensions(&data) {
-            Some((w, h)) if w > 0 && h > 0 => (w, h),
-            _ => {
-                crate::graphics::log_decode_failure(&data, "unreadable or empty image header");
-                return self.kitty_reply(&cmd, id, number, 0, Err(err("EBADPNG", "Failed to decode image")));
-            }
+        let (w, h) = match job.dimensions() {
+            Ok(size) => size,
+            Err(e) => return self.kitty_reply(&cmd, id, number, 0, Err(e)),
         };
         let bytes = w as usize * h as usize * 4;
         if bytes > max {
@@ -638,44 +824,56 @@ impl Terminal {
         }
         let mut held = cmd;
         held.payload = Vec::new();
-        self.decode_later(key, data, Some(HeldReply { cmd: held, id, number, pid, put }));
+        self.decode_later(key, Purpose::Fill, job, Some(HeldReply { cmd: held, id, number, pid, put }));
+    }
+
+    /// `a=f` with a compressed frame: decode in the background, then add
+    /// the frame and reply. Later commands for the image wait for it.
+    fn kitty_frame_later(&mut self, mut cmd: Command) {
+        let (id, number) = (cmd.id(), cmd.number());
+        let prepared = self.kitty_lookup(&cmd).and_then(|key| {
+            let size = self.frame_target(key, &cmd)?;
+            Ok((key, self.kitty_job(&cmd, size)?))
+        });
+        match prepared {
+            Ok((key, job)) => {
+                cmd.payload = Vec::new();
+                let reply = HeldReply { cmd, id, number, pid: 0, put: Ok(()) };
+                self.decode_later(key, Purpose::Frame, job, Some(reply));
+            }
+            Err(e) => self.kitty_reply(&cmd, id, number, 0, Err(e)),
+        }
     }
 
     // --- background decoding -------------------------------------------------
 
-    fn decode_later(&mut self, key: u64, data: Vec<u8>, reply: Option<HeldReply>) {
+    fn decode_later(&mut self, key: u64, purpose: Purpose, job: DecodeJob, reply: Option<HeldReply>) {
         let tx = self.decodes.tx.clone();
         let waker = self.config.graphics.waker.clone();
-        let configured_max = self.config.graphics.max_image_bytes;
-        let frame = image_dimensions(&data)
-            .and_then(|(w, h)| (w as usize).checked_mul(h as usize)?.checked_mul(4))
-            .unwrap_or(1 << 20)
-            .min(configured_max);
-        // Each GIF frame takes at least 12 bytes (image descriptor and data);
-        // its decoder composites onto a canvas besides the frame.
-        let (max, scratch) = if data.starts_with(b"GIF8") {
-            (frame.saturating_mul(data.len() / 12 + 1).min(configured_max), frame.saturating_mul(2))
-        } else {
-            (frame, frame)
-        };
+        let max = self.config.graphics.max_image_bytes;
         self.decodes.pending += 1;
-        let need = data.len().saturating_add(max).saturating_add(scratch);
+        if purpose == Purpose::Frame {
+            self.decodes.frames.push(key);
+        }
+        let need = job.data.len().saturating_add(job.allowance(max));
         let Some(permit) = crate::graphics::reserve_decode(need) else {
-            self.finish_decode(Decoded { key, _permit: None, result: Err(DecodeError::TooLarge), reply });
+            let result = Err(err("EFBIG", "Image too large"));
+            self.finish_decode(Decoded { key, purpose, _permit: None, result, reply });
             return;
         };
         run_in_background(Box::new(move || {
-            let decode = std::panic::AssertUnwindSafe(|| decode_image(&data, max));
+            let len = job.data.len();
+            let decode = std::panic::AssertUnwindSafe(|| job.run(max));
             let result = std::panic::catch_unwind(decode).unwrap_or_else(|payload| {
                 let message = payload
                     .downcast_ref::<&str>()
                     .copied()
                     .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
                     .unwrap_or("non-string panic payload");
-                tracing::error!(panic = message, len = data.len(), "image decoder panicked");
-                Err(DecodeError::Invalid("panic".into()))
+                tracing::error!(panic = message, len, "image decoder panicked");
+                Err(err("EBADPNG", "Failed to decode image"))
             });
-            if tx.send(Decoded { key, _permit: Some(permit), result, reply }).is_ok()
+            if tx.send(Decoded { key, purpose, _permit: Some(permit), result, reply }).is_ok()
                 && let Some(w) = waker
             {
                 (w.0)();
@@ -696,8 +894,8 @@ impl Terminal {
 
     /// Drop commands waiting for images that were removed meanwhile.
     fn prune_deferred(&mut self) {
-        let (a, b) = (&self.images, &self.images_inactive);
-        let waiting = |k: u64| a.image(k).or_else(|| b.image(k)).is_some_and(|i| i.is_loading());
+        let (a, b, frames) = (&self.images, &self.images_inactive, &self.decodes.frames);
+        let waiting = |k: u64| frames.contains(&k) || a.image(k).or_else(|| b.image(k)).is_some_and(|i| i.is_loading());
         if self.decodes.deferred.iter().all(|(k, _)| waiting(*k)) {
             return;
         }
@@ -711,17 +909,48 @@ impl Terminal {
 
     fn finish_decode(&mut self, d: Decoded) {
         self.decodes.pending = self.decodes.pending.saturating_sub(1);
-        self.damage.images = true;
         let key = d.key;
+        match d.purpose {
+            Purpose::Fill => self.finish_fill(key, d.result, d.reply),
+            Purpose::Query => {
+                if let Some(r) = d.reply {
+                    self.kitty_reply(&r.cmd, r.id, r.number, 0, d.result.map(drop));
+                }
+                return;
+            }
+            Purpose::Frame => {
+                if let Some(i) = self.decodes.frames.iter().position(|k| *k == key) {
+                    self.decodes.frames.swap_remove(i);
+                }
+                if let Some(r) = d.reply {
+                    let added = d.result.and_then(|mut dec| {
+                        let (rgba, _) = dec.frames.swap_remove(0);
+                        self.add_frame(key, &r.cmd, kitty::Pixels { width: dec.width, height: dec.height, rgba })
+                    });
+                    self.kitty_reply(&r.cmd, r.id, r.number, 0, added);
+                }
+            }
+        }
+        if self.decodes.deferred.iter().any(|(k, _)| *k == key) {
+            let (ready, rest) = std::mem::take(&mut self.decodes.deferred).into_iter().partition(|(k, _)| *k == key);
+            self.decodes.deferred = rest;
+            for (_, cmd) in ready {
+                self.kitty_run(cmd);
+            }
+        }
+    }
+
+    /// Fill in the pixels of the loading image `key`.
+    fn finish_fill(&mut self, key: u64, result: Result<DecodedImage, Error>, reply: Option<HeldReply>) {
+        self.damage.images = true;
         let primary = self.images.image(key).is_some();
         let (store, other) = if primary {
             (&mut self.images, self.images_inactive.bytes())
         } else {
             (&mut self.images_inactive, self.images.bytes())
         };
-        let outcome = match d.result {
-            Err(DecodeError::TooLarge) => Err(err("EFBIG", "Image too large")),
-            Err(DecodeError::Invalid(_)) => Err(err("EBADPNG", "Failed to decode image")),
+        let outcome = match result {
+            Err(e) => Err(e),
             Ok(dec) => match store.image_mut(key) {
                 // Deleted meanwhile, or evicted: nothing to fill in.
                 None => Ok(()),
@@ -746,7 +975,7 @@ impl Terminal {
                     img.generation += 1;
                     // Animated (iTerm2 GIF): the other frames need room too.
                     let rest: Vec<(Vec<u8>, u32)> =
-                        if d.reply.is_none() { frames.take(MAX_FRAMES - 1).collect() } else { Vec::new() };
+                        if reply.is_none() { frames.take(MAX_FRAMES - 1).collect() } else { Vec::new() };
                     let need = rest.len() * img.extra_frame_bytes();
                     if !rest.is_empty() {
                         if store.reserve(need, other, &self.config.graphics, Some(key)).is_ok() {
@@ -770,15 +999,8 @@ impl Terminal {
             store.remove_image(key);
             store.free_anonymous();
         }
-        if let Some(r) = d.reply {
+        if let Some(r) = reply {
             self.kitty_reply(&r.cmd, r.id, r.number, r.pid, outcome.and(r.put));
-        }
-        if self.decodes.deferred.iter().any(|(k, _)| *k == key) {
-            let (ready, rest) = std::mem::take(&mut self.decodes.deferred).into_iter().partition(|(k, _)| *k == key);
-            self.decodes.deferred = rest;
-            for (_, cmd) in ready {
-                self.kitty_run(cmd);
-            }
         }
     }
 
@@ -931,6 +1153,13 @@ impl Terminal {
 
     fn kitty_frame(&mut self, cmd: &Command) -> Result<(), Error> {
         let key = self.kitty_lookup(cmd)?;
+        let size = self.frame_target(key, cmd)?;
+        let px = self.kitty_pixels(cmd, size)?;
+        self.add_frame(key, cmd, px)
+    }
+
+    /// Size of image `key` if it can take the frame of `cmd`.
+    fn frame_target(&self, key: u64, cmd: &Command) -> Result<(u32, u32), Error> {
         let img = self.images.image(key).ok_or_else(|| err("ENOENT", "Image not found"))?;
         if img.evicted {
             return Err(err("ENOSPC", "Image data was evicted"));
@@ -939,11 +1168,15 @@ impl Terminal {
             return Err(err("ENOSPC", "Too many frames"));
         }
         let (iw, ih) = img.size();
-        let px = self.kitty_pixels(cmd, (iw, ih))?;
-        let (x, y) = (cmd.u(b'x'), cmd.u(b'y'));
-        if x >= iw || y >= ih {
+        if cmd.u(b'x') >= iw || cmd.u(b'y') >= ih {
             return Err(err("EINVAL", "Frame offset out of bounds"));
         }
+        Ok((iw, ih))
+    }
+
+    fn add_frame(&mut self, key: u64, cmd: &Command, px: kitty::Pixels) -> Result<(), Error> {
+        let (iw, ih) = self.frame_target(key, cmd)?;
+        let (x, y) = (cmd.u(b'x'), cmd.u(b'y'));
         let rect = PxRect { x: 0, y: 0, w: px.width.min(iw - x), h: px.height.min(ih - y) };
         let replace = cmd.u(b'X') == 1;
         let gap = cmd.i(b'z');
@@ -1198,36 +1431,48 @@ impl Terminal {
     }
 
     /// OSC 1337 (iTerm2): `File=`, multipart files and `ReportCellSize`.
+    /// Works on the parser's parameter slices so the payload is not copied.
     pub(super) fn osc_iterm(&mut self, params: &[&[u8]], term: Terminator) {
-        let body = join_params(params, 1);
+        let body = params.get(1..).unwrap_or_default();
+        let first = body.first().copied().unwrap_or_default();
+        let is = |s: &[u8]| body.len() == 1 && first == s;
         let max = self.config.graphics.max_image_bytes / 3 * 4 + 8192;
-        if !body.starts_with("FilePart=") && body != "FileEnd" {
+        if !first.starts_with(b"FilePart=") && !is(b"FileEnd") {
             self.iterm_multipart = None;
         }
-        if let Some(rest) = body.strip_prefix("File=") {
-            let (args, data) = rest.split_once(':').unwrap_or((rest, ""));
-            self.iterm_file(args, data.as_bytes());
-        } else if let Some(args) = body.strip_prefix("MultipartFile=") {
-            self.iterm_multipart = Some((args.to_string(), Vec::new()));
-        } else if let Some(part) = body.strip_prefix("FilePart=") {
+        if let Some(rest) = first.strip_prefix(b"File=") {
+            let mut parts = body.to_vec();
+            parts[0] = rest;
+            let (args, data) = split_file(&parts);
+            self.iterm_file(&args, &data);
+        } else if first.starts_with(b"MultipartFile=") {
+            let args = join_params(body, 0).split_off("MultipartFile=".len());
+            self.iterm_multipart = Some((args, Vec::new()));
+        } else if let Some(part) = first.strip_prefix(b"FilePart=") {
+            let rest = &body[1..];
+            let len = part.len() + rest.iter().map(|p| p.len() + 1).sum::<usize>();
             if let Some((_, buf)) = &mut self.iterm_multipart {
-                if buf.len() + part.len() > max {
+                if buf.len() + len > max {
                     tracing::debug!(
                         kind = "iterm2 multipart file",
-                        size = buf.len() + part.len(),
+                        size = buf.len() + len,
                         max,
                         "dropping oversized string"
                     );
                     self.iterm_multipart = None;
                 } else {
-                    buf.extend_from_slice(part.as_bytes());
+                    buf.extend_from_slice(part);
+                    for p in rest {
+                        buf.push(b';');
+                        buf.extend_from_slice(p);
+                    }
                 }
             }
-        } else if body == "FileEnd" {
+        } else if is(b"FileEnd") {
             if let Some((args, data)) = self.iterm_multipart.take() {
                 self.iterm_file(&args, &data);
             }
-        } else if body == "ReportCellSize" {
+        } else if is(b"ReportCellSize") {
             let (cw, ch) = self.cell_pixel_size();
             self.reply(&format!("\x1b]1337;ReportCellSize={ch}.0;{cw}.0;1.0{}", term.as_str()));
         }
@@ -1323,7 +1568,7 @@ impl Terminal {
             }
             None => {
                 if let Some(key) = self.place_anonymous(Source::Iterm, w, h, None, Some(size)) {
-                    self.decode_later(key, bytes, None);
+                    self.decode_later(key, Purpose::Fill, DecodeJob { data: bytes, inflate: false, raw: None }, None);
                 }
             }
         }

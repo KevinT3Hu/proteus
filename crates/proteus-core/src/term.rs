@@ -281,7 +281,8 @@ impl Terminal {
         // Rows above the screen never change, so only layouts from the
         // block holding the top screen row onwards can go stale.
         let alt = self.is_alt_screen();
-        let stale = crate::bidi::Cache::block_start(&self.grid, self.grid.abs_line(0));
+        let stale = (!self.bidi_cache.get_mut().is_empty())
+            .then(|| crate::bidi::Cache::block_start(&self.grid, self.grid.abs_line(0)));
         self.poll_images();
         let mut parser = std::mem::take(&mut self.parser);
         self.feed(&mut parser, bytes);
@@ -290,7 +291,7 @@ impl Terminal {
         let cache = self.bidi_cache.get_mut();
         if switched {
             cache.clear();
-        } else {
+        } else if let Some(stale) = stale {
             cache.invalidate_from(stale);
         }
     }

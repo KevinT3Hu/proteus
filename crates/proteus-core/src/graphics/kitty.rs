@@ -18,13 +18,15 @@ pub(crate) struct Command {
 const CHAR_KEYS: &[u8] = b"atod";
 
 impl Command {
-    pub fn parse(data: &[u8]) -> Option<Command> {
-        let (control, payload) = match data.iter().position(|&b| b == b';') {
-            Some(i) => (&data[..i], &data[i + 1..]),
-            None => (data, &[][..]),
+    /// Parse the command in `data[start..]`; its payload keeps the allocation of `data`.
+    pub fn parse(mut data: Vec<u8>, start: usize) -> Option<Command> {
+        let body = data.get(start..)?;
+        let (control_end, payload_start) = match body.iter().position(|&b| b == b';') {
+            Some(i) => (start + i, start + i + 1),
+            None => (data.len(), data.len()),
         };
-        let mut cmd = Command { vals: [0; 128], set: 0, payload: payload.to_vec() };
-        for kv in control.split(|&b| b == b',') {
+        let mut cmd = Command { vals: [0; 128], set: 0, payload: Vec::new() };
+        for kv in data[start..control_end].split(|&b| b == b',') {
             if kv.is_empty() {
                 continue;
             }
@@ -43,6 +45,8 @@ impl Command {
             cmd.vals[*key as usize] = v;
             cmd.set |= 1 << *key;
         }
+        data.drain(..payload_start);
+        cmd.payload = data;
         Some(cmd)
     }
 
@@ -149,6 +153,11 @@ pub(crate) fn inflate(data: &[u8], max: usize) -> Result<Vec<u8>, Error> {
         .map_err(|_| err("EINVAL", "Failed to decompress image data"))
 }
 
+/// At most the first `n` inflated bytes of zlib data, enough to read an image header.
+pub(crate) fn inflate_head(data: &[u8], n: usize) -> Vec<u8> {
+    miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(data, n).unwrap_or_else(|e| e.output)
+}
+
 /// Source-over blend of one RGBA pixel onto another (non-premultiplied).
 fn blend(dst: &mut [u8], src: &[u8]) {
     let sa = src[3] as u32;
@@ -200,15 +209,15 @@ mod tests {
 
     #[test]
     fn parse_control_data() {
-        let c = Command::parse(b"a=T,f=24,s=2,v=1,i=7,z=-3;AAAA").unwrap();
+        let c = Command::parse(b"Ga=T,f=24,s=2,v=1,i=7,z=-3;AAAA".to_vec(), 1).unwrap();
         assert_eq!(c.action(), b'T');
         assert_eq!((c.u(b'f'), c.u(b's'), c.u(b'v'), c.id()), (24, 2, 1, 7));
         assert_eq!(c.i(b'z'), -3);
         assert_eq!(c.payload, b"AAAA");
         assert!(!c.has(b'm'));
-        assert!(Command::parse(b"a=Tx").is_none());
-        assert!(Command::parse(b"i=abc").is_none());
-        assert_eq!(Command::parse(b"i=4294967295").unwrap().id(), u32::MAX);
+        assert!(Command::parse(b"a=Tx".to_vec(), 0).is_none());
+        assert!(Command::parse(b"i=abc".to_vec(), 0).is_none());
+        assert_eq!(Command::parse(b"i=4294967295".to_vec(), 0).unwrap().id(), u32::MAX);
     }
 
     #[test]
