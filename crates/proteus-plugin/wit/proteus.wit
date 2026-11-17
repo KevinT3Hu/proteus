@@ -389,7 +389,8 @@ interface host {
     open-surface: func(options: surface-options) -> result<surface-id, string>;
     /// Update a surface title without reopening it (only surfaces owned by this instance).
     set-surface-title: func(surface: surface-id, title: string) -> result<_, string>;
-    /// Replace what a surface shows.
+    /// Replace what a surface shows. Returns before the terminal shows the
+    /// frame: errors it finds then (the surface was closed) go to its log.
     draw: func(surface: surface-id, frame: frame) -> result<_, string>;
     close-surface: func(surface: surface-id);
     /// Give a surface the keyboard.

@@ -7,7 +7,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use proteus_wasm::types::{Event, PaneInfo};
-use proteus_wasm::{Call, FromPlugin, Key, Permissions, Reply, Runtime, Spec};
+use proteus_wasm::{Ack, Call, FromPlugin, Key, Permissions, Reply, Runtime, Spec};
 
 /// A real fixture component. Missing prerequisites fail rather than skip tests.
 fn fixture() -> &'static [u8] {
@@ -106,7 +106,7 @@ impl Host {
                         Call::OpenSurface(_) => Ok(Reply::Surface(7)),
                         _ => Ok(Reply::Unit),
                     };
-                    if let Some(r) = reply {
+                    if let Ack::Answer(r) = reply {
                         let _ = r.send(answer);
                     }
                     match c {
@@ -292,18 +292,29 @@ fn plugin_reads_its_own_config() {
 }
 
 #[test]
-fn host_flood_has_one_in_flight_call_and_stop_interrupts_backpressure() {
+fn host_flood_is_bounded_by_unhandled_calls_and_stop_interrupts_backpressure() {
     let h = start("host-flood", Permissions { ui: true, ..Default::default() });
     h.wait(|m| matches!(m, FromPlugin::Started));
     h.handle.event(Event::Action("host-flood".into()));
+    // Logs need no answer: the plugin sends several before the host handles any.
+    let mut held = Vec::new();
+    for _ in 0..64 {
+        let (_, message) = h.rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let FromPlugin::Call(Call::Log(_), Ack::Done(credit)) = message else { panic!("expected an unanswered log") };
+        held.push(credit);
+    }
+    // None of them handled yet: no more may queue.
+    assert!(matches!(h.rx.recv_timeout(Duration::from_millis(100)), Err(mpsc::RecvTimeoutError::Timeout)));
+    // Handling one lets one more through.
+    held.pop();
     let (_, message) = h.rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    let FromPlugin::Call(Call::Log(_), Some(reply)) = message else { panic!("expected acknowledged log") };
-    // The GUI has not consumed/acknowledged this call: no more calls may queue.
+    let FromPlugin::Call(Call::Log(_), Ack::Done(credit)) = message else { panic!("expected an unanswered log") };
+    held.push(credit);
     assert!(matches!(h.rx.recv_timeout(Duration::from_millis(100)), Err(mpsc::RecvTimeoutError::Timeout)));
     h.handle.stop();
     let (_, message) = h.rx.recv_timeout(Duration::from_secs(2)).unwrap();
     assert!(matches!(message, FromPlugin::Failed(_) | FromPlugin::Exited));
-    drop(reply);
+    drop(held);
 }
 
 #[test]

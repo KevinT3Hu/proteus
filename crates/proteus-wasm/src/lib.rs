@@ -12,6 +12,7 @@ mod limits;
 pub mod manifest;
 pub mod net;
 mod output;
+mod pool;
 pub mod process;
 pub mod runtime;
 pub mod secrets;
@@ -20,7 +21,9 @@ pub mod storage;
 
 pub use manifest::{FsGrant, Manifest, Permissions};
 pub use output::printable;
-pub use runtime::{Answer, Call, FromPlugin, Handle, Key, Pixels, Reply, Responder, Runtime, Sink, Spec, types};
+pub use runtime::{
+    Ack, Answer, Call, Credit, FromPlugin, Handle, Key, Pixels, Reply, Responder, Runtime, Sink, Spec, types,
+};
 pub use source::{Cache, Resolved, Source};
 
 /// Characters that would let plugin-supplied text hide or reorder what the

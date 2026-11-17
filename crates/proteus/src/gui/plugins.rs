@@ -16,7 +16,7 @@ use proteus_core::Terminal;
 use proteus_wasm::types::{
     self, Attrs, Color, Event, Frame, MouseButton as PButton, Placement, StatusSide, SurfaceKind, UiEvent,
 };
-use proteus_wasm::{Answer, Cache, Call, FromPlugin, Key, Pixels, Reply, Resolved, Responder, Runtime, Spec};
+use proteus_wasm::{Ack, Answer, Cache, Call, FromPlugin, Key, Pixels, Reply, Resolved, Responder, Runtime, Spec};
 use smithay_client_toolkit::reexports::calloop::timer::{TimeoutAction, Timer};
 use unicode_width::UnicodeWidthChar;
 
@@ -663,16 +663,25 @@ impl App {
     pub(super) fn plugin_msg(&mut self, key: Key, m: FromPlugin) {
         let current = self.pl.running.get(&key.id).is_some_and(|r| r.handle.key == key);
         match m {
-            FromPlugin::Call(Call::ClipboardRead, Some(reply)) if current => {
+            FromPlugin::Call(Call::ClipboardRead, Ack::Answer(reply)) if current => {
                 self.pl.next_ask += 1;
                 let n = self.pl.next_ask;
                 self.pl.clip_waiters.insert(n, reply);
                 self.read_clipboard(super::ClipboardKind::Clipboard, super::ClipTarget::Plugin(n));
             }
-            FromPlugin::Call(call, reply) => {
+            FromPlugin::Call(call, ack) => {
                 let answer = if current { self.plugin_call(&key, call) } else { Err("the plugin was stopped".into()) };
-                if let Some(r) = reply {
-                    let _ = r.send(answer);
+                match ack {
+                    Ack::Answer(r) => {
+                        let _ = r.send(answer);
+                    }
+                    Ack::Done(_credit) => {
+                        if let Err(e) = answer
+                            && current
+                        {
+                            tracing::debug!(plugin = %key.id, error = %e, "plugin call failed");
+                        }
+                    }
                 }
             }
             _ if !current => {}

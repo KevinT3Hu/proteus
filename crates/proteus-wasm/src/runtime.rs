@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::limits::Limits;
@@ -163,9 +163,71 @@ pub type Answer = Result<Reply, String>;
 /// Where a call's answer goes.
 pub type Responder = mpsc::Sender<Answer>;
 
+/// How the host acknowledges a call.
+pub enum Ack {
+    /// The plugin waits for the answer.
+    Answer(Responder),
+    /// The plugin went on without waiting (logging, notices, drawing,
+    /// status). Drop this once the call is handled; errors are only logged.
+    Done(Credit),
+}
+
+/// Calls a plugin may have sent without waiting that the host has not
+/// handled yet. A single call may be bigger than the byte limit.
+const MAX_UNANSWERED: usize = 64;
+const MAX_UNANSWERED_BYTES: usize = 8 << 20;
+
+/// How often waiting helpers and plugins look at the stop flag.
+const POLL: Duration = Duration::from_millis(50);
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The unanswered calls of one plugin: (count, bytes).
+#[derive(Default)]
+struct Window {
+    used: Mutex<(usize, usize)>,
+    freed: Condvar,
+}
+
+impl Window {
+    /// Waits for room; `None` once the plugin is stopped.
+    fn acquire(self: &Arc<Self>, bytes: usize, stop: &AtomicBool) -> Option<Credit> {
+        let mut used = lock(&self.used);
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                return None;
+            }
+            if used.0 == 0 || (used.0 < MAX_UNANSWERED && used.1 + bytes <= MAX_UNANSWERED_BYTES) {
+                break;
+            }
+            used = self.freed.wait_timeout(used, POLL).unwrap_or_else(std::sync::PoisonError::into_inner).0;
+        }
+        used.0 += 1;
+        used.1 += bytes;
+        Some(Credit { window: self.clone(), bytes })
+    }
+}
+
+/// A call sent without waiting, until the host drops it.
+pub struct Credit {
+    window: Arc<Window>,
+    bytes: usize,
+}
+
+impl Drop for Credit {
+    fn drop(&mut self) {
+        let mut used = lock(&self.window.used);
+        used.0 -= 1;
+        used.1 -= self.bytes;
+        self.window.freed.notify_one();
+    }
+}
+
 /// What plugins tell the host.
 pub enum FromPlugin {
-    Call(Call, Option<Responder>),
+    Call(Call, Ack),
     /// `init` returned fine.
     Started,
     /// Trapped, ran too long, ran out of memory, or `init` failed. The
@@ -196,6 +258,20 @@ fn coalesced(e: &Event) -> Option<(PaneId, u8)> {
     }
 }
 
+/// Woken whenever a plugin takes a message from its queue.
+#[derive(Default)]
+struct Progress {
+    lock: Mutex<()>,
+    taken: Condvar,
+}
+
+impl Progress {
+    fn notify(&self) {
+        let _guard = lock(&self.lock);
+        self.taken.notify_all();
+    }
+}
+
 /// Sends events to a plugin from helper threads (processes, HTTP, file
 /// watches).
 #[derive(Clone)]
@@ -204,6 +280,7 @@ pub struct Poster {
     backlog: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     pending: Pending,
+    progress: Arc<Progress>,
 }
 
 impl Poster {
@@ -213,17 +290,29 @@ impl Poster {
     }
 
     fn event_until(&self, e: Event, cancel: &AtomicBool) -> bool {
-        let mut m = ToPlugin::Event(e);
+        let mut m = Some(ToPlugin::Event(e));
+        self.wait(cancel, || match self.tx.try_send(m.take().expect("put back when full")) {
+            Ok(()) => Some(true),
+            Err(mpsc::TrySendError::Full(back)) => {
+                m = Some(back);
+                None
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => Some(false),
+        })
+    }
+
+    /// Try `attempt` again each time the plugin takes a message, until it
+    /// has an outcome. False once the plugin is stopped or `cancel` is set.
+    fn wait(&self, cancel: &AtomicBool, mut attempt: impl FnMut() -> Option<bool>) -> bool {
+        let mut guard = lock(&self.progress.lock);
         loop {
             if self.stopped() || cancel.load(Ordering::Relaxed) {
                 return false;
             }
-            match self.tx.try_send(m) {
-                Ok(()) => return true,
-                Err(mpsc::TrySendError::Full(back)) => m = back,
-                Err(mpsc::TrySendError::Disconnected(_)) => return false,
+            if let Some(outcome) = attempt() {
+                return outcome;
             }
-            std::thread::sleep(Duration::from_millis(5));
+            guard = self.progress.taken.wait_timeout(guard, POLL).unwrap_or_else(std::sync::PoisonError::into_inner).0;
         }
     }
 
@@ -238,13 +327,7 @@ impl Poster {
     }
 
     pub(crate) fn data_until(&self, n: usize, e: Event, cancel: &AtomicBool) -> bool {
-        while self.backlog.load(Ordering::Relaxed) > MAX_BACKLOG {
-            if self.stopped() || cancel.load(Ordering::Relaxed) {
-                return false;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        if cancel.load(Ordering::Relaxed) {
+        if !self.wait(cancel, || (self.backlog.load(Ordering::Relaxed) <= MAX_BACKLOG).then_some(true)) {
             return false;
         }
         self.backlog.fetch_add(n, Ordering::Relaxed);
@@ -254,7 +337,14 @@ impl Poster {
     #[cfg(test)]
     pub(crate) fn testing() -> (Self, mpsc::Receiver<ToPlugin>) {
         let (tx, rx) = mpsc::sync_channel(QUEUE);
-        (Self { tx, backlog: Arc::default(), stop: Arc::default(), pending: Arc::default() }, rx)
+        let post = Self {
+            tx,
+            backlog: Arc::default(),
+            stop: Arc::default(),
+            pending: Arc::default(),
+            progress: Arc::default(),
+        };
+        (post, rx)
     }
 }
 
@@ -314,7 +404,13 @@ impl Runtime {
         let key = spec.key.clone();
         let granted = spec.granted.clone();
         let pending = Pending::default();
-        let poster = Poster { tx: tx.clone(), backlog: Arc::default(), stop: stop.clone(), pending: pending.clone() };
+        let poster = Poster {
+            tx: tx.clone(),
+            backlog: Arc::default(),
+            stop: stop.clone(),
+            pending: pending.clone(),
+            progress: Arc::default(),
+        };
         let (engine, cache) = (self.engine.clone(), self.cache.clone());
         std::thread::Builder::new()
             .name(format!("plugin {}", spec.key.id))
@@ -449,6 +545,7 @@ struct State {
     rate_calls: usize,
     free_window: Instant,
     free_calls: usize,
+    unanswered: Arc<Window>,
 }
 
 impl WasiView for State {
@@ -499,15 +596,13 @@ impl State {
         self.excluded(|s| {
             let (tx, rx) = mpsc::channel();
             let span = tracing::Span::current();
-            std::thread::Builder::new()
-                .name("plugin-call".into())
-                .spawn(move || {
-                    let _entered = span.enter();
-                    let _ = tx.send(f());
-                })
-                .map_err(|e| e.to_string())?;
+            crate::pool::run(Box::new(move || {
+                let _entered = span.enter();
+                let _ = tx.send(f());
+            }))
+            .map_err(|e| e.to_string())?;
             loop {
-                match rx.recv_timeout(Duration::from_millis(50)) {
+                match rx.recv_timeout(POLL) {
                     Ok(v) => return Ok(v),
                     Err(RecvTimeoutError::Timeout) if !s.stop.load(Ordering::Relaxed) => {}
                     Err(_) => return Err("stopped".into()),
@@ -516,8 +611,9 @@ impl State {
         })
     }
 
-    /// Send one bounded call and wait for its consumption.
-    fn rpc(&mut self, call: Call) -> Answer {
+    /// Count a call against the rate and size limits; over them the plugin
+    /// is stopped.
+    fn admit(&mut self, call: &Call) -> Result<(), String> {
         if self.stop.load(Ordering::Acquire) {
             return Err("stopped".into());
         }
@@ -526,19 +622,35 @@ impl State {
             self.rate_calls = 0;
         }
         self.rate_calls += 1;
-        if self.rate_calls > 2000 || call_bytes(&call) > 4 << 20 {
+        if self.rate_calls > 2000 || call_bytes(call) > 4 << 20 {
             let e = "plugin exceeded host call rate or message size limit".to_string();
             self.fault = Some(e.clone());
             self.stop.store(true, Ordering::Release);
             return Err(e);
         }
-        // Every call is acknowledged after consumption, including drawing and
-        // logging. A plugin can have only one host message in flight.
+        Ok(())
+    }
+
+    /// Send a call without waiting for the host to handle it, once fewer
+    /// than `MAX_UNANSWERED` are unhandled. The host handles calls in the
+    /// order they were sent, these and those of [`State::rpc`] alike.
+    fn tell(&mut self, call: Call) -> Result<(), String> {
+        self.admit(&call)?;
+        let bytes = call_bytes(&call);
+        let window = self.unanswered.clone();
+        let credit = self.uncharged(|s| window.acquire(bytes, &s.stop)).ok_or("stopped")?;
+        (self.sink)(self.key.clone(), FromPlugin::Call(call, Ack::Done(credit)));
+        Ok(())
+    }
+
+    /// Send one call and wait for its answer.
+    fn rpc(&mut self, call: Call) -> Answer {
+        self.admit(&call)?;
         let (tx, rx) = mpsc::channel();
-        (self.sink)(self.key.clone(), FromPlugin::Call(call, Some(tx)));
+        (self.sink)(self.key.clone(), FromPlugin::Call(call, Ack::Answer(tx)));
         self.uncharged(|s| {
             loop {
-                match rx.recv_timeout(Duration::from_millis(50)) {
+                match rx.recv_timeout(POLL) {
                     Ok(answer) => break answer,
                     Err(RecvTimeoutError::Timeout) if !s.stop.load(Ordering::Relaxed) => {}
                     Err(RecvTimeoutError::Timeout) => break Err("stopped".into()),
@@ -663,11 +775,11 @@ impl proteus::plugin::host::Host for State {
     }
 
     fn log(&mut self, message: String) {
-        let _ = self.rpc(Call::Log(short(&message, 4096)));
+        let _ = self.tell(Call::Log(short(&message, 4096)));
     }
 
     fn notify(&mut self, text: String, error: bool) {
-        let _ = self.rpc(Call::Notify { text: short(&text, 1000), error });
+        let _ = self.tell(Call::Notify { text: short(&text, 1000), error });
     }
 
     fn list_panes(&mut self) -> Result<Vec<PaneInfo>, String> {
@@ -763,12 +875,12 @@ impl proteus::plugin::host::Host for State {
         if let Some(i) = frame.images.iter().find(|i| !self.images.contains_key(&i.image)) {
             return Err(format!("no image {}", i.image));
         }
-        self.rpc(Call::Draw(surface, frame)).map(|_| ())
+        self.tell(Call::Draw(surface, frame))
     }
 
     fn close_surface(&mut self, surface: SurfaceId) {
         if self.granted.ui {
-            let _ = self.rpc(Call::CloseSurface(surface));
+            let _ = self.tell(Call::CloseSurface(surface));
         }
     }
 
@@ -787,7 +899,7 @@ impl proteus::plugin::host::Host for State {
 
     fn set_status(&mut self, side: StatusSide, text: String) -> Result<(), String> {
         self.need(self.granted.ui, "ui")?;
-        self.rpc(Call::SetStatus(side, short(&text, 4096))).map(|_| ())
+        self.tell(Call::SetStatus(side, short(&text, 4096)))
     }
 
     fn register_action(&mut self, name: String, key: Option<String>) -> Result<(), String> {
@@ -830,7 +942,7 @@ impl proteus::plugin::host::Host for State {
 
     fn drop_image(&mut self, id: ImageId) {
         if self.images.remove(&id).is_some() {
-            let _ = self.rpc(Call::DropImage(id));
+            let _ = self.tell(Call::DropImage(id));
         }
     }
 
@@ -861,13 +973,13 @@ impl proteus::plugin::host::Host for State {
     fn task_update(&mut self, id: TaskId, progress: Option<f32>, message: String) {
         if self.tasks.contains(&id) {
             let progress = progress.filter(|p| p.is_finite()).map(|p| p.clamp(0.0, 1.0));
-            let _ = self.rpc(Call::TaskUpdate { id, progress, message: short(&message, 100) });
+            let _ = self.tell(Call::TaskUpdate { id, progress, message: short(&message, 100) });
         }
     }
 
     fn task_end(&mut self, id: TaskId) {
         if self.tasks.remove(&id) {
-            let _ = self.rpc(Call::TaskEnd(id));
+            let _ = self.tell(Call::TaskEnd(id));
         }
     }
 
@@ -875,7 +987,7 @@ impl proteus::plugin::host::Host for State {
         match self.excluded(|s| s.storage.get(&key)) {
             Ok(value) => value,
             Err(e) => {
-                let _ = self.rpc(Call::Notify { text: e, error: true });
+                let _ = self.tell(Call::Notify { text: e, error: true });
                 None
             }
         }
@@ -887,7 +999,7 @@ impl proteus::plugin::host::Host for State {
 
     fn storage_delete(&mut self, key: String) {
         if let Err(e) = self.excluded(|s| s.storage.delete(&key)) {
-            let _ = self.rpc(Call::Notify { text: e, error: true });
+            let _ = self.tell(Call::Notify { text: e, error: true });
         }
     }
 
@@ -895,7 +1007,7 @@ impl proteus::plugin::host::Host for State {
         match self.excluded(|s| s.storage.keys()) {
             Ok(keys) => keys,
             Err(e) => {
-                let _ = self.rpc(Call::Notify { text: e, error: true });
+                let _ = self.tell(Call::Notify { text: e, error: true });
                 Vec::new()
             }
         }
@@ -1330,6 +1442,7 @@ fn run(
     }
     let backlog = post.backlog.clone();
     let pending = post.pending.clone();
+    let progress = post.progress.clone();
     let state = State {
         config: spec.config.to_string(),
         key: spec.key.clone(),
@@ -1363,6 +1476,7 @@ fn run(
         rate_calls: 0,
         free_window: Instant::now(),
         free_calls: 0,
+        unanswered: Arc::default(),
     };
     let mut store = Store::new(engine, state);
     store.limiter(|s| &mut s.limits);
@@ -1397,11 +1511,15 @@ fn run(
         if store.data().stop.load(Ordering::Relaxed) {
             return store.data().fault.clone().map_or(Ok(()), Err);
         }
-        match next_wake(&rx, &store.data().timers) {
+        let wake = next_wake(&rx, &store.data().timers);
+        if let Wake::Message(m) = &wake {
+            if let ToPlugin::Event(Event::ProcessOutput(ProcessOutput { data, .. }) | Event::HttpBody((_, data))) = m {
+                backlog.fetch_sub(data.len(), Ordering::Relaxed);
+            }
+            progress.notify();
+        }
+        match wake {
             Wake::Message(ToPlugin::Event(e)) => {
-                if let Event::ProcessOutput(ProcessOutput { data, .. }) | Event::HttpBody((_, data)) = &e {
-                    backlog.fetch_sub(data.len(), Ordering::Relaxed);
-                }
                 let e = match coalesced(&e) {
                     Some(k) => pending.lock().ok().and_then(|mut p| p.remove(&k)).flatten().unwrap_or(e),
                     None => e,
@@ -1497,6 +1615,7 @@ mod tests {
             rate_calls: 0,
             free_window: Instant::now(),
             free_calls: 0,
+            unanswered: Arc::default(),
         };
         state.create_private("/data/staged".into(), false).unwrap();
         assert_eq!(state.file_mode("/data/staged".into()).unwrap(), 0o600);
