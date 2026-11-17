@@ -1,10 +1,13 @@
 //! Fonts: fontconfig discovery and per-character fallback, swash metrics and
 //! rasterization.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_int};
 use std::os::unix::ffi::OsStrExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::ptr::NonNull;
+use std::rc::Weak;
 use std::sync::Arc;
 
 use fontconfig_sys as fc;
@@ -12,6 +15,7 @@ use fontconfig_sys::constants::{
     FC_CHARSET, FC_COLOR, FC_FAMILY, FC_FILE, FC_INDEX, FC_MONO, FC_SLANT, FC_SLANT_ITALIC, FC_SLANT_ROMAN, FC_SPACING,
     FC_WEIGHT, FC_WEIGHT_BOLD, FC_WEIGHT_REGULAR, FC_WEIGHT_SEMIBOLD,
 };
+use rustix::mm;
 use std::rc::Rc;
 use swash::scale::image::Content;
 
@@ -38,18 +42,68 @@ pub struct Metrics {
     pub strike_y: i32,
 }
 
-struct Face {
-    data: Arc<Vec<u8>>,
+/// A font file mapped read-only into memory. Pages are read on demand, so a
+/// large CJK font costs only the tables and glyphs actually used. Package
+/// managers replace fonts by renaming, which leaves the mapping valid.
+struct FontFile {
+    ptr: NonNull<u8>,
+    len: usize,
+}
+
+// SAFETY: the mapping is private, read-only and lives until drop.
+unsafe impl Send for FontFile {}
+// SAFETY: as above; shared access only ever reads.
+unsafe impl Sync for FontFile {}
+
+impl FontFile {
+    fn open(path: &Path) -> Option<Self> {
+        let file = std::fs::File::open(path).ok()?;
+        let len = usize::try_from(file.metadata().ok()?.len()).ok().filter(|&n| n > 0)?;
+        // SAFETY: a fresh private read-only mapping of `len` bytes of an open
+        // file; nothing else aliases it.
+        let ptr = unsafe { mm::mmap(std::ptr::null_mut(), len, mm::ProtFlags::READ, mm::MapFlags::PRIVATE, &file, 0) };
+        Some(Self { ptr: NonNull::new(ptr.ok()?.cast())?, len })
+    }
+}
+
+impl std::ops::Deref for FontFile {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        // SAFETY: `ptr` maps `len` readable bytes until drop.
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+impl AsRef<[u8]> for FontFile {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
+impl Drop for FontFile {
+    fn drop(&mut self) {
+        // SAFETY: unmaps exactly the mapping created in `open`.
+        let _ = unsafe { mm::munmap(self.ptr.as_ptr().cast(), self.len) };
+    }
+}
+
+/// A parsed face of a font file, shared by every window using it.
+struct FaceData {
+    file: Arc<FontFile>,
     offset: u32,
     key: CacheKey,
     shaping: harfrust::Font,
+}
+
+struct Face {
+    data: Rc<FaceData>,
     synth_bold: bool,
     synth_italic: bool,
 }
 
 impl Face {
     fn font(&self) -> FontRef<'_> {
-        FontRef { data: &self.data, offset: self.offset, key: self.key }
+        FontRef { data: &self.data.file, offset: self.data.offset, key: self.data.key }
     }
 }
 
@@ -134,6 +188,7 @@ impl ShapeCache {
 struct FcConfig(*mut fc::FcConfig);
 
 /// Result of a fontconfig match.
+#[derive(Clone)]
 struct Match {
     family: String,
     file: PathBuf,
@@ -218,8 +273,80 @@ impl Drop for FcConfig {
     }
 }
 
-pub struct Fonts {
+/// Bound on cached fontconfig answers.
+const MATCH_CACHE: usize = 4096;
+
+type Query = (String, c_int, c_int, Vec<char>, bool);
+
+/// Fontconfig, its answers and the loaded faces, shared by every window of
+/// the GUI thread so a new window reuses what earlier ones looked up.
+#[derive(Default)]
+struct Library {
     fc: Option<FcConfig>,
+    matches: HashMap<Query, Option<Match>>,
+    faces: HashMap<(PathBuf, u32), Weak<FaceData>>,
+    files: HashMap<PathBuf, std::sync::Weak<FontFile>>,
+}
+
+thread_local! {
+    static LIBRARY: RefCell<Library> = RefCell::default();
+}
+
+impl Library {
+    fn with<R>(f: impl FnOnce(&mut Library) -> R) -> R {
+        LIBRARY.with_borrow_mut(f)
+    }
+
+    /// Load fontconfig, or reload it when its configuration or font
+    /// directories changed since. Returns whether fontconfig is usable.
+    fn refresh(&mut self) -> bool {
+        // SAFETY: `fc.0` is a live config owned by `self`.
+        let current = self.fc.as_ref().is_some_and(|fc| unsafe { fc::FcConfigUptoDate(fc.0) } != 0);
+        if !current {
+            self.fc = FcConfig::new();
+            self.matches.clear();
+            self.faces.clear();
+            self.files.clear();
+        }
+        self.fc.is_some()
+    }
+
+    fn find(&mut self, family: &str, weight: c_int, slant: c_int, chars: &[char], color: bool) -> Option<Match> {
+        let query = (family.to_owned(), weight, slant, chars.to_vec(), color);
+        if let Some(m) = self.matches.get(&query) {
+            return m.clone();
+        }
+        let m = self.fc.as_ref()?.find(family, weight, slant, chars, color);
+        if self.matches.len() >= MATCH_CACHE {
+            self.matches.clear();
+        }
+        self.matches.insert(query, m.clone());
+        m
+    }
+
+    fn face(&mut self, m: &Match) -> Option<Rc<FaceData>> {
+        let key = (m.file.clone(), m.index);
+        if let Some(face) = self.faces.get(&key).and_then(Weak::upgrade) {
+            return Some(face);
+        }
+        let file = match self.files.get(&m.file).and_then(std::sync::Weak::upgrade) {
+            Some(f) => f,
+            None => Arc::new(FontFile::open(&m.file)?),
+        };
+        let font = FontRef::from_index(&file, m.index as usize)?;
+        let (offset, cache_key) = (font.offset, font.key);
+        let source: Arc<dyn AsRef<[u8]> + Send + Sync> = file.clone();
+        let shaping = harfrust::Font::new(source, m.index)?;
+        self.files.retain(|_, f| f.strong_count() > 0);
+        self.faces.retain(|_, f| f.strong_count() > 0);
+        self.files.insert(m.file.clone(), Arc::downgrade(&file));
+        let face = Rc::new(FaceData { file, offset, key: cache_key, shaping });
+        self.faces.insert(key, Rc::downgrade(&face));
+        Some(face)
+    }
+}
+
+pub struct Fonts {
     family: String,
     settings: crate::appearance::FontSettings,
     /// Font size in points; pixels = points * 96/72 * scale.
@@ -229,7 +356,6 @@ pub struct Fonts {
     faces: Vec<Face>,
     /// Face index per style for the primary family.
     primary: [usize; STYLES],
-    files: HashMap<(PathBuf, u32), Arc<Vec<u8>>>,
     /// Fallback face per (char, style).
     fallback: HashMap<(char, u8), Option<usize>>,
     /// Faces chosen for runs per (style, script of the chars the primary
@@ -289,7 +415,6 @@ impl Fonts {
         settings: crate::appearance::FontSettings,
     ) -> Result<Fonts, String> {
         let mut f = Fonts {
-            fc: FcConfig::new(),
             family: family.to_string(),
             settings,
             size_pt,
@@ -297,7 +422,6 @@ impl Fonts {
             px: 0.0,
             faces: Vec::new(),
             primary: [0; STYLES],
-            files: HashMap::new(),
             fallback: HashMap::new(),
             run_fallback: HashMap::new(),
             glyphs: HashMap::new(),
@@ -321,25 +445,19 @@ impl Fonts {
     }
 
     fn load_face(&mut self, m: &Match, synth_bold: bool, synth_italic: bool) -> Option<usize> {
-        let key = (m.file.clone(), m.index);
-        let data = match self.files.get(&key) {
-            Some(d) => d.clone(),
-            None => {
-                let d = Arc::new(std::fs::read(&m.file).ok()?);
-                self.files.insert(key, d.clone());
-                d
-            }
-        };
-        let font = FontRef::from_index(&data, m.index as usize)?;
-        let (offset, key) = (font.offset, font.key);
-        let source: Arc<dyn AsRef<[u8]> + Send + Sync> = data.clone();
-        let shaping = harfrust::Font::new(source, m.index)?;
-        self.faces.push(Face { data, offset, key, shaping, synth_bold, synth_italic });
+        let data = Library::with(|l| l.face(m))?;
+        self.faces.push(Face { data, synth_bold, synth_italic });
         Some(self.faces.len() - 1)
     }
 
+    fn find(&self, family: &str, weight: c_int, slant: c_int, chars: &[char], color: bool) -> Option<Match> {
+        Library::with(|l| l.find(family, weight, slant, chars, color))
+    }
+
     fn load_primary(&mut self) -> Result<(), String> {
-        let fc = self.fc.as_ref().ok_or("fontconfig initialization failed")?;
+        if !Library::with(Library::refresh) {
+            return Err("fontconfig initialization failed".into());
+        }
         let mut matches = Vec::new();
         for style in 0..STYLES as u8 {
             let w = if style & BOLD != 0 { FC_WEIGHT_BOLD } else { FC_WEIGHT_REGULAR };
@@ -351,7 +469,7 @@ impl Fonts {
                 _ => None,
             }
             .unwrap_or(&self.family);
-            matches.push(fc.find(family, w, s, &[], false));
+            matches.push(self.find(family, w, s, &[], false));
         }
         let regular = matches[0].take().ok_or_else(|| format!("no font found for `{}`", self.family))?;
         self.primary[0] = self
@@ -460,7 +578,7 @@ impl Fonts {
         rtl: bool,
         ligatures: bool,
     ) -> Vec<ShapedGlyph> {
-        let face = &self.faces[face_idx];
+        let face = &self.faces[face_idx].data;
         // HarfRust retains UTF-8 cluster offsets while handling normalization,
         // variation selectors, default ignorables, and RTL mirroring.
         let mut buffer = harfrust::Buffer::new();
@@ -601,8 +719,7 @@ impl Fonts {
         if let Some(f) = self.emoji {
             return f;
         }
-        let m =
-            self.fc.as_ref().and_then(|fc| fc.find("emoji", FC_WEIGHT_REGULAR, FC_SLANT_ROMAN, &['\u{1f600}'], true));
+        let m = self.find("emoji", FC_WEIGHT_REGULAR, FC_SLANT_ROMAN, &['\u{1f600}'], true);
         let f = m.and_then(|m| self.face_for(&m, false, false));
         self.emoji = Some(f);
         f
@@ -641,7 +758,7 @@ impl Fonts {
         let w = if style & BOLD != 0 { FC_WEIGHT_BOLD } else { FC_WEIGHT_REGULAR };
         let s = if style & ITALIC != 0 { FC_SLANT_ITALIC } else { FC_SLANT_ROMAN };
         for family in self.settings.fallback_families.clone() {
-            let Some(m) = self.fc.as_ref()?.find(&family, w, s, chars, false) else {
+            let Some(m) = self.find(&family, w, s, chars, false) else {
                 continue;
             };
             let generic = matches!(
@@ -660,7 +777,7 @@ impl Fonts {
                 return Some(face);
             }
         }
-        let m = self.fc.as_ref()?.find(&self.family, w, s, chars, false)?;
+        let m = self.find(&self.family, w, s, chars, false)?;
         let synth_bold = style & BOLD != 0 && m.weight < FC_WEIGHT_SEMIBOLD;
         let synth_italic = style & ITALIC != 0 && m.slant == FC_SLANT_ROMAN;
         self.face_for(&m, synth_bold, synth_italic)
@@ -668,14 +785,16 @@ impl Fonts {
 
     /// Reuse an already loaded face for the same file and synthesis, or load it.
     fn face_for(&mut self, m: &Match, synth_bold: bool, synth_italic: bool) -> Option<usize> {
-        if let Some(data) = self.files.get(&(m.file.clone(), m.index))
-            && let Some(i) = self.faces.iter().position(|f| {
-                Arc::ptr_eq(&f.data, data) && f.synth_bold == synth_bold && f.synth_italic == synth_italic
-            })
+        let data = Library::with(|l| l.face(m))?;
+        if let Some(i) = self
+            .faces
+            .iter()
+            .position(|f| Rc::ptr_eq(&f.data, &data) && f.synth_bold == synth_bold && f.synth_italic == synth_italic)
         {
             return Some(i);
         }
-        self.load_face(m, synth_bold, synth_italic)
+        self.faces.push(Face { data, synth_bold, synth_italic });
+        Some(self.faces.len() - 1)
     }
 
     /// Glyph for a character in a style, falling back through fontconfig.
