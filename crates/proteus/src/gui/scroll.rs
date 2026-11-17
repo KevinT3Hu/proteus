@@ -776,8 +776,10 @@ impl App {
                 self.palette_update();
             }
             Edit::Prev | Edit::Next if purpose == Purpose::Palette => {
+                let query = self.w.input.as_ref().map(|i| i.text.clone()).unwrap_or_default();
+                let count = self.palette_hits(&query).len();
                 if let Some(i) = self.w.input.as_mut() {
-                    i.navigate_completions(key == Key::Up || mods.contains(Mods::SHIFT));
+                    i.navigate_completions(key == Key::Up || mods.contains(Mods::SHIFT), count);
                 }
                 self.palette_update();
             }

@@ -182,9 +182,15 @@ impl Input {
     }
 
     /// Opening the list preserves the first match; subsequent navigation moves.
-    pub fn navigate_completions(&mut self, previous: bool) {
+    /// Navigation wraps around at either end of the `count` candidates.
+    pub fn navigate_completions(&mut self, previous: bool, count: usize) {
         if self.completions {
-            self.choice = if previous { self.choice.saturating_sub(1) } else { self.choice.saturating_add(1) };
+            if count == 0 {
+                self.choice = 0;
+            } else {
+                let current = self.choice.min(count - 1);
+                self.choice = if previous { (current + count - 1) % count } else { (current + 1) % count };
+            }
         } else {
             self.completions = true;
         }
@@ -226,12 +232,16 @@ mod tests {
         // Empty input exposes every entry, not an empty completion set.
         assert_eq!(palette_rank(&items, &input.text).len(), 3);
         assert_eq!(input.key(Key::Tab, Mods::empty(), ""), Edit::Next);
-        input.navigate_completions(false);
+        input.navigate_completions(false, 3);
         assert!(input.completions);
         assert_eq!(input.choice, 0);
-        input.navigate_completions(false);
+        input.navigate_completions(false, 3);
         assert_eq!(input.choice, 1);
-        input.navigate_completions(true);
+        input.navigate_completions(true, 3);
+        assert_eq!(input.choice, 0);
+        input.navigate_completions(true, 3);
+        assert_eq!(input.choice, 2);
+        input.navigate_completions(false, 3);
         assert_eq!(input.choice, 0);
         input.insert("font");
         assert_eq!(palette_rank(&items, &input.text).len(), 2);

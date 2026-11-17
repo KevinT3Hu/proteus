@@ -163,7 +163,7 @@ impl App {
                 }
                 let up = vertical.absolute < 0. || vertical.discrete < 0 || vertical.value120 < 0;
                 if let Some(input) = self.w.input.as_mut() {
-                    input.navigate_completions(up);
+                    input.choice = if up { input.choice.saturating_sub(1) } else { input.choice.saturating_add(1) };
                 }
                 self.palette_update();
             }
