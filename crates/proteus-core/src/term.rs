@@ -727,7 +727,9 @@ impl Terminal {
     // --- internal helpers ------------------------------------------------
 
     fn reply(&mut self, s: &str) {
-        self.output.extend_from_slice(s.as_bytes());
+        if !self.decodes.queue_reply(s.as_bytes()) {
+            self.output.extend_from_slice(s.as_bytes());
+        }
     }
 
     fn damage_line(&mut self, y: usize) {
@@ -1329,6 +1331,8 @@ impl Terminal {
         fresh.palette = std::mem::take(&mut self.palette);
         fresh.palette.reset_all();
         fresh.events = std::mem::take(&mut self.events);
+        // Decodes in flight are dropped, so their replies never come.
+        self.decodes.abandon_replies(&mut self.output);
         fresh.output = std::mem::take(&mut self.output);
         fresh.notify_times = std::mem::take(&mut self.notify_times);
         fresh.cell_px = self.cell_px;

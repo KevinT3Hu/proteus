@@ -1,7 +1,7 @@
 //! Byte and message accounting held until a consumer drops its permit.
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 pub struct Budget(Arc<Inner>);
@@ -18,6 +18,10 @@ pub struct Permit {
     budget: Budget,
     bytes: usize,
 }
+
+/// The deadline passed before the budget had room.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimedOut;
 
 impl Budget {
     pub fn new(bytes: usize, messages: usize) -> Self {
@@ -37,18 +41,37 @@ impl Budget {
     /// Wait only on producer threads. Cancellation is checked even when no
     /// consumer remains to release a permit.
     pub fn acquire(&self, bytes: usize, stop: &AtomicBool) -> Option<Permit> {
+        self.acquire_until(bytes, stop, None).ok()?
+    }
+
+    /// Like [`acquire`](Self::acquire), but gives up at `deadline`.
+    /// `Ok(None)` when stopped or too large.
+    pub fn acquire_until(
+        &self,
+        bytes: usize,
+        stop: &AtomicBool,
+        deadline: Option<Instant>,
+    ) -> Result<Option<Permit>, TimedOut> {
         if bytes > self.0.limits.0 {
-            return None;
+            return Ok(None);
         }
         loop {
             if stop.load(Ordering::Acquire) {
-                return None;
+                return Ok(None);
             }
             if let Some(p) = self.try_acquire(bytes) {
-                return Some(p);
+                return Ok(Some(p));
+            }
+            let mut wait = Duration::from_millis(10);
+            if let Some(d) = deadline {
+                let left = d.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(TimedOut);
+                }
+                wait = wait.min(left);
             }
             let used = self.0.used.lock().unwrap();
-            let _ = self.0.wake.wait_timeout(used, Duration::from_millis(10)).unwrap();
+            let _ = self.0.wake.wait_timeout(used, wait).unwrap();
         }
     }
 }

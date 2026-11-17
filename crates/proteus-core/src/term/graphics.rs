@@ -3,7 +3,7 @@
 //! `vte` lacks.
 
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
@@ -61,6 +61,8 @@ pub(super) struct HeldReply {
     pid: u32,
     /// Outcome of the placement made before decoding.
     put: Result<(), Error>,
+    /// Its place in [`Decodes::replies`].
+    ticket: u64,
 }
 
 /// What a background decode is for.
@@ -81,21 +83,25 @@ struct DecodeJob {
     inflate: bool,
     /// Raw pixels as `(format, width, height)`; `None` for an image file format.
     raw: Option<(u32, u32, u32)>,
+    /// Only the first frame is used (`a=f`), so an animation is not decoded in full.
+    first_frame: bool,
 }
 
 /// Inflated bytes read to find the size of a compressed image file.
 const HEADER_BYTES: usize = 64 << 10;
 
-/// The decode size cap and decoder scratch allowance for an encoded image.
-fn decode_limits(data: &[u8], configured_max: usize) -> (usize, usize) {
-    let frame = image_dimensions(data)
+/// The decode size cap and decoder scratch allowance for an encoded image
+/// whose header is `head` and whose full length is `len`.
+fn decode_limits(head: &[u8], len: usize, configured_max: usize, first_frame: bool) -> (usize, usize) {
+    let frame = image_dimensions(head)
         .and_then(|(w, h)| (w as usize).checked_mul(h as usize)?.checked_mul(4))
         .unwrap_or(1 << 20)
         .min(configured_max);
     // Each GIF frame takes at least 12 bytes (image descriptor and data);
     // its decoder composites onto a canvas besides the frame.
-    if data.starts_with(b"GIF8") {
-        (frame.saturating_mul(data.len() / 12 + 1).min(configured_max), frame.saturating_mul(2))
+    if head.starts_with(b"GIF8") {
+        let frames = if first_frame { 1 } else { len / 12 + 1 };
+        (frame.saturating_mul(frames).min(configured_max), frame.saturating_mul(2))
     } else {
         (frame, frame)
     }
@@ -118,15 +124,32 @@ fn kitty_compressed(cmd: &Command) -> Result<bool, Error> {
 }
 
 impl DecodeJob {
+    /// Largest inflated size the payload may have.
+    fn inflate_cap(&self, max: usize) -> usize {
+        match self.raw {
+            Some((_, w, h)) => (w as usize).saturating_mul(h as usize).saturating_mul(4).min(max),
+            None => max,
+        }
+    }
+
     /// Memory the decode may take besides the input.
     fn allowance(&self, max: usize) -> usize {
-        let inflated = if self.inflate { max } else { 0 };
+        let inflated = if self.inflate { self.inflate_cap(max) } else { 0 };
         let output = match self.raw {
-            Some((_, w, h)) => (w as usize).saturating_mul(h as usize).saturating_mul(4).min(max),
-            // The image is unknown until inflated: assume the worst (a GIF).
-            None if self.inflate => max.saturating_mul(3),
+            Some(_) => self.inflate_cap(max),
+            None if self.inflate => {
+                let head = kitty::inflate_head(&self.data, HEADER_BYTES);
+                if image_dimensions(&head).is_some() {
+                    // The inflated length is unknown: assume it is the largest allowed.
+                    let (out, scratch) = decode_limits(&head, max, max, self.first_frame);
+                    out.saturating_add(scratch)
+                } else {
+                    // Unreadable header; decoding will fail, but assume the worst (a GIF).
+                    max.saturating_mul(3)
+                }
+            }
             None => {
-                let (out, scratch) = decode_limits(&self.data, max);
+                let (out, scratch) = decode_limits(&self.data, self.data.len(), max, self.first_frame);
                 out.saturating_add(scratch)
             }
         };
@@ -158,13 +181,16 @@ impl DecodeJob {
     }
 
     fn run(self, max: usize) -> Result<DecodedImage, Error> {
-        let data = if self.inflate { kitty::inflate(&self.data, max)? } else { self.data };
+        let data = if self.inflate { kitty::inflate(&self.data, self.inflate_cap(max))? } else { self.data };
         match self.raw {
             Some((format, w, h)) => {
                 let px = kitty::to_rgba(format, data, w, h, max)?;
                 Ok(DecodedImage { width: px.width, height: px.height, format: None, frames: vec![(px.rgba, 0)] })
             }
-            None => decode_image(&data, decode_limits(&data, max).0).map_err(decode_error),
+            None => {
+                let limit = decode_limits(&data, data.len(), max, self.first_frame).0;
+                decode_image(&data, limit).map_err(decode_error)
+            }
         }
     }
 }
@@ -187,6 +213,11 @@ pub(super) struct Decodes {
     deferred: Vec<(u64, Command)>,
     /// Images with a frame being decoded.
     frames: Vec<u64>,
+    /// Replies in the order they were asked for, while a held reply is
+    /// still waiting for its decode (`None`): clients such as the `a=q` then
+    /// DA1 probe rely on that order.
+    replies: VecDeque<(u64, Option<Vec<u8>>)>,
+    next_ticket: u64,
 }
 
 /// Most commands held back until an image decodes.
@@ -195,7 +226,7 @@ const MAX_DEFERRED: usize = 64;
 impl Default for Decodes {
     fn default() -> Self {
         let (tx, rx) = channel();
-        Self { tx, rx, pending: 0, deferred: Vec::new(), frames: Vec::new() }
+        Self { tx, rx, pending: 0, deferred: Vec::new(), frames: Vec::new(), replies: VecDeque::new(), next_ticket: 1 }
     }
 }
 
@@ -203,6 +234,40 @@ impl Decodes {
     /// Commands needing the pixels of image `key` must wait.
     fn busy(&self, key: u64) -> bool {
         self.frames.contains(&key) || self.deferred.iter().any(|(k, _)| *k == key)
+    }
+
+    /// Keep a place for a reply that is not known yet.
+    fn hold_reply(&mut self) -> u64 {
+        let ticket = self.next_ticket;
+        self.next_ticket += 1;
+        self.replies.push_back((ticket, None));
+        ticket
+    }
+
+    /// Queue `bytes` behind held replies; `false` when nothing is held.
+    pub(super) fn queue_reply(&mut self, bytes: &[u8]) -> bool {
+        if self.replies.is_empty() {
+            return false;
+        }
+        self.replies.push_back((0, Some(bytes.to_vec())));
+        true
+    }
+
+    /// Fill in the held reply `ticket` and move the replies now in order to `out`.
+    fn release_reply(&mut self, ticket: u64, bytes: Vec<u8>, out: &mut Vec<u8>) {
+        if let Some(slot) = self.replies.iter_mut().find(|(t, b)| *t == ticket && b.is_none()) {
+            slot.1 = Some(bytes);
+        }
+        while let Some((_, Some(_))) = self.replies.front() {
+            out.extend(self.replies.pop_front().and_then(|(_, b)| b).unwrap_or_default());
+        }
+    }
+
+    /// Give up on held replies: send the others in order.
+    pub(super) fn abandon_replies(&mut self, out: &mut Vec<u8>) {
+        for (_, b) in self.replies.drain(..) {
+            out.extend(b.unwrap_or_default());
+        }
     }
 }
 
@@ -605,6 +670,18 @@ impl Terminal {
     }
 
     fn kitty_reply(&mut self, cmd: &Command, id: u32, number: u32, pid: u32, r: Result<(), Error>) {
+        if let Some(s) = Self::kitty_reply_text(cmd, id, number, pid, r) {
+            self.reply(&s);
+        }
+    }
+
+    /// Answer a held reply in its place among the others.
+    fn kitty_held_reply(&mut self, r: &HeldReply, result: Result<(), Error>) {
+        let text = Self::kitty_reply_text(&r.cmd, r.id, r.number, r.pid, result).unwrap_or_default();
+        self.decodes.release_reply(r.ticket, text.into_bytes(), &mut self.output);
+    }
+
+    fn kitty_reply_text(cmd: &Command, id: u32, number: u32, pid: u32, r: Result<(), Error>) -> Option<String> {
         if let Err(e) = &r {
             tracing::debug!(
                 action = %char::from(cmd.action()),
@@ -616,7 +693,7 @@ impl Terminal {
             );
         }
         if id == 0 && number == 0 {
-            return;
+            return None;
         }
         let q = cmd.quiet();
         // Errors about file media all look alike so a client cannot probe files.
@@ -627,9 +704,9 @@ impl Terminal {
             r => r,
         };
         let msg = match &r {
-            Ok(()) if q >= 1 => return,
+            Ok(()) if q >= 1 => return None,
             Ok(()) => "OK",
-            Err(_) if q >= 2 => return,
+            Err(_) if q >= 2 => return None,
             Err(e) => e.as_str(),
         };
         let mut s = format!("\x1b_Gi={id}");
@@ -642,7 +719,7 @@ impl Terminal {
         s.push(';');
         s.push_str(msg);
         s.push_str("\x1b\\");
-        self.reply(&s);
+        Some(s)
     }
 
     fn kitty_lookup(&self, cmd: &Command) -> Result<u64, Error> {
@@ -716,7 +793,7 @@ impl Terminal {
             }
             _ => return Err(err("EINVAL", "Unknown image format")),
         };
-        Ok(DecodeJob { data: self.kitty_payload(cmd)?, inflate, raw })
+        Ok(DecodeJob { data: self.kitty_payload(cmd)?, inflate, raw, first_frame: cmd.action() == b'f' })
     }
 
     fn kitty_pixels(&self, cmd: &Command, default: (u32, u32)) -> Result<kitty::Pixels, Error> {
@@ -776,7 +853,7 @@ impl Terminal {
         match self.kitty_job(&cmd, (0, 0)) {
             Ok(job) => {
                 cmd.payload = Vec::new();
-                let reply = HeldReply { cmd, id, number, pid: 0, put: Ok(()) };
+                let reply = HeldReply { cmd, id, number, pid: 0, put: Ok(()), ticket: 0 };
                 self.decode_later(0, Purpose::Query, job, Some(reply));
             }
             Err(e) => self.kitty_reply(&cmd, id, number, 0, Err(e)),
@@ -824,7 +901,7 @@ impl Terminal {
         }
         let mut held = cmd;
         held.payload = Vec::new();
-        self.decode_later(key, Purpose::Fill, job, Some(HeldReply { cmd: held, id, number, pid, put }));
+        self.decode_later(key, Purpose::Fill, job, Some(HeldReply { cmd: held, id, number, pid, put, ticket: 0 }));
     }
 
     /// `a=f` with a compressed frame: decode in the background, then add
@@ -838,7 +915,7 @@ impl Terminal {
         match prepared {
             Ok((key, job)) => {
                 cmd.payload = Vec::new();
-                let reply = HeldReply { cmd, id, number, pid: 0, put: Ok(()) };
+                let reply = HeldReply { cmd, id, number, pid: 0, put: Ok(()), ticket: 0 };
                 self.decode_later(key, Purpose::Frame, job, Some(reply));
             }
             Err(e) => self.kitty_reply(&cmd, id, number, 0, Err(e)),
@@ -847,11 +924,14 @@ impl Terminal {
 
     // --- background decoding -------------------------------------------------
 
-    fn decode_later(&mut self, key: u64, purpose: Purpose, job: DecodeJob, reply: Option<HeldReply>) {
+    fn decode_later(&mut self, key: u64, purpose: Purpose, job: DecodeJob, mut reply: Option<HeldReply>) {
         let tx = self.decodes.tx.clone();
         let waker = self.config.graphics.waker.clone();
         let max = self.config.graphics.max_image_bytes;
         self.decodes.pending += 1;
+        if let Some(r) = &mut reply {
+            r.ticket = self.decodes.hold_reply();
+        }
         if purpose == Purpose::Frame {
             self.decodes.frames.push(key);
         }
@@ -914,7 +994,7 @@ impl Terminal {
             Purpose::Fill => self.finish_fill(key, d.result, d.reply),
             Purpose::Query => {
                 if let Some(r) = d.reply {
-                    self.kitty_reply(&r.cmd, r.id, r.number, 0, d.result.map(drop));
+                    self.kitty_held_reply(&r, d.result.map(drop));
                 }
                 return;
             }
@@ -927,7 +1007,7 @@ impl Terminal {
                         let (rgba, _) = dec.frames.swap_remove(0);
                         self.add_frame(key, &r.cmd, kitty::Pixels { width: dec.width, height: dec.height, rgba })
                     });
-                    self.kitty_reply(&r.cmd, r.id, r.number, 0, added);
+                    self.kitty_held_reply(&r, added);
                 }
             }
         }
@@ -999,8 +1079,9 @@ impl Terminal {
             store.remove_image(key);
             store.free_anonymous();
         }
-        if let Some(r) = reply {
-            self.kitty_reply(&r.cmd, r.id, r.number, r.pid, outcome.and(r.put));
+        if let Some(mut r) = reply {
+            let put = std::mem::replace(&mut r.put, Ok(()));
+            self.kitty_held_reply(&r, outcome.and(put));
         }
     }
 
@@ -1568,7 +1649,12 @@ impl Terminal {
             }
             None => {
                 if let Some(key) = self.place_anonymous(Source::Iterm, w, h, None, Some(size)) {
-                    self.decode_later(key, Purpose::Fill, DecodeJob { data: bytes, inflate: false, raw: None }, None);
+                    self.decode_later(
+                        key,
+                        Purpose::Fill,
+                        DecodeJob { data: bytes, inflate: false, raw: None, first_frame: false },
+                        None,
+                    );
                 }
             }
         }
@@ -1594,6 +1680,36 @@ impl Terminal {
 mod tests {
     use super::*;
     use crate::Config;
+
+    fn zlib(data: &[u8]) -> Vec<u8> {
+        miniz_oxide::deflate::compress_to_vec_zlib(data, 6)
+    }
+
+    fn png(w: u32, h: u32) -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::new(w, h).write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        buf.into_inner()
+    }
+
+    #[test]
+    fn compressed_file_allowance_follows_the_header() {
+        let max = 64 << 20;
+        let job = DecodeJob { data: zlib(&png(2, 2)), inflate: true, raw: None, first_frame: false };
+        assert_eq!(job.allowance(max), max + 2 * 16);
+        let unreadable = DecodeJob { data: zlib(b"junk"), inflate: true, raw: None, first_frame: false };
+        assert_eq!(unreadable.allowance(max), 4 * max);
+        let raw = DecodeJob { data: zlib(&[0; 16]), inflate: true, raw: Some((32, 2, 2)), first_frame: false };
+        assert_eq!(raw.allowance(max), 32);
+    }
+
+    #[test]
+    fn frame_jobs_decode_one_gif_frame() {
+        let gif = b"GIF89a".to_vec();
+        let all = decode_limits(&gif, 12 * 100, 64 << 20, false).0;
+        let one = decode_limits(&gif, 12 * 100, 64 << 20, true).0;
+        assert!(all > one);
+        assert_eq!(one, 1 << 20);
+    }
 
     #[test]
     fn deferred_commands_are_capped_and_dropped_with_their_image() {

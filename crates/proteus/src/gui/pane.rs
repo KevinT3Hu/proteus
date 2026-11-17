@@ -22,9 +22,11 @@ use crate::spec::Cmd;
 
 /// How often the fallback title (foreground process) is re-read.
 const PROC_REFRESH: Duration = Duration::from_secs(1);
-/// Pty output sent to the GUI in one message once this much is collected;
-/// below the per-pane budget so several batches can be in flight.
-const READ_BATCH: usize = 32 << 10;
+/// Pty output sent to the GUI in one message once this much is collected.
+/// With one more read on top, two batches fit the per-pane budget (64 KiB).
+const READ_BATCH: usize = 24 << 10;
+/// Longest wait for pty output or for room in the output budget.
+const IDLE_POLL: Duration = Duration::from_millis(50);
 
 pub struct Pane {
     pub term: Terminal,
@@ -176,29 +178,19 @@ impl Pane {
             // out in one message, and while the GUI is behind, output keeps
             // collecting here instead of in many small messages.
             let mut batch: Vec<u8> = Vec::new();
-            // Send `batch`, waiting for room if `wait`. `Some(false)`: no room yet.
-            let send = |batch: &mut Vec<u8>, wait: bool| -> Option<bool> {
+            // Send `batch`, waiting for room until `deadline` (or for as long
+            // as it takes). `Some(false)`: no room by the deadline.
+            let send = |batch: &mut Vec<u8>, deadline: Option<Instant>| -> Option<bool> {
                 let n = batch.len();
-                let local = if wait {
-                    pending.acquire(n, &stop)?
-                } else {
-                    match pending.try_acquire(n) {
-                        Some(p) => p,
-                        None => return Some(false),
-                    }
-                };
-                let global = match total.try_acquire(n) {
-                    Some(p) => p,
-                    None if wait => total.acquire(n, &stop)?,
-                    None => return Some(false),
-                };
+                let Ok(local) = pending.acquire_until(n, &stop, deadline) else { return Some(false) };
+                let Ok(global) = total.acquire_until(n, &stop, deadline) else { return Some(false) };
                 tracing::trace!(bytes = n, "pty output");
                 let data = std::mem::take(batch);
-                tx.send(Msg::Pty(id, data, (local, global))).ok().map(|()| true)
+                tx.send(Msg::Pty(id, data, (local?, global?))).ok().map(|()| true)
             };
-            let poll = |reader: &std::fs::File, ms: u64| -> rustix::io::Result<()> {
+            let poll = |reader: &std::fs::File, wait: Duration| -> rustix::io::Result<()> {
                 let mut polls = [rustix::event::PollFd::new(reader, rustix::event::PollFlags::IN)];
-                let wait = rustix::event::Timespec::try_from(Duration::from_millis(ms)).expect("small timeout");
+                let wait = rustix::event::Timespec::try_from(wait).expect("small timeout");
                 match rustix::event::poll(&mut polls, Some(&wait)) {
                     Err(rustix::io::Errno::INTR) => Ok(()),
                     r => r.map(drop),
@@ -210,7 +202,7 @@ impl Pane {
                     return;
                 }
                 if batch.len() >= READ_BATCH {
-                    match send(&mut batch, true) {
+                    match send(&mut batch, None) {
                         Some(true) => continue,
                         _ => return,
                     }
@@ -220,19 +212,18 @@ impl Pane {
                     Ok(n) => batch.extend_from_slice(&buf[..n]),
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        // Nothing more is ready. Readiness wakes immediately on
-                        // output; the timeouts only exist to notice a closed
-                        // pane, or room for the batch.
-                        let ms = if batch.is_empty() {
-                            50
-                        } else {
-                            match send(&mut batch, false) {
+                        // Nothing more is ready. While the GUI is behind, wait
+                        // for room for the batch for a while, then go back to
+                        // collecting whatever the pty has meanwhile.
+                        if !batch.is_empty() {
+                            match send(&mut batch, Some(Instant::now() + IDLE_POLL)) {
                                 None => return,
-                                Some(true) => continue,
-                                Some(false) => 2,
+                                Some(_) => continue,
                             }
-                        };
-                        if let Err(e) = poll(&reader, ms) {
+                        }
+                        // Readiness wakes immediately on output; the timeout
+                        // only exists to notice a closed pane.
+                        if let Err(e) = poll(&reader, IDLE_POLL) {
                             tracing::warn!("pty poll failed: {e}");
                             break;
                         }
@@ -248,7 +239,7 @@ impl Pane {
                     }
                 }
             }
-            if !batch.is_empty() && send(&mut batch, true).is_none() {
+            if !batch.is_empty() && send(&mut batch, None).is_none() {
                 return;
             }
             let _ = tx.send(Msg::PtyClosed(id));

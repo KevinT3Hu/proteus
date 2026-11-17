@@ -407,6 +407,28 @@ fn background_decode_places_first_and_replies_later() {
 }
 
 #[test]
+fn background_query_replies_before_later_replies() {
+    let (c, woken) = background();
+    let mut t = term_with(20, 10, c);
+    feed(&mut t, &apc("a=q,f=100,i=31", &png(1, 1, [1, 2, 3, 255])));
+    feed(&mut t, "\x1b[c");
+    assert_eq!(out(&mut t), "");
+    settle(&mut t, &woken, 1);
+    let reply = out(&mut t);
+    assert!(reply.starts_with("\x1b_Gi=31;OK\x1b\\\x1b[?"), "{reply:?}");
+}
+
+#[test]
+fn reset_sends_replies_held_behind_a_decode() {
+    let (c, _) = background();
+    let mut t = term_with(20, 10, c);
+    feed(&mut t, &apc("a=q,f=100,i=31", &png(1, 1, [1, 2, 3, 255])));
+    feed(&mut t, "\x1b[c\x1bc\x1b[c");
+    let reply = out(&mut t);
+    assert_eq!(reply.matches("\x1b[?").count(), 2, "{reply:?}");
+}
+
+#[test]
 fn background_decode_failure_removes_the_image() {
     let (c, woken) = background();
     let mut t = term_with(20, 10, c);
