@@ -89,7 +89,7 @@ impl App {
                 let current = self.focused_pane().name.clone().unwrap_or_default();
                 self.open_input(Purpose::RenamePane(old), &current, "empty: automatic title".into());
             }
-            Action::ResetRenderer => self.recover_gpu(self.w.id),
+            Action::ResetRenderer => self.recover_gpu(),
             Action::ExportScrollback => {
                 self.open_input(Purpose::ExportScrollback(old), "", self.cfg.i18n.t("hint-export-scrollback", &[]));
             }

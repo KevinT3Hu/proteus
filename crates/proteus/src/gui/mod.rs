@@ -163,7 +163,7 @@ pub(crate) enum ClipTarget {
 pub(crate) enum Msg {
     Ipc(crate::ipc::Call),
     Accessibility(WinId, Option<accesskit::ActionRequest>),
-    GpuLost(WinId),
+    GpuLost,
     Exported(Result<(), String>),
     SshWorkspace(PaneId, Result<Option<crate::project::Workspace>, String>),
     Pty(PaneId, Vec<u8>, (proteus_pty::budget::Permit, proteus_pty::budget::Permit)),
@@ -487,6 +487,8 @@ struct App {
     /// Window with keyboard focus (keys and IME go there).
     kbd_win: Option<WinId>,
     instance: wgpu::Instance,
+    /// Device shared by every window's renderer.
+    gpu: render::Gpu,
     ipc_socket: Option<PathBuf>,
     /// Where diagnostics are written (see [`crate::logging`]).
     log_file: Option<PathBuf>,
@@ -626,6 +628,7 @@ fn gpu_surface(
     .map_err(|e| format!("cannot create GPU surface: {e}"))
 }
 
+/// `gpu` is opened on the new window's surface if there is none yet.
 #[allow(clippy::too_many_arguments)] // Wayland globals needed to construct one window.
 fn make_win(
     id: WinId,
@@ -636,6 +639,7 @@ fn make_win(
     viewporter: Option<&WpViewporter>,
     fractional_manager: Option<&WpFractionalScaleManagerV1>,
     instance: &wgpu::Instance,
+    gpu: &mut Option<render::Gpu>,
     cfg: &Config,
     logical: Option<(u32, u32)>,
 ) -> io::Result<Win> {
@@ -661,7 +665,11 @@ fn make_win(
     let m = fonts.metrics();
     let size = logical.unwrap_or_else(|| cfg.window_size((m.cell_w, m.cell_h), 1.0));
     let wsurface = gpu_surface(instance, conn, &window).map_err(err)?;
-    let mut renderer = Renderer::new(instance, wsurface.into(), size).map_err(err)?;
+    let gpu = match gpu {
+        Some(gpu) => gpu,
+        None => gpu.insert(render::Gpu::new(instance, &wsurface).map_err(err)?),
+    };
+    let mut renderer = Renderer::new(gpu, wsurface.into(), size).map_err(err)?;
     renderer.images.budget = cfg.graphics.gpu_memory;
     Ok(Win {
         renderer,
@@ -757,6 +765,7 @@ pub fn run(
         desc.backends = wgpu::Backends::VULKAN | wgpu::Backends::GL;
     }
     let instance = wgpu::Instance::new(desc);
+    let mut gpu = None;
     let first = make_win(
         1,
         &conn,
@@ -766,10 +775,12 @@ pub fn run(
         viewporter.as_ref(),
         fractional_manager.as_ref(),
         &instance,
+        &mut gpu,
         &cfg,
         None,
     )?;
-    tracing::info!(window = first.id, adapter = %first.renderer.adapter_info, "window created");
+    let gpu = gpu.expect("make_win opens the GPU");
+    tracing::info!(window = first.id, adapter = %gpu.info(), "window created");
     {
         let protocol = |name: &str, present: bool| {
             if present {
@@ -793,7 +804,7 @@ pub fn run(
             },
             channel::Event::Msg(Msg::Accessibility(window, action)) => app.accessibility_event(window, action),
             channel::Event::Msg(Msg::Ipc(call)) => app.ipc_call(call),
-            channel::Event::Msg(Msg::GpuLost(id)) => app.recover_gpu(id),
+            channel::Event::Msg(Msg::GpuLost) => app.recover_gpu(),
             channel::Event::Msg(Msg::Pty(id, bytes, permits)) => {
                 // Retain permits until idle processing: producers cannot
                 // continuously refill this source and starve input/rendering.
@@ -831,6 +842,7 @@ pub fn run(
         next_win: 2,
         kbd_win: None,
         instance,
+        gpu,
         ipc_socket: None,
         log_file,
         xdg,

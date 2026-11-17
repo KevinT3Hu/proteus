@@ -119,8 +119,9 @@ pub struct TextureCache {
 }
 
 impl TextureCache {
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, budget: usize) -> TextureCache {
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+    /// Layout of the image bind group (group 1 of the pipeline).
+    pub fn bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("image"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
@@ -132,7 +133,15 @@ impl TextureCache {
                 },
                 count: None,
             }],
-        });
+        })
+    }
+
+    pub fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        layout: wgpu::BindGroupLayout,
+        budget: usize,
+    ) -> TextureCache {
         // The bind group keeps the texture alive.
         let (tex, empty) = Self::texture(device, &layout, (1, 1));
         Self::write(queue, &tex, (1, 1), &[0; 4]);
@@ -145,10 +154,6 @@ impl TextureCache {
             budget,
             max_dim: device.limits().max_texture_dimension_2d.max(1),
         }
-    }
-
-    pub fn layout(&self) -> &wgpu::BindGroupLayout {
-        &self.layout
     }
 
     fn texture(

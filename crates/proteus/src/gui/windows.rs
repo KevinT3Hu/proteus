@@ -64,16 +64,15 @@ impl App {
 
     pub(super) fn watch_gpu(&self) {
         let sender = self.sender.clone();
-        let id = self.w.id;
-        let lost = self.w.renderer.lost.clone();
-        let device = &self.w.renderer.device;
+        let lost = self.gpu.lost_flag();
+        let device = self.gpu.device();
         device.set_device_lost_callback(move |reason, message| {
             if reason != wgpu::DeviceLostReason::Destroyed {
                 lost.store(true, std::sync::atomic::Ordering::Release);
-                tracing::error!(window = id, ?reason, "gpu device lost: {message}");
-                let _ = sender.send(Msg::GpuLost(id));
+                tracing::error!(?reason, "gpu device lost: {message}");
+                let _ = sender.send(Msg::GpuLost);
             } else {
-                tracing::debug!(window = id, "gpu device destroyed");
+                tracing::debug!("gpu device destroyed");
             }
         });
         let reported = std::sync::atomic::AtomicU32::new(0);
@@ -83,45 +82,66 @@ impl App {
             if n < LIMIT {
                 match &e {
                     wgpu::Error::OutOfMemory { source } => {
-                        tracing::error!(window = id, "gpu out of memory: {source}")
+                        tracing::error!("gpu out of memory: {source}")
                     }
                     wgpu::Error::Validation { description, .. } => {
-                        tracing::error!(window = id, "gpu validation error: {description}")
+                        tracing::error!("gpu validation error: {description}")
                     }
                     wgpu::Error::Internal { description, .. } => {
-                        tracing::error!(window = id, "gpu internal error: {description}")
+                        tracing::error!("gpu internal error: {description}")
                     }
                 }
             } else if n == LIMIT {
-                tracing::error!(window = id, "further gpu errors on this device are not logged");
+                tracing::error!("further gpu errors on this device are not logged");
             }
         }));
     }
 
-    pub(super) fn recover_gpu(&mut self, id: WinId) {
-        if !self.activate(id) {
-            return;
-        }
-        let result = self.w.renderer.recover(&self.instance, self.physical());
+    /// Open a new device and move every window's renderer to it. Nothing
+    /// changes unless all windows get a renderer.
+    pub(super) fn recover_gpu(&mut self) {
+        let current = self.w.id;
+        let result = self.new_renderers();
         match result {
-            Ok(mut renderer) => {
-                renderer.images.budget = self.cfg.graphics.gpu_memory;
-                self.w.renderer = renderer;
-                self.w.styled = None;
-                self.style_window();
+            Ok((gpu, renderers)) => {
+                self.gpu = gpu;
+                for (id, mut renderer) in renderers {
+                    if !self.activate(id) {
+                        continue;
+                    }
+                    renderer.images.budget = self.cfg.graphics.gpu_memory;
+                    self.w.renderer = renderer;
+                    self.w.styled = None;
+                    self.style_window();
+                    self.w.frame_pending = false;
+                    self.w.dirty = true;
+                }
+                self.activate(current);
                 self.watch_gpu();
-                self.w.frame_pending = false;
-                self.w.dirty = true;
-                tracing::info!(window = id, adapter = %self.w.renderer.adapter_info, "gpu recovered");
+                tracing::info!(adapter = %self.gpu.info(), "gpu recovered");
             }
             Err(e) => {
-                tracing::warn!(window = id, "gpu recovery failed, retrying in two seconds: {e}");
-                let _ = self.handle.insert_source(Timer::from_duration(Duration::from_secs(2)), move |_, _, app| {
-                    app.recover_gpu(id);
+                self.activate(current);
+                tracing::warn!("gpu recovery failed, retrying in two seconds: {e}");
+                let _ = self.handle.insert_source(Timer::from_duration(Duration::from_secs(2)), |_, _, app| {
+                    if app.gpu.is_lost() {
+                        app.recover_gpu();
+                    }
                     TimeoutAction::Drop
                 });
             }
         }
+    }
+
+    fn new_renderers(&mut self) -> Result<(super::render::Gpu, Vec<(WinId, Renderer)>), String> {
+        let gpu = super::render::Gpu::new(&self.instance, self.w.renderer.surface())?;
+        let mut renderers = Vec::new();
+        for id in self.window_ids() {
+            if self.activate(id) {
+                renderers.push((id, self.w.renderer.recover(&gpu, self.physical())?));
+            }
+        }
+        Ok((gpu, renderers))
     }
 
     /// Open a new (empty) window and make it current. Its size follows the
@@ -129,6 +149,7 @@ impl App {
     pub(super) fn new_window(&mut self) -> io::Result<WinId> {
         let id = self.next_win;
         self.next_win += 1;
+        let mut gpu = Some(self.gpu.clone());
         let win = make_win(
             id,
             &self.conn,
@@ -138,13 +159,13 @@ impl App {
             self.viewporter.as_ref(),
             self.fractional_manager.as_ref(),
             &self.instance,
+            &mut gpu,
             &self.cfg,
             (self.cfg.window == Default::default()).then_some(self.w.size),
         )?;
         self.parked.push(win);
         self.activate(id);
         self.setup_accessibility();
-        self.watch_gpu();
         self.style_window();
         tracing::info!(window = id, "window created");
         Ok(id)
@@ -232,7 +253,7 @@ impl App {
     }
 
     pub(super) fn snapshot(&mut self, path: &std::path::Path) {
-        if self.w.renderer.lost.load(std::sync::atomic::Ordering::Acquire) {
+        if self.gpu.is_lost() {
             tracing::warn!(window = self.w.id, path = %path.display(), "snapshot unavailable while the gpu is recovering");
             return;
         }

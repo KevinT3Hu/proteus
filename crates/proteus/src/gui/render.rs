@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use swash::text::Codepoint;
@@ -235,9 +235,177 @@ pub fn preedit_start(x: usize, width: usize, cols: usize) -> usize {
     if x + width <= cols { x } else { cols.saturating_sub(width) }
 }
 
+/// The adapter, device and queue all windows render with, and the device
+/// objects that do not depend on a window. Clones share them.
+#[derive(Clone)]
+pub struct Gpu(Arc<GpuShared>);
+
+struct GpuShared {
+    adapter: wgpu::Adapter,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    /// Set by the device-lost callback (see [`Gpu::lost_flag`]).
+    lost: Arc<AtomicBool>,
+    info: String,
+    shader: wgpu::ShaderModule,
+    atlas_layout: wgpu::BindGroupLayout,
+    image_layout: wgpu::BindGroupLayout,
+    pipeline_layout: wgpu::PipelineLayout,
+    samplers: [wgpu::Sampler; 2],
+    /// Render pipelines by surface format.
+    pipelines: Mutex<Vec<(wgpu::TextureFormat, wgpu::RenderPipeline)>>,
+}
+
+impl Gpu {
+    /// Pick an adapter that can present to `surface` and open a device on it.
+    pub fn new(instance: &wgpu::Instance, surface: &wgpu::Surface<'static>) -> Result<Gpu, String> {
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            compatible_surface: Some(surface),
+            ..Default::default()
+        }))
+        .map_err(|e| format!("no suitable GPU adapter: {e}"))?;
+        let info = adapter.get_info();
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("proteus"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits()),
+            ..Default::default()
+        }))
+        .map_err(|e| format!("cannot create GPU device: {e}"))?;
+        tracing::info!(
+            adapter = %info.name,
+            backend = ?info.backend,
+            device_type = ?info.device_type,
+            driver = %info.driver,
+            driver_info = %info.driver_info,
+            "gpu device created"
+        );
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("proteus shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
+        });
+        let sampler = |filter| {
+            device.create_sampler(&wgpu::SamplerDescriptor {
+                mag_filter: filter,
+                min_filter: filter,
+                ..Default::default()
+            })
+        };
+        let samplers = [sampler(wgpu::FilterMode::Nearest), sampler(wgpu::FilterMode::Linear)];
+        let entry = |binding, ty| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+            ty,
+            count: None,
+        };
+        let texture_ty = wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        };
+        let atlas_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[
+                entry(
+                    0,
+                    wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                ),
+                entry(1, texture_ty),
+                entry(2, texture_ty),
+                entry(3, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
+                entry(4, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
+            ],
+        });
+        let image_layout = TextureCache::bind_group_layout(&device);
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[Some(&atlas_layout), Some(&image_layout)],
+            immediate_size: 0,
+        });
+        Ok(Gpu(Arc::new(GpuShared {
+            adapter,
+            device,
+            queue,
+            lost: Arc::new(AtomicBool::new(false)),
+            info: format!("{} ({:?})", info.name, info.backend),
+            shader,
+            atlas_layout,
+            image_layout,
+            pipeline_layout,
+            samplers,
+            pipelines: Mutex::new(Vec::new()),
+        })))
+    }
+
+    pub fn device(&self) -> &wgpu::Device {
+        &self.0.device
+    }
+
+    /// Adapter name and backend.
+    pub fn info(&self) -> &str {
+        &self.0.info
+    }
+
+    /// For the device-lost callback, which must not hold the device itself.
+    pub fn lost_flag(&self) -> Arc<AtomicBool> {
+        self.0.lost.clone()
+    }
+
+    pub fn is_lost(&self) -> bool {
+        self.0.lost.load(Ordering::Acquire)
+    }
+
+    fn pipeline(&self, format: wgpu::TextureFormat) -> wgpu::RenderPipeline {
+        let mut pipelines = self.0.pipelines.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, p)) = pipelines.iter().find(|(f, _)| *f == format) {
+            return p.clone();
+        }
+        let g = &self.0;
+        let attrs =
+            wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4, 3 => Float32x4, 4 => Uint32];
+        let pipeline = g.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("proteus"),
+            layout: Some(&g.pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &g.shader,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<Instance>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &attrs,
+                })],
+            },
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, ..Default::default() },
+            depth_stencil: None,
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &g.shader,
+                entry_point: Some("fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        pipelines.push((format, pipeline.clone()));
+        pipeline
+    }
+}
+
 pub struct Renderer {
-    pub device: wgpu::Device,
-    pub lost: Arc<AtomicBool>,
+    gpu: Gpu,
+    device: wgpu::Device,
     queue: wgpu::Queue,
     surface: Arc<wgpu::Surface<'static>>,
     config: wgpu::SurfaceConfiguration,
@@ -253,8 +421,6 @@ pub struct Renderer {
     color_shelves: Shelves,
     /// Largest atlas side the device takes (capped at `MAX_ATLAS`).
     max_atlas: u32,
-    atlas_layout: wgpu::BindGroupLayout,
-    samplers: [wgpu::Sampler; 2],
     /// Changes whenever atlas positions of cached glyphs become invalid.
     glyph_epoch: u64,
     /// Times the (mask, color) atlas was started over in this frame, and in the one before.
@@ -270,7 +436,6 @@ pub struct Renderer {
     fg: Vec<Instance>,
     /// Finished layers, in drawing order.
     out: Vec<Instance>,
-    pub adapter_info: String,
     /// An atlas filled up mid-frame: draw again so every glyph is valid.
     pub redraw_needed: bool,
     pub images: TextureCache,
@@ -331,28 +496,15 @@ fn atlas_bind_group(
 }
 
 impl Renderer {
-    pub fn new(
-        instance: &wgpu::Instance,
-        surface: Arc<wgpu::Surface<'static>>,
-        size: (u32, u32),
-    ) -> Result<Renderer, String> {
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::LowPower,
-            compatible_surface: Some(&surface),
-            ..Default::default()
-        }))
-        .map_err(|e| format!("no suitable GPU adapter: {e}"))?;
-        let info = adapter.get_info();
-        let adapter_info = format!("{} ({:?})", info.name, info.backend);
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("proteus"),
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits()),
-            ..Default::default()
-        }))
-        .map_err(|e| format!("cannot create GPU device: {e}"))?;
-
-        let caps = surface.get_capabilities(&adapter);
+    /// Draw into `surface` with the shared `gpu`. Atlases, image textures and
+    /// caches belong to this renderer.
+    pub fn new(gpu: &Gpu, surface: Arc<wgpu::Surface<'static>>, size: (u32, u32)) -> Result<Renderer, String> {
+        let device = gpu.0.device.clone();
+        let queue = gpu.0.queue.clone();
+        let caps = surface.get_capabilities(&gpu.0.adapter);
+        if caps.formats.is_empty() || caps.alpha_modes.is_empty() {
+            return Err(format!("the GPU adapter {} cannot present to this window", gpu.0.info));
+        }
         // Prefer a non-sRGB format: text blended in gamma space looks like
         // every other terminal (and like the colors apps asked for).
         let format = caps
@@ -378,111 +530,30 @@ impl Renderer {
             view_formats: vec![],
             color_space: wgpu::SurfaceColorSpace::Auto,
         };
-        tracing::info!(
-            adapter = %info.name,
-            backend = ?info.backend,
-            device_type = ?info.device_type,
-            driver = %info.driver,
-            driver_info = %info.driver_info,
+        tracing::debug!(
             format = ?format,
             present_mode = ?config.present_mode,
             alpha_mode = ?alpha_mode,
-            "gpu device created"
+            "gpu surface configured"
         );
         surface.configure(&device, &config);
 
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("proteus shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
-        });
         let mask = atlas_texture(&device, "mask atlas", wgpu::TextureFormat::R8Unorm, ATLAS);
         let color = atlas_texture(&device, "color atlas", wgpu::TextureFormat::Rgba8Unorm, ATLAS);
-        let sampler = |filter| {
-            device.create_sampler(&wgpu::SamplerDescriptor {
-                mag_filter: filter,
-                min_filter: filter,
-                ..Default::default()
-            })
-        };
-        let nearest = sampler(wgpu::FilterMode::Nearest);
-        let smooth = sampler(wgpu::FilterMode::Linear);
         let globals = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("globals"),
             size: std::mem::size_of::<Globals>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let entry = |binding, ty| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-            ty,
-            count: None,
-        };
-        let texture_ty = wgpu::BindingType::Texture {
-            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-            view_dimension: wgpu::TextureViewDimension::D2,
-            multisampled: false,
-        };
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: None,
-            entries: &[
-                entry(
-                    0,
-                    wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                ),
-                entry(1, texture_ty),
-                entry(2, texture_ty),
-                entry(3, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
-                entry(4, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
-            ],
-        });
-        let samplers = [nearest, smooth];
-        let bind_group = atlas_bind_group(&device, &layout, &globals, &mask, &color, &samplers);
-        let images = TextureCache::new(&device, &queue, DEFAULT_TEXTURE_BUDGET);
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: None,
-            bind_group_layouts: &[Some(&layout), Some(images.layout())],
-            immediate_size: 0,
-        });
-        let attrs =
-            wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4, 3 => Float32x4, 4 => Uint32];
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("proteus"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs"),
-                compilation_options: Default::default(),
-                buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<Instance>() as u64,
-                    step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &attrs,
-                })],
-            },
-            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, ..Default::default() },
-            depth_stencil: None,
-            multisample: Default::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
+        let bind_group = atlas_bind_group(&device, &gpu.0.atlas_layout, &globals, &mask, &color, &gpu.0.samplers);
+        let images = TextureCache::new(&device, &queue, gpu.0.image_layout.clone(), DEFAULT_TEXTURE_BUDGET);
+        let pipeline = gpu.pipeline(format);
         let capacity = 4096;
         let instances = Self::instance_buffer(&device, capacity);
         Ok(Renderer {
-            lost: Arc::new(AtomicBool::new(false)),
+            max_atlas: device.limits().max_texture_dimension_2d.min(MAX_ATLAS),
+            gpu: gpu.clone(),
             device,
             queue,
             surface,
@@ -497,9 +568,6 @@ impl Renderer {
             capacity,
             mask_shelves: Shelves::new(ATLAS),
             color_shelves: Shelves::new(ATLAS),
-            max_atlas: adapter.limits().max_texture_dimension_2d.min(MAX_ATLAS),
-            atlas_layout: layout,
-            samplers,
             glyph_epoch: 0,
             atlas_resets: [0; 2],
             prev_atlas_resets: [0; 2],
@@ -510,7 +578,6 @@ impl Renderer {
             scratch: Vec::new(),
             fg: Vec::new(),
             out: Vec::new(),
-            adapter_info,
             redraw_needed: false,
             images,
             opacity: 1.0,
@@ -537,7 +604,7 @@ impl Renderer {
         self.opacity = opacity;
         if mode != self.config.alpha_mode {
             self.config.alpha_mode = mode;
-            if !self.lost.load(Ordering::Acquire) {
+            if !self.gpu.is_lost() {
                 self.surface.configure(&self.device, &self.config);
             }
             self.redraw_needed = true;
@@ -545,10 +612,15 @@ impl Renderer {
         true
     }
 
+    /// The native surface, for picking an adapter that can present to it.
+    pub fn surface(&self) -> &wgpu::Surface<'static> {
+        &self.surface
+    }
+
     /// Reconfigure the existing native surface with a fresh device. Creating a
     /// second native surface for the same wl_surface duplicates explicit-sync objects.
-    pub fn recover(&self, instance: &wgpu::Instance, size: (u32, u32)) -> Result<Self, String> {
-        Self::new(instance, self.surface.clone(), size)
+    pub fn recover(&self, gpu: &Gpu, size: (u32, u32)) -> Result<Self, String> {
+        Self::new(gpu, self.surface.clone(), size)
     }
 
     fn instance_buffer(device: &wgpu::Device, n: usize) -> wgpu::Buffer {
@@ -565,7 +637,7 @@ impl Renderer {
         if (w, h) != (self.config.width, self.config.height) {
             self.config.width = w;
             self.config.height = h;
-            if !self.lost.load(Ordering::Acquire) {
+            if !self.gpu.is_lost() {
                 self.surface.configure(&self.device, &self.config);
             }
         }
@@ -598,8 +670,14 @@ impl Renderer {
                 self.mask = atlas_texture(&self.device, "mask atlas", wgpu::TextureFormat::R8Unorm, size);
             }
         }
-        self.bind_group =
-            atlas_bind_group(&self.device, &self.atlas_layout, &self.globals, &self.mask, &self.color, &self.samplers);
+        self.bind_group = atlas_bind_group(
+            &self.device,
+            &self.gpu.0.atlas_layout,
+            &self.globals,
+            &self.mask,
+            &self.color,
+            &self.gpu.0.samplers,
+        );
     }
 
     fn glyph(&mut self, fonts: &mut Fonts, g: GlyphRef) -> Option<AtlasGlyph> {
@@ -666,7 +744,7 @@ impl Renderer {
     /// Render one frame. Fails if the surface was not available (the caller
     /// should retry on the next frame).
     pub fn draw(&mut self, fonts: &mut Fonts, info: &FrameInfo) -> Result<(), Skipped> {
-        if self.lost.load(Ordering::Acquire) {
+        if self.gpu.is_lost() {
             return Err(Skipped::DeviceLost);
         }
         let frame = match self.surface.get_current_texture() {
