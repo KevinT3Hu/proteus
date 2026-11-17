@@ -131,7 +131,7 @@ use render::{FrameInfo, Overlay, PaneFrame, Renderer, Theme};
 use textinput::{Input, Purpose};
 use workspace::SessionStore;
 
-const APP_ID: &str = "dev.proteus.Proteus";
+const APP_ID: &str = "cc.spie.proteus";
 const APP_NAME: &str = "Proteus";
 /// How long the visual bell tints a pane.
 const FLASH: Duration = Duration::from_millis(120);

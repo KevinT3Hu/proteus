@@ -125,10 +125,10 @@ fn main() -> Result {
     }
     let usr = stage.join("usr");
     copy(binary, usr.join("bin/proteus"))?;
-    copy("packaging/dev.proteus.Proteus.desktop", usr.join("share/applications/dev.proteus.Proteus.desktop"))?;
+    copy("packaging/cc.spie.proteus.desktop", usr.join("share/applications/cc.spie.proteus.desktop"))?;
     copy(
         "assets/branding/proteus-icon-faithful.svg",
-        usr.join("share/icons/hicolor/scalable/apps/dev.proteus.Proteus.svg"),
+        usr.join("share/icons/hicolor/scalable/apps/cc.spie.proteus.svg"),
     )?;
     copy("crates/proteus-pty/terminfo/proteus.terminfo", usr.join("share/proteus/proteus.terminfo"))?;
     copy(plugin, usr.join("share/proteus/plugins/files/proteus_files.wasm"))?;

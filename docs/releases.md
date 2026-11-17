@@ -36,7 +36,7 @@ builds; build on the oldest distribution you intend to support. Debian dependenc
 names describe the required libraries, but do not promise compatibility with
 older libc versions. Test on each supported distribution before publishing.
 
-Desktop integration uses `dev.proteus.Proteus`, matching the Wayland app ID.
+Desktop integration uses `cc.spie.proteus`, matching the Wayland app ID.
 The supplied SVG is the desktop icon; original logos and wordmarks are included
 under `share/proteus/branding`. Documentation, an example workspace, the
 licence (`LICENSE`) and the licences of every bundled third-party component
