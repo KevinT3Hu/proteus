@@ -3,6 +3,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+/// How often a waiter that is not woken by a released permit checks `stop`.
+const STOP_CHECK: Duration = Duration::from_millis(100);
+
 #[derive(Debug, Clone)]
 pub struct Budget(Arc<Inner>);
 
@@ -30,6 +33,10 @@ impl Budget {
 
     pub fn try_acquire(&self, bytes: usize) -> Option<Permit> {
         let mut used = self.0.used.lock().unwrap();
+        self.take(&mut used, bytes)
+    }
+
+    fn take(&self, used: &mut (usize, usize), bytes: usize) -> Option<Permit> {
         if bytes > self.0.limits.0.saturating_sub(used.0) || used.1 >= self.0.limits.1 {
             return None;
         }
@@ -55,14 +62,15 @@ impl Budget {
         if bytes > self.0.limits.0 {
             return Ok(None);
         }
+        let mut used = self.0.used.lock().unwrap();
         loop {
             if stop.load(Ordering::Acquire) {
                 return Ok(None);
             }
-            if let Some(p) = self.try_acquire(bytes) {
+            if let Some(p) = self.take(&mut used, bytes) {
                 return Ok(Some(p));
             }
-            let mut wait = Duration::from_millis(10);
+            let mut wait = STOP_CHECK;
             if let Some(d) = deadline {
                 let left = d.saturating_duration_since(Instant::now());
                 if left.is_zero() {
@@ -70,8 +78,7 @@ impl Budget {
                 }
                 wait = wait.min(left);
             }
-            let used = self.0.used.lock().unwrap();
-            let _ = self.0.wake.wait_timeout(used, wait).unwrap();
+            used = self.0.wake.wait_timeout(used, wait).unwrap().0;
         }
     }
 }
