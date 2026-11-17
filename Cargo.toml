@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["xtask", "crates/proteus-i18n", "crates/proteus-core", "crates/proteus-pty", "crates/proteus-wasm", "crates/proteus"]
+members = ["xtask", "crates/proteus-i18n", "crates/proteus-core", "crates/proteus-pty", "crates/proteus-tasks", "crates/proteus-wasm", "crates/proteus"]
 # Built for wasm32-wasip2 on their own (see examples/plugins/README.md).
 exclude = ["crates/proteus-plugin", "crates/proteus-wasm/tests/fixture", "examples/plugins"]
 
@@ -13,11 +13,11 @@ rust-version = "1.98"
 [workspace.dependencies]
 proteus-core = { path = "crates/proteus-core" }
 proteus-pty = { path = "crates/proteus-pty" }
+proteus-tasks = { path = "crates/proteus-tasks" }
 # Versions come from Cargo.lock (builds use --locked); requirements are caret
 # so `cargo update` can take compatible fixes. Exact pins remain where code
 # depends on a version's internals:
 # - vte: the string pre-filter in proteus-core mirrors its state machine;
-# - ureq: its `unversioned` transport API;
 # - wasmtime, wasmtime-wasi: the runtime shadows `wasi:io/poll@0.2.12`.
 vte = "=0.15.0"
 bitflags = "2.13.2"
@@ -52,7 +52,14 @@ toml = "1.1.8"
 serde_json = "1.0.154"
 sha2 = "0.11.1"
 proteus-wasm = { path = "crates/proteus-wasm" }
-ureq = { version = "=3.4.2", default-features = false, features = ["rustls", "platform-verifier", "gzip"] }
+http = "1.5.0"
+hyper = { version = "1.12.0", default-features = false, features = ["client", "http1"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
+http-body-util = "0.1.5"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls-platform-verifier = "0.7.1"
+flate2 = "1.1.10"
 tokio = { version = "1.54.0", default-features = false }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

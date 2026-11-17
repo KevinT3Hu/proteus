@@ -1,13 +1,14 @@
 //! SSH UI orchestration. Authentication stays in OpenSSH's PTY.
-use super::{App, Msg, textinput::Purpose};
+use super::{App, textinput::Purpose};
 use crate::{
     layout::PaneId,
     project::Workspace,
     ssh::{self, Connection, Destination, Kind},
 };
 use std::{
+    os::fd::OwnedFd,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     time::Duration,
 };
 
@@ -288,29 +289,26 @@ impl App {
         remote.loading = true;
         remote.error = None;
         let destination = remote.connection.destination.clone();
-        let sender = self.sender.clone();
         // At most one per pane and four globally; a closed pane cannot turn the
         // request queue into unbounded subprocesses.
-        static ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        use std::sync::atomic::Ordering;
-        if ACTIVE.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| (n < 4).then_some(n + 1)).is_err() {
+        static ACTIVE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+        let Ok(permit) = ACTIVE.try_acquire() else {
             remote.loading = false;
             return self.notice("Four remote workspace requests are already running".into());
-        }
-        let result = std::thread::Builder::new().name("ssh-workspace".into()).spawn(move || {
-            let result = fetch_workspace(&destination, &cwd);
-            ACTIVE.fetch_sub(1, Ordering::Relaxed);
-            let _ = sender.send(Msg::SshWorkspace(id, result));
-        });
-        if let Err(e) = result {
-            ACTIVE.fetch_sub(1, Ordering::Relaxed);
+        };
+        let fetch = async move {
+            let result = fetch_workspace(&destination, &cwd).await;
+            drop(permit);
+            result
+        };
+        if let Err(e) = self.in_task(fetch, move |app, result| app.ssh_workspace_received(id, result)) {
             if let Some(remote) = self.panes.get_mut(&id).and_then(|p| p.remote.as_mut()) {
                 remote.loading = false;
             }
             self.notice_error(format!("cannot start the remote workspace request: {e}"));
         }
     }
-    pub(super) fn ssh_workspace_received(&mut self, id: PaneId, result: Result<Option<Workspace>, String>) {
+    fn ssh_workspace_received(&mut self, id: PaneId, result: Result<Option<Workspace>, String>) {
         if let Some(remote) = self.panes.get_mut(&id).and_then(|p| p.remote.as_mut()) {
             remote.loading = false;
             match result {
@@ -333,8 +331,7 @@ impl App {
     }
 }
 
-fn fetch_workspace(destination: &Destination, cwd: &str) -> Result<Option<Workspace>, String> {
-    use std::os::unix::process::CommandExt;
+async fn fetch_workspace(destination: &Destination, cwd: &str) -> Result<Option<Workspace>, String> {
     const FAILED: &str = "Remote workspace read failed; needs Python 3 and noninteractive SSH authentication. Check the remote files and connection.";
     let command = ssh::workspace_command(cwd);
     let args = ["-T", "-oBatchMode=yes", "-oConnectTimeout=10", "--", destination.as_str(), &command];
@@ -342,30 +339,37 @@ fn fetch_workspace(destination: &Destination, cwd: &str) -> Result<Option<Worksp
         argv = %ssh::argv_for_log(&std::iter::once("ssh").chain(args).map(Into::into).collect::<Vec<_>>()),
         "fetching remote workspace"
     );
-    let mut child = Command::new("ssh")
+    let mut child = tokio::process::Command::new("ssh")
         .args(args)
         .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .map_err(|e| format!("cannot run ssh: {e}"))?;
-    let stderr = child.stderr.take().expect("piped");
-    let stderr = std::thread::Builder::new()
-        .name("ssh-workspace-stderr".into())
-        .spawn(move || super::transfer::read(stderr, 64 * 1024, Duration::from_secs(25)).unwrap_or_default())
-        .ok();
-    let result = super::transfer::read(child.stdout.take().expect("piped"), 2 * 1024 * 1024, Duration::from_secs(20));
-    // read is deadline bounded; never block the worker on a server that closes
-    // stdout but continues running. Kill/reap on every exit path.
+    let pipe = |p: Option<OwnedFd>| p.ok_or_else(|| std::io::Error::other("not piped"));
+    let stdout = pipe(child.stdout.take().and_then(|p| p.into_owned_fd().ok()));
+    let stderr = pipe(child.stderr.take().and_then(|p| p.into_owned_fd().ok()));
+    let stderr =
+        proteus_tasks::spawn(async { super::transfer::read(stderr?, 64 * 1024, Duration::from_secs(25)).await });
+    let result = match stdout {
+        Ok(fd) => super::transfer::read(fd, 2 * 1024 * 1024, Duration::from_secs(20)).await,
+        Err(e) => Err(e),
+    };
+    // read is deadline bounded; a server that closes stdout but keeps
+    // running is killed with its process group.
     let status = child.try_wait().map_err(|e| format!("ssh: {e}"));
     if !matches!(status, Ok(Some(_)))
-        && let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32)
+        && let Some(pid) = child.id().and_then(|id| rustix::process::Pid::from_raw(id as i32))
     {
         let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
     }
-    let _ = child.wait();
-    let stderr = stderr.and_then(|h| h.join().ok()).unwrap_or_default();
+    let _ = child.wait().await;
+    let stderr = match stderr {
+        Ok(task) => task.await.ok().and_then(Result::ok).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
     let stderr = String::from_utf8_lossy(&stderr);
     let stderr = stderr.trim();
     let fail = |what: String| {

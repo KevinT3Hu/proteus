@@ -421,19 +421,16 @@ impl App {
             return;
         };
         let sources = self.cfg.plugins.clone();
-        let tx = self.sender.clone();
         tracing::debug!(sources = sources.len(), generation, "resolving plugin sources");
         // No directory scans, installed-plugin registry, or bundled defaults.
-        if let Err(e) = std::thread::Builder::new().name("plugin-sources".into()).spawn(move || {
-            let results = sources.iter().map(|s| cache.resolve(s)).collect();
-            let _ = tx.send(Msg::PluginsResolved(generation, results));
-        }) {
-            tracing::error!(error = %e, "cannot start the plugin source thread");
+        let resolve = move || sources.iter().map(|s| cache.resolve(s)).collect();
+        if let Err(e) = self.in_background(resolve, move |app, results| app.plugins_resolved(generation, results)) {
+            tracing::error!(error = %e, "cannot resolve plugin sources");
             self.toast(format!("plugins: {e}"), true, None);
         }
     }
 
-    pub(super) fn plugins_resolved(&mut self, generation: u64, results: Vec<Result<Resolved, String>>) {
+    fn plugins_resolved(&mut self, generation: u64, results: Vec<Result<Resolved, String>>) {
         if generation != self.pl.generation {
             return;
         }
@@ -1164,25 +1161,23 @@ impl App {
                     .get_or_init(|| proteus_pty::budget::Budget::new(4, 4))
                     .try_acquire(1)
                     .ok_or("too many pending desktop opens")?;
-                let mut cmd = std::process::Command::new("xdg-open");
+                let mut cmd = tokio::process::Command::new("xdg-open");
                 cmd.arg(&target)
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null());
+                let _runtime = proteus_tasks::enter()?;
                 let mut child = cmd.spawn().map_err(|e| {
                     tracing::warn!(plugin = %key.id, error = %e, "xdg-open failed to start");
                     e.to_string()
                 })?;
-                std::thread::Builder::new()
-                    .name("plugin-open".into())
-                    .spawn(move || {
-                        let _ = child.wait();
-                        drop(permit);
-                        // Some openers hand the path to an application and exit at once.
-                        std::thread::sleep(OPEN_GRACE);
-                        drop(file);
-                    })
-                    .map_err(|e| e.to_string())?;
+                proteus_tasks::spawn(async move {
+                    let _ = child.wait().await;
+                    drop(permit);
+                    // Some openers hand the path to an application and exit at once.
+                    tokio::time::sleep(OPEN_GRACE).await;
+                    drop(file);
+                })?;
                 Ok(Reply::Unit)
             }
         }

@@ -19,6 +19,8 @@ proteus-i18n = { path = "../proteus-i18n" }
 proteus-core.workspace = true
 proteus-pty.workspace = true
 proteus-wasm.workspace = true
+proteus-tasks.workspace = true
+tokio = { workspace = true, features = ["time", "net", "process", "sync"] }
 rustix.workspace = true
 clap.workspace = true
 mlua.workspace = true

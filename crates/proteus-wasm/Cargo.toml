@@ -14,12 +14,20 @@ serde.workspace = true
 toml.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-ureq.workspace = true
+http.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-platform-verifier.workspace = true
+flate2.workspace = true
 zbus.workspace = true
 rustix.workspace = true
 proteus-pty.workspace = true
 image.workspace = true
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["time", "net", "sync", "rt", "process", "io-util", "macros"] }
+proteus-tasks.workspace = true
 tracing.workspace = true
 
 [lints]

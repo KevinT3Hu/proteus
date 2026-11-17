@@ -261,19 +261,17 @@ fn coalesced(e: &Event) -> Option<(PaneId, u8)> {
 /// Woken whenever a plugin takes a message from its queue.
 #[derive(Default)]
 struct Progress {
-    lock: Mutex<()>,
-    taken: Condvar,
+    taken: tokio::sync::Notify,
 }
 
 impl Progress {
     fn notify(&self) {
-        let _guard = lock(&self.lock);
-        self.taken.notify_all();
+        self.taken.notify_waiters();
     }
 }
 
-/// Sends events to a plugin from helper threads (processes, HTTP, file
-/// watches).
+/// Sends events to a plugin from tasks (processes, HTTP streams, file
+/// watches), waiting while it is behind.
 #[derive(Clone)]
 pub struct Poster {
     tx: mpsc::SyncSender<ToPlugin>,
@@ -283,55 +281,59 @@ pub struct Poster {
     progress: Arc<Progress>,
 }
 
+/// Queue `m` unless the queue is full: the outcome, or `m` back.
+fn try_queue(tx: &mpsc::SyncSender<ToPlugin>, m: &mut Option<ToPlugin>) -> Option<bool> {
+    match tx.try_send(m.take().expect("put back when full")) {
+        Ok(()) => Some(true),
+        Err(mpsc::TrySendError::Full(back)) => {
+            *m = Some(back);
+            None
+        }
+        Err(mpsc::TrySendError::Disconnected(_)) => Some(false),
+    }
+}
+
 impl Poster {
-    /// Waits while the plugin's queue is full. False once the plugin is gone.
-    pub fn event(&self, e: Event) -> bool {
-        self.event_until(e, &AtomicBool::new(false))
-    }
-
-    fn event_until(&self, e: Event, cancel: &AtomicBool) -> bool {
-        let mut m = Some(ToPlugin::Event(e));
-        self.wait(cancel, || match self.tx.try_send(m.take().expect("put back when full")) {
-            Ok(()) => Some(true),
-            Err(mpsc::TrySendError::Full(back)) => {
-                m = Some(back);
-                None
-            }
-            Err(mpsc::TrySendError::Disconnected(_)) => Some(false),
-        })
-    }
-
     /// Try `attempt` again each time the plugin takes a message, until it
-    /// has an outcome. False once the plugin is stopped or `cancel` is set.
-    fn wait(&self, cancel: &AtomicBool, mut attempt: impl FnMut() -> Option<bool>) -> bool {
-        let mut guard = lock(&self.progress.lock);
+    /// has an outcome. False once the plugin is stopped.
+    async fn wait(&self, mut attempt: impl FnMut() -> Option<bool>) -> bool {
         loop {
-            if self.stopped() || cancel.load(Ordering::Relaxed) {
+            // Registered before trying, so a message taken in between wakes it.
+            let taken = self.progress.taken.notified();
+            let mut taken = std::pin::pin!(taken);
+            taken.as_mut().enable();
+            if self.stopped() {
                 return false;
             }
             if let Some(outcome) = attempt() {
                 return outcome;
             }
-            guard = self.progress.taken.wait_timeout(guard, POLL).unwrap_or_else(std::sync::PoisonError::into_inner).0;
+            let _ = tokio::time::timeout(POLL, taken).await;
         }
+    }
+
+    /// Waits while the plugin's queue is full. False once the plugin is gone.
+    pub(crate) async fn event_async(&self, e: Event) -> bool {
+        let mut m = Some(ToPlugin::Event(e));
+        self.wait(|| try_queue(&self.tx, &mut m)).await
     }
 
     /// An event carrying `n` bytes of output: waits while the plugin is
     /// behind.
-    pub fn data(&self, n: usize, e: Event) -> bool {
-        self.data_until(n, e, &AtomicBool::new(false))
+    pub(crate) async fn data_async(&self, n: usize, e: Event) -> bool {
+        if !self.wait(|| self.caught_up()).await {
+            return false;
+        }
+        self.backlog.fetch_add(n, Ordering::Relaxed);
+        self.event_async(e).await
+    }
+
+    fn caught_up(&self) -> Option<bool> {
+        (self.backlog.load(Ordering::Relaxed) <= MAX_BACKLOG).then_some(true)
     }
 
     pub(crate) fn stopped(&self) -> bool {
         self.stop.load(Ordering::Relaxed)
-    }
-
-    pub(crate) fn data_until(&self, n: usize, e: Event, cancel: &AtomicBool) -> bool {
-        if !self.wait(cancel, || (self.backlog.load(Ordering::Relaxed) <= MAX_BACKLOG).then_some(true)) {
-            return false;
-        }
-        self.backlog.fetch_add(n, Ordering::Relaxed);
-        self.event_until(e, cancel)
     }
 
     #[cfg(test)]
@@ -412,9 +414,12 @@ impl Runtime {
             progress: Arc::default(),
         };
         let (engine, cache) = (self.engine.clone(), self.cache.clone());
+        let tasks = proteus_tasks::handle()?;
         std::thread::Builder::new()
             .name(format!("plugin {}", spec.key.id))
             .spawn(move || {
+                // WASI's blocking calls run on the shared runtime.
+                let _runtime = tasks.enter();
                 let key = spec.key.clone();
                 let span = tracing::info_span!("plugin", id = %key.id, instance = key.instance);
                 let _entered = span.enter();
@@ -595,12 +600,9 @@ impl State {
     fn blocking<T: Send + 'static>(&mut self, f: impl FnOnce() -> T + Send + 'static) -> Result<T, String> {
         self.excluded(|s| {
             let (tx, rx) = mpsc::channel();
-            let span = tracing::Span::current();
-            crate::pool::run(Box::new(move || {
-                let _entered = span.enter();
+            proteus_tasks::spawn_blocking(move || {
                 let _ = tx.send(f());
-            }))
-            .map_err(|e| e.to_string())?;
+            })?;
             loop {
                 match rx.recv_timeout(POLL) {
                     Ok(v) => return Ok(v),
@@ -1016,8 +1018,10 @@ impl proteus::plugin::host::Host for State {
     fn run(&mut self, cmd: Command, input: Vec<u8>, timeout_ms: u32) -> Result<Output, String> {
         let (program, cwd) = self.command(&cmd)?;
         let timeout = if timeout_ms == 0 { process::DEFAULT_TIMEOUT } else { Duration::from_millis(timeout_ms as u64) };
-        let stop = self.stop.clone();
-        self.blocking(move || process::run(&program, &cmd, &cwd, input, timeout, &stop))?
+        self.excluded(|s| {
+            let running = process::run(&program, &cmd, &cwd, input, timeout);
+            proteus_tasks::handle()?.block_on(unless_stopped(&s.stop, running))
+        })
     }
 
     fn spawn_process(&mut self, cmd: Command) -> Result<ProcessId, String> {
@@ -1043,8 +1047,10 @@ impl proteus::plugin::host::Host for State {
             return Err(denied("network"));
         }
         let uri = net::check(&self.granted.network, &request.url)?;
-        let stop = self.stop.clone();
-        self.blocking(move || net::fetch(uri, request, stop))?
+        self.excluded(|s| {
+            let tasks = proteus_tasks::handle()?;
+            tasks.block_on(unless_stopped(&s.stop, net::fetch(uri, request)))
+        })
     }
 
     fn http_stream(&mut self, request: HttpRequest) -> Result<RequestId, String> {
@@ -1095,17 +1101,7 @@ impl proteus::plugin::host::Host for State {
     fn watch(&mut self, path: String) -> Result<WatchId, String> {
         let host = self.access.pin(&path, false, true)?;
         if self.watcher.is_none() {
-            let post = self.post.clone();
-            let on_change: files::OnChange = Box::new(move |watch, path, change| {
-                let kind = match change {
-                    files::Change::Created => FsChangeKind::Created,
-                    files::Change::Removed => FsChangeKind::Removed,
-                    files::Change::Modified => FsChangeKind::Modified,
-                    files::Change::Moved => FsChangeKind::Moved,
-                };
-                post.event(Event::FsChanged(FsChange { watch, path, kind }))
-            });
-            self.watcher = Some(Watcher::new(on_change, Arc::new(AtomicBool::new(false)))?);
+            self.watcher = Some(Watcher::new(self.post.clone())?);
         }
         self.watcher.as_mut().expect("just made").add(&host, &path)
     }
@@ -1296,6 +1292,21 @@ fn interruptible_poll(linker: &mut Linker<State>) -> wasmtime::Result<()> {
     })?;
     linker.allow_shadowing(false);
     Ok(())
+}
+
+/// `f`, unless the plugin is stopped first (dropping `f` cancels it).
+async fn unless_stopped<T>(
+    stop: &AtomicBool,
+    f: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    let mut f = std::pin::pin!(f);
+    loop {
+        match tokio::time::timeout(POLL, f.as_mut()).await {
+            Ok(v) => return v,
+            Err(_) if stop.load(Ordering::Relaxed) => return Err("stopped".into()),
+            Err(_) => {}
+        }
+    }
 }
 
 /// `f`, unless `stop` is set or `deadline` passes first.
@@ -1647,39 +1658,74 @@ mod tests {
     }
 
     #[test]
-    fn helper_floods_wait_for_the_plugin_instead_of_stopping_it() {
+    fn floods_from_tasks_wait_for_the_plugin_instead_of_stopping_it() {
+        let tasks = proteus_tasks::handle().unwrap();
         let (post, events) = Poster::testing();
         let p = post.clone();
-        let worker = std::thread::spawn(move || (0..QUEUE as u32 + 100).all(|i| p.event(Event::Timer(i))));
+        let flood = tasks.spawn(async move {
+            for i in 0..QUEUE as u32 + 100 {
+                if !p.event_async(Event::Timer(i)).await {
+                    return false;
+                }
+            }
+            true
+        });
         std::thread::sleep(Duration::from_millis(50));
         assert!(!post.stopped());
-        let got: Vec<_> = (0..QUEUE + 100).map(|_| events.recv_timeout(Duration::from_secs(1)).unwrap()).collect();
-        assert!(worker.join().unwrap());
+        let got: Vec<_> = (0..QUEUE + 100)
+            .map(|_| {
+                let m = events.recv_timeout(Duration::from_secs(1)).unwrap();
+                post.progress.notify();
+                m
+            })
+            .collect();
+        assert!(tasks.block_on(flood).unwrap());
         assert!(matches!(got.last(), Some(ToPlugin::Event(Event::Timer(i))) if *i == QUEUE as u32 + 99));
-        for _ in 0..QUEUE {
-            assert!(post.event(Event::Timer(0)));
-        }
-        let p = post.clone();
-        let worker = std::thread::spawn(move || p.event(Event::Timer(1)));
-        std::thread::sleep(Duration::from_millis(20));
-        post.stop.store(true, Ordering::Relaxed);
-        assert!(!worker.join().unwrap(), "a stopped plugin releases waiting helpers");
     }
 
     #[test]
-    fn stream_cancellation_interrupts_backlog_wait() {
-        let (post, _events) = Poster::testing();
-        post.backlog.store(MAX_BACKLOG + 1, Ordering::Relaxed);
-        let cancel = Arc::new(AtomicBool::new(false));
-        let c = cancel.clone();
-        let worker = std::thread::spawn(move || post.data_until(1, Event::HttpBody((1, vec![0])), &c));
-        std::thread::sleep(Duration::from_millis(20));
-        cancel.store(true, Ordering::Relaxed);
-        let end = Instant::now() + Duration::from_secs(1);
-        while !worker.is_finished() && Instant::now() < end {
-            std::thread::sleep(Duration::from_millis(5));
+    fn tasks_wait_for_room_and_cancelling_them_ends_the_wait() {
+        let tasks = proteus_tasks::handle().unwrap();
+        let (post, events) = Poster::testing();
+        for _ in 0..QUEUE {
+            assert!(tasks.block_on(post.event_async(Event::Timer(0))));
         }
-        assert!(worker.is_finished());
-        assert!(!worker.join().unwrap());
+        let p = post.clone();
+        let waiting = tasks.spawn(async move { p.event_async(Event::Timer(1)).await });
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(!waiting.is_finished(), "the queue is full");
+        events.recv().unwrap();
+        post.progress.notify();
+        assert!(tasks.block_on(waiting).unwrap());
+
+        post.backlog.store(MAX_BACKLOG + 1, Ordering::Relaxed);
+        let p = post.clone();
+        let waiting = tasks.spawn(async move { p.data_async(1, Event::HttpBody((1, vec![0]))).await });
+        std::thread::sleep(Duration::from_millis(20));
+        waiting.abort();
+        assert!(tasks.block_on(waiting).unwrap_err().is_cancelled());
+        post.stop.store(true, Ordering::Relaxed);
+        assert!(!tasks.block_on(post.data_async(1, Event::HttpBody((1, vec![0])))), "a stopped plugin takes nothing");
+        post.stop.store(false, Ordering::Relaxed);
+        let p = post.clone();
+        let waiting = tasks.spawn(async move { p.event_async(Event::Timer(2)).await });
+        std::thread::sleep(Duration::from_millis(20));
+        post.stop.store(true, Ordering::Relaxed);
+        assert!(!tasks.block_on(waiting).unwrap(), "stopping releases a waiting task");
+    }
+
+    #[test]
+    fn stopping_the_plugin_ends_a_host_wait() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let s = stop.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            s.store(true, Ordering::Relaxed);
+        });
+        let t = Instant::now();
+        let never = std::future::pending::<Result<(), String>>();
+        let r = proteus_tasks::handle().unwrap().block_on(unless_stopped(&stop, never));
+        assert_eq!(r, Err("stopped".into()));
+        assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
     }
 }

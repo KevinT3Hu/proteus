@@ -865,10 +865,9 @@ impl App {
                     return;
                 };
                 let output = p.term.scrollback_text();
-                let sender = self.sender.clone();
-                std::thread::spawn(move || {
+                let write = move || {
                     use std::io::Write;
-                    let result = std::fs::OpenOptions::new()
+                    std::fs::OpenOptions::new()
                         .write(true)
                         .create_new(true)
                         .open(&text)
@@ -876,9 +875,15 @@ impl App {
                             file.write_all(output.as_bytes())?;
                             file.sync_all()
                         })
-                        .map_err(|e| format!("{text}: {e}"));
-                    let _ = sender.send(super::Msg::Exported(result));
-                });
+                        .map_err(|e| format!("{text}: {e}"))
+                };
+                let done = |app: &mut App, result: Result<(), String>| match result {
+                    Ok(()) => app.toast(app.cfg.i18n.t("notice-scrollback-exported", &[]), false, None),
+                    Err(e) => app.toast(e, true, None),
+                };
+                if let Err(e) = self.in_background(write, done) {
+                    self.toast(e, true, None);
+                }
             }
             Purpose::SaveLayout if !text.is_empty() => self.save_layout(&text),
             Purpose::LoadLayout if !text.is_empty() => self.load_layout(&text),

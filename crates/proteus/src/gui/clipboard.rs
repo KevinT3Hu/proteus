@@ -26,7 +26,7 @@ impl App {
         self.read_clipboard(kind, ClipTarget::Paste(id));
     }
 
-    /// Fetch a selection's text; the result arrives as `Msg::Clipboard`
+    /// Fetch a selection's text; `clipboard_received` gets it later
     /// (immediately if we own the selection).
     pub(super) fn read_clipboard(&mut self, kind: ClipboardKind, target: ClipTarget) {
         let own = match kind {
@@ -66,15 +66,20 @@ impl App {
             self.clipboard_received(target, String::new());
             return;
         };
-        let tx = self.sender.clone();
-        let _ = std::thread::Builder::new().name("paste".into()).spawn(move || {
-            // Timeout/overflow discards the whole selection, never a partial command.
-            let data = transfer::read(File::from(fd), 16 << 20, Duration::from_secs(3)).unwrap_or_else(|e| {
+        // Timeout/overflow discards the whole selection, never a partial command.
+        let read = transfer::read(fd, 16 << 20, Duration::from_secs(3));
+        let done = move |app: &mut App, data: std::io::Result<Vec<u8>>| {
+            let data = data.unwrap_or_else(|e| {
                 tracing::warn!("reading the selection failed, nothing pasted: {e}");
                 Vec::new()
             });
-            let _ = tx.send(Msg::Clipboard(target, String::from_utf8_lossy(&data).into_owned(), permit));
-        });
+            app.clipboard_received(target, String::from_utf8_lossy(&data).into_owned());
+            drop(permit);
+        };
+        if let Err(e) = self.in_task(read, done) {
+            tracing::warn!("reading the selection failed, nothing pasted: {e}");
+            self.clipboard_received(target, String::new());
+        }
     }
 
     pub(super) fn clipboard_received(&mut self, target: ClipTarget, text: String) {
@@ -128,11 +133,14 @@ impl App {
         else {
             return;
         };
-        let _ = std::thread::Builder::new().name("copy".into()).spawn(move || {
-            if let Err(e) = transfer::write(File::from(fd), &data, Duration::from_secs(5)) {
+        let send = async move {
+            if let Err(e) = transfer::write(fd, &data, Duration::from_secs(5)).await {
                 tracing::debug!(bytes = data.len(), "sending our selection failed: {e}");
             }
             drop(permit);
-        });
+        };
+        if let Err(e) = proteus_tasks::spawn(send) {
+            tracing::debug!("sending our selection failed: {e}");
+        }
     }
 }

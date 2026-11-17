@@ -122,20 +122,8 @@ impl Cache {
                 }
                 let file = slot.join("plugin.wasm");
                 if !file.exists() {
-                    let cfg = ureq::Agent::config_builder()
-                        .timeout_global(Some(Duration::from_secs(60)))
-                        .https_only(source.sha256.is_none())
-                        .tls_config(
-                            ureq::tls::TlsConfig::builder().root_certs(ureq::tls::RootCerts::PlatformVerifier).build(),
-                        )
-                        .build();
-                    let mut response = cfg.new_agent().get(raw).call().map_err(|e| format!("fetch {raw}: {e}"))?;
-                    let bytes = response
-                        .body_mut()
-                        .with_config()
-                        .limit(256 * 1024 * 1024)
-                        .read_to_vec()
-                        .map_err(|e| e.to_string())?;
+                    let bytes = crate::net::download(raw, source.sha256.is_none(), 256 * 1024 * 1024)
+                        .map_err(|e| format!("fetch {raw}: {e}"))?;
                     if !bytes.starts_with(b"\0asm") {
                         return Err(format!("{raw}: not WebAssembly"));
                     }
@@ -331,45 +319,44 @@ fn command(cmd: &mut Command, label: &str) -> Result<(), String> {
     if out.status.success() { Ok(()) } else { Err(format!("{label}: {}", String::from_utf8_lossy(&out.stderr))) }
 }
 
-/// `cmd`'s output; its process group is killed after `limit`.
+/// `cmd`'s output; its process group is killed after `limit`. Blocks; it
+/// runs on the pooled thread that resolves sources, never on a worker.
 fn timed(cmd: &mut Command, limit: Duration) -> Result<std::process::Output, String> {
-    use std::io::Read;
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    fn collect(r: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<Vec<u8>> {
-        std::thread::spawn(move || {
-            let mut v = Vec::new();
-            if let Some(mut r) = r {
-                let _ = r.read_to_end(&mut v);
-            }
-            v
-        })
-    }
-    let (stdout, stderr) = (collect(child.stdout.take()), collect(child.stderr.take()));
-    let end = std::time::Instant::now() + limit;
-    let status = loop {
-        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-            break status;
-        }
-        if std::time::Instant::now() >= end {
-            let pid = rustix::process::Pid::from_child(&child);
-            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
-            let _ = child.wait();
-            return Err(format!("timed out after {} s", limit.as_secs()));
-        }
-        std::thread::sleep(Duration::from_millis(50));
+    use tokio::io::{AsyncRead, AsyncReadExt};
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
+    let mut cmd = tokio::process::Command::from(std::mem::replace(cmd, Command::new("")));
+    cmd.kill_on_drop(true);
+    let tasks = proteus_tasks::handle()?;
+    let mut child = {
+        let _runtime = tasks.enter();
+        cmd.spawn().map_err(|e| e.to_string())?
     };
-    Ok(std::process::Output {
-        status,
-        stdout: stdout.join().unwrap_or_default(),
-        stderr: stderr.join().unwrap_or_default(),
+    async fn collect(r: Option<impl AsyncRead + Unpin>) -> Vec<u8> {
+        let mut v = Vec::new();
+        if let Some(mut r) = r {
+            let _ = r.read_to_end(&mut v).await;
+        }
+        v
+    }
+    let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
+    tasks.block_on(async {
+        // Output is read to its end too: a descendant holding the pipes
+        // open cannot outlast the limit.
+        let all = async { tokio::join!(child.wait(), collect(stdout), collect(stderr)) };
+        match tokio::time::timeout(limit, all).await {
+            Ok((status, stdout, stderr)) => {
+                Ok(std::process::Output { status: status.map_err(|e| e.to_string())?, stdout, stderr })
+            }
+            Err(_) => {
+                if let Some(pid) = child.id().and_then(|id| rustix::process::Pid::from_raw(id as i32)) {
+                    let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+                }
+                let _ = child.kill().await;
+                Err(format!("timed out after {} s", limit.as_secs()))
+            }
+        }
     })
 }
 fn cache_lock(dir: &Path) -> Result<std::fs::File, String> {

@@ -3,7 +3,7 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use proteus_core::event::ClipboardKind;
 use proteus_core::hints::{self, Hint, HintKind, HintPattern};
@@ -307,14 +307,15 @@ impl App {
 
     /// Hand `target` to the desktop's default application.
     pub(super) fn xdg_open(&mut self, target: &str, dir: Option<&Path>) {
-        let mut cmd = Command::new("xdg-open");
+        let mut cmd = tokio::process::Command::new("xdg-open");
         cmd.arg(target).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
         if let Some(d) = dir.filter(|d| d.is_dir()) {
             cmd.current_dir(d);
         }
-        match cmd.spawn() {
+        let spawned = proteus_tasks::enter().and_then(|_runtime| cmd.spawn().map_err(|e| e.to_string()));
+        match spawned {
             Ok(mut child) => {
-                let _ = std::thread::Builder::new().name("xdg-open".into()).spawn(move || child.wait());
+                let _ = proteus_tasks::spawn(async move { child.wait().await });
             }
             Err(e) => self.notice_error(format!("cannot run xdg-open: {e}")),
         }

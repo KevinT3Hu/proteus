@@ -1,0 +1,15 @@
+[package]
+name = "proteus-tasks"
+description = "The Proteus terminal's shared Tokio runtime for background work."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "time", "net", "process"] }
+tracing.workspace = true
+
+[lints]
+workspace = true

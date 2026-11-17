@@ -12,6 +12,7 @@
 mod accessibility;
 mod actions;
 mod approvals;
+mod background;
 mod blocks;
 mod chrome;
 mod clipboard;
@@ -51,7 +52,6 @@ pub use scripting::Overrides;
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
-use std::fs::File;
 use std::io;
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
@@ -160,18 +160,17 @@ pub(crate) enum ClipTarget {
     Plugin(u64),
 }
 
-pub(crate) enum Msg {
+enum Msg {
+    /// The rest of background work, on the GUI thread.
+    Run(Box<dyn FnOnce(&mut App) + Send>),
     Ipc(crate::ipc::Call),
     Accessibility(WinId, Option<accesskit::ActionRequest>),
     GpuLost,
-    Exported(Result<(), String>),
-    SshWorkspace(PaneId, Result<Option<crate::project::Workspace>, String>),
     Pty(PaneId, Vec<u8>, (proteus_pty::budget::Permit, proteus_pty::budget::Permit)),
     PtyClosed(PaneId),
     /// A `/proc` scan for this pane's shell (pid) found this remote program
     /// in its session, or none.
     SessionScanned(PaneId, i32, Option<String>),
-    Clipboard(ClipTarget, String, proteus_pty::budget::Permit),
     /// A desktop notification about this pane was clicked (with an
     /// xdg-activation token, if the daemon sent one).
     NotifyActivated(PaneId, Option<String>),
@@ -179,9 +178,6 @@ pub(crate) enum Msg {
     ImagesDecoded(PaneId),
     /// A plugin called the host, started, stopped or failed.
     Plugin(proteus_wasm::Key, proteus_wasm::FromPlugin),
-    PluginsResolved(u64, Vec<Result<proteus_wasm::Resolved, String>>),
-    /// A `text/uri-list` dropped on a plugin surface.
-    Dropped(u32, String),
 }
 
 /// Lets wgpu's GL backend reach the Wayland display.
@@ -798,10 +794,7 @@ pub fn run(
     let (sender, rx) = channel::channel();
     handle
         .insert_source(rx, |ev, _, app: &mut App| match ev {
-            channel::Event::Msg(Msg::Exported(result)) => match result {
-                Ok(()) => app.toast(app.cfg.i18n.t("notice-scrollback-exported", &[]), false, None),
-                Err(e) => app.toast(e, true, None),
-            },
+            channel::Event::Msg(Msg::Run(then)) => then(app),
             channel::Event::Msg(Msg::Accessibility(window, action)) => app.accessibility_event(window, action),
             channel::Event::Msg(Msg::Ipc(call)) => app.ipc_call(call),
             channel::Event::Msg(Msg::GpuLost) => app.recover_gpu(),
@@ -818,15 +811,11 @@ pub fn run(
                     p.session_scanned(shell, remote);
                 }
             }
-            channel::Event::Msg(Msg::SshWorkspace(id, result)) => app.ssh_workspace_received(id, result),
-            channel::Event::Msg(Msg::Clipboard(target, text, _permit)) => app.clipboard_received(target, text),
             channel::Event::Msg(Msg::NotifyActivated(pane, token)) => app.notification_clicked(pane, token),
             channel::Event::Msg(Msg::ImagesDecoded(id)) => app.pty_output(id, &[]),
             channel::Event::Msg(Msg::Plugin(key, m)) => {
                 app.handle.insert_idle(move |app| app.plugin_msg(key, m));
             }
-            channel::Event::Msg(Msg::PluginsResolved(generation, results)) => app.plugins_resolved(generation, results),
-            channel::Event::Msg(Msg::Dropped(s, list)) => app.surface_dropped(s, &list),
             channel::Event::Closed => app.exit = true,
         })
         .map_err(|e| err(format!("event channel: {e}")))?;

@@ -267,14 +267,15 @@ impl DataDeviceHandler for App {
             self.activate_kbd();
             let (Some(o), Some(s)) = (offer, surface) else { return };
             let Ok(pipe) = o.receive(URI_LIST.into()) else { return };
-            let tx = self.sender.clone();
-            let _ = std::thread::Builder::new().name("drop".into()).spawn(move || {
-                let data = transfer::read(File::from(OwnedFd::from(pipe)), 1 << 20, Duration::from_secs(3))
-                    .unwrap_or_default();
+            let read = transfer::read(OwnedFd::from(pipe), 1 << 20, Duration::from_secs(3));
+            let done = move |app: &mut App, data: std::io::Result<Vec<u8>>| {
                 o.finish();
                 o.destroy();
-                let _ = tx.send(Msg::Dropped(s, String::from_utf8_lossy(&data).into_owned()));
-            });
+                app.surface_dropped(s, &String::from_utf8_lossy(&data.unwrap_or_default()));
+            };
+            if let Err(e) = self.in_task(read, done) {
+                tracing::warn!("reading the dropped files failed: {e}");
+            }
             return;
         }
         let Some(dnd) = self.tab_dnd.as_mut() else { return };

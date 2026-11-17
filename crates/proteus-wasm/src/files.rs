@@ -2,14 +2,17 @@
 //! directories, the desktop trash and MIME types.
 
 use std::collections::HashMap;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::manifest::FsGrant;
+use crate::runtime::Poster;
+use crate::runtime::types::{Event, FsChange, FsChangeKind};
+use tokio::io::Interest;
+use tokio::io::unix::AsyncFd;
 
 /// The plugin's view of the file system: `/data` and its `fs` grants.
 #[derive(Clone)]
@@ -234,76 +237,35 @@ pub fn list_dir(host: &Path, guest: &Path, access: &Access) -> Result<Vec<crate:
 
 // --- watching ------------------------------------------------------------------
 
-pub enum Change {
-    Created,
-    Removed,
-    Modified,
-    Moved,
-}
+type Dirs = Arc<Mutex<HashMap<i32, (u32, String)>>>;
 
-/// What the watcher reports: (watch id, path as the plugin named it, change).
-pub type OnChange = Box<dyn Fn(u32, String, Change) -> bool + Send>;
-
-/// Directory watches of one plugin (one inotify instance, one thread).
+/// Directory watches of one plugin: one inotify instance, read by a task.
+/// Dropping it ends the task.
 pub struct Watcher {
     fd: Arc<OwnedFd>,
     /// inotify watch descriptor → (watch id, directory as the plugin named it).
-    dirs: Arc<Mutex<HashMap<i32, (u32, String)>>>,
+    dirs: Dirs,
     next: u32,
-    stop: Arc<AtomicBool>,
+    task: tokio::task::AbortHandle,
 }
 
 pub const MAX_WATCHES: usize = 256;
 
 impl Watcher {
-    pub fn new(on_change: OnChange, stop: Arc<AtomicBool>) -> Result<Watcher, String> {
+    pub fn new(post: Poster) -> Result<Watcher, String> {
         use rustix::fs::inotify;
         let fd = inotify::init(inotify::CreateFlags::CLOEXEC | inotify::CreateFlags::NONBLOCK)
             .map_err(|e| format!("watch: {e}"))?;
         let fd = Arc::new(fd);
-        let dirs: Arc<Mutex<HashMap<i32, (u32, String)>>> = Arc::default();
-        let (f, d, s) = (fd.clone(), dirs.clone(), stop.clone());
-        let span = tracing::Span::current();
-        std::thread::Builder::new()
-            .name("plugin-watch".into())
-            .spawn(move || {
-                let _entered = span.enter();
-                let mut buf = [std::mem::MaybeUninit::<u8>::uninit(); 8192];
-                while !s.load(Ordering::Relaxed) {
-                    let mut reader = inotify::Reader::new(f.as_fd(), &mut buf);
-                    let mut any = false;
-                    while let Ok(ev) = reader.next() {
-                        any = true;
-                        let Some((id, dir)) = d.lock().ok().and_then(|m| m.get(&ev.wd()).cloned()) else { continue };
-                        let m = ev.events();
-                        let name = ev.file_name().map(|n| n.to_string_lossy().into_owned());
-                        let path = match &name {
-                            Some(n) if !n.is_empty() => format!("{}/{n}", dir.trim_end_matches('/')),
-                            _ => dir.clone(),
-                        };
-                        use inotify::ReadFlags as R;
-                        let change = if m.intersects(R::CREATE | R::MOVED_TO) {
-                            Change::Created
-                        } else if m.intersects(R::DELETE | R::DELETE_SELF | R::MOVE_SELF) {
-                            Change::Removed
-                        } else if m.contains(R::MOVED_FROM) {
-                            Change::Moved
-                        } else if m.intersects(R::CLOSE_WRITE | R::ATTRIB) {
-                            Change::Modified
-                        } else {
-                            continue;
-                        };
-                        if !on_change(id, path, change) {
-                            return;
-                        }
-                    }
-                    if !any {
-                        std::thread::sleep(Duration::from_millis(100));
-                    }
-                }
-            })
-            .map_err(|e| e.to_string())?;
-        Ok(Watcher { fd, dirs, next: 0, stop })
+        let dirs = Dirs::default();
+        let readable = {
+            let _runtime = proteus_tasks::enter()?;
+            // SAFETY: the `Arc` keeps the descriptor open and the same for as long as the `AsyncFd` lives.
+            unsafe { AsyncFd::register_with_interest(fd.clone(), Interest::READABLE) }
+                .map_err(|e| format!("watch: {}", e.into_parts().1))?
+        };
+        let task = proteus_tasks::spawn(report(readable, dirs.clone(), post))?.abort_handle();
+        Ok(Watcher { fd, dirs, next: 0, task })
     }
 
     pub fn add(&mut self, host: &Path, guest: &str) -> Result<u32, String> {
@@ -345,7 +307,57 @@ impl Watcher {
 
 impl Drop for Watcher {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        self.task.abort();
+    }
+}
+
+/// The changes inotify has ready, as the plugin named the paths.
+fn changes(fd: &OwnedFd, dirs: &Dirs) -> Result<Vec<FsChange>, rustix::io::Errno> {
+    use rustix::fs::inotify::{ReadFlags as R, Reader};
+    let mut buf = [std::mem::MaybeUninit::<u8>::uninit(); 8192];
+    let mut reader = Reader::new(fd, &mut buf);
+    let mut out = Vec::new();
+    loop {
+        let ev = match reader.next() {
+            Ok(ev) => ev,
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(rustix::io::Errno::AGAIN) if !out.is_empty() => return Ok(out),
+            Err(e) => return Err(e),
+        };
+        let Some((watch, dir)) = dirs.lock().ok().and_then(|m| m.get(&ev.wd()).cloned()) else { continue };
+        let m = ev.events();
+        let kind = if m.intersects(R::CREATE | R::MOVED_TO) {
+            FsChangeKind::Created
+        } else if m.intersects(R::DELETE | R::DELETE_SELF | R::MOVE_SELF) {
+            FsChangeKind::Removed
+        } else if m.contains(R::MOVED_FROM) {
+            FsChangeKind::Moved
+        } else if m.intersects(R::CLOSE_WRITE | R::ATTRIB) {
+            FsChangeKind::Modified
+        } else {
+            continue;
+        };
+        let path = match ev.file_name().map(|n| n.to_string_lossy()) {
+            Some(n) if !n.is_empty() => format!("{}/{n}", dir.trim_end_matches('/')),
+            _ => dir,
+        };
+        out.push(FsChange { watch, path, kind });
+    }
+}
+
+async fn report(fd: AsyncFd<Arc<OwnedFd>>, dirs: Dirs, post: Poster) {
+    loop {
+        let Ok(mut ready) = fd.readable().await else { return };
+        let found = match ready.try_io(|fd| changes(fd.get_ref(), &dirs).map_err(std::io::Error::from)) {
+            Ok(Ok(found)) => found,
+            Ok(Err(e)) => return tracing::warn!(error = %e, "reading file changes failed; no longer watching"),
+            Err(_would_block) => continue,
+        };
+        for change in found {
+            if !post.event_async(Event::FsChanged(change)).await {
+                return;
+            }
+        }
     }
 }
 
@@ -697,6 +709,36 @@ pub fn mime_type_named(path: &Path, original: &Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn watched_changes_reach_the_plugin_without_polling() {
+        let dir = std::env::temp_dir().join(format!("proteus-watch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (post, events) = Poster::testing();
+        let mut watcher = Watcher::new(post).unwrap();
+        let id = watcher.add(&dir, "/watched/").unwrap();
+        std::fs::write(dir.join("new"), "x").unwrap();
+        let mut seen = Vec::new();
+        while seen.len() < 2 {
+            if let crate::runtime::ToPlugin::Event(Event::FsChanged(c)) =
+                events.recv_timeout(Duration::from_secs(1)).unwrap()
+            {
+                assert_eq!((c.watch, c.path.as_str()), (id, "/watched/new"));
+                seen.push(c.kind);
+            }
+        }
+        assert!(matches!(seen[..], [FsChangeKind::Created, FsChangeKind::Modified]), "{seen:?}");
+        let task = watcher.task.clone();
+        drop(watcher);
+        let end = std::time::Instant::now() + Duration::from_secs(1);
+        while !task.is_finished() && std::time::Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(task.is_finished());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn retained_descriptors_resist_directory_and_grant_root_swaps() {
