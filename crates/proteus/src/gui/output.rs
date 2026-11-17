@@ -9,7 +9,7 @@ impl App {
         self.activate_pane(id);
         let focused = id == self.focused_id();
         let Some(p) = self.panes.get_mut(&id) else { return };
-        p.update_locality();
+        p.update_locality(id, &self.session_scanner);
         p.term.advance(bytes);
         p.deliver_run(workspace::RUN_TIMEOUT);
         let reply = p.term.take_pty_output();

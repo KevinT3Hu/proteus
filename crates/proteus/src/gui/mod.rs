@@ -168,6 +168,9 @@ pub(crate) enum Msg {
     SshWorkspace(PaneId, Result<Option<crate::project::Workspace>, String>),
     Pty(PaneId, Vec<u8>, (proteus_pty::budget::Permit, proteus_pty::budget::Permit)),
     PtyClosed(PaneId),
+    /// A `/proc` scan for this pane's shell (pid) found this remote program
+    /// in its session, or none.
+    SessionScanned(PaneId, i32, Option<String>),
     Clipboard(ClipTarget, String, proteus_pty::budget::Permit),
     /// A desktop notification about this pane was clicked (with an
     /// xdg-activation token, if the daemon sent one).
@@ -531,6 +534,7 @@ struct App {
     /// Files from another program dragged over a window: where.
     file_dnd: Option<(WinId, (f64, f64))>,
     notifier: notify::Notifier,
+    session_scanner: pane::SessionScanner,
     activation: Option<ActivationState>,
     hint_patterns: Vec<proteus_core::hints::HintPattern>,
     /// Palette entries used recently, most recent first.
@@ -798,6 +802,11 @@ pub fn run(
             channel::Event::Msg(Msg::PtyClosed(id)) => {
                 app.handle.insert_idle(move |app| app.ssh_closed(id));
             }
+            channel::Event::Msg(Msg::SessionScanned(id, shell, remote)) => {
+                if let Some(p) = app.panes.get_mut(&id) {
+                    p.session_scanned(shell, remote);
+                }
+            }
             channel::Event::Msg(Msg::SshWorkspace(id, result)) => app.ssh_workspace_received(id, result),
             channel::Event::Msg(Msg::Clipboard(target, text, _permit)) => app.clipboard_received(target, text),
             channel::Event::Msg(Msg::NotifyActivated(pane, token)) => app.notification_clicked(pane, token),
@@ -812,6 +821,7 @@ pub fn run(
         .map_err(|e| err(format!("event channel: {e}")))?;
 
     let notifier = notify::Notifier::new(sender.clone());
+    let session_scanner = pane::SessionScanner::new(sender.clone());
     let activation = ActivationState::bind(&globals, &qh).ok();
     let hint_patterns = hint::patterns(&cfg.hint_patterns);
     let cfg_total_memory = cfg.graphics.total_memory;
@@ -858,6 +868,7 @@ pub fn run(
         tab_dnd: None,
         file_dnd: None,
         notifier,
+        session_scanner,
         activation,
         hint_patterns,
         recent: scroll::load_recent(),

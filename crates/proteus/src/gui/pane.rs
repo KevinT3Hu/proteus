@@ -58,9 +58,15 @@ pub struct Pane {
     pub plugin: Option<(String, String)>,
     /// Size (cols, rows, cell) to apply once its hidden tab is shown.
     deferred_size: Option<(u16, u16, (u32, u32))>,
-    /// Foreground process group, whether the pane's output is local, and
-    /// when that was checked.
-    fg_local: Option<(i32, bool, Instant)>,
+    /// Foreground process group, the remote program found in the shell's
+    /// process tree (if any), and when that was checked.
+    fg_local: Option<(i32, Option<String>, Instant)>,
+    /// The remote program the last whole-session scan found, if any.
+    session_remote: Option<String>,
+    /// When the last whole-session scan result arrived.
+    session_checked: Option<Instant>,
+    /// A whole-session scan was requested and has not answered yet.
+    session_pending: bool,
     /// Locality last written to the log.
     logged_local: Option<bool>,
     /// `pane{id}` for log events about this pane (none for plugin panes).
@@ -146,8 +152,84 @@ fn remote_in_session(procs: &[Proc], shell: i32) -> Option<&str> {
             stack.extend(children.get(&pid).into_iter().flatten());
         }
     }
-    let remote = |comm: &str| REMOTE_PROGRAMS.contains(&comm.split(':').next().unwrap_or(comm));
-    procs.iter().find(|p| ours.contains(&p.0) && remote(&p.3)).map(|p| p.3.as_str())
+    procs.iter().find(|p| ours.contains(&p.0) && is_remote(&p.3)).map(|p| p.3.as_str())
+}
+
+fn is_remote(comm: &str) -> bool {
+    REMOTE_PROGRAMS.contains(&comm.split(':').next().unwrap_or(comm))
+}
+
+/// The [`REMOTE_PROGRAMS`] entry one of `roots` or their descendants runs,
+/// if any. Costs a few reads per process of the tree, not of the machine.
+fn remote_in_tree(
+    roots: &[i32],
+    children: impl Fn(i32) -> Vec<i32>,
+    comm: impl Fn(i32) -> Option<String>,
+) -> Option<String> {
+    let mut seen: HashSet<i32> = HashSet::new();
+    let mut stack = roots.to_vec();
+    while let Some(pid) = stack.pop() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        if let Some(c) = comm(pid).filter(|c| is_remote(c)) {
+            return Some(c);
+        }
+        stack.extend(children(pid));
+    }
+    None
+}
+
+/// Children of every thread of `pid` (`/proc/<pid>/task/*/children`).
+fn proc_children(pid: i32) -> Vec<i32> {
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else { return Vec::new() };
+    let mut out = Vec::new();
+    for task in tasks.flatten() {
+        if let Ok(list) = std::fs::read_to_string(task.path().join("children")) {
+            out.extend(list.split_whitespace().filter_map(|c| c.parse::<i32>().ok()));
+        }
+    }
+    out
+}
+
+fn proc_comm(pid: i32) -> Option<String> {
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    Some(comm.trim_end_matches('\n').to_string())
+}
+
+/// Scans all of `/proc` off the GUI thread for [`Pane::update_locality`],
+/// at most once per [`LOCALITY_TTL`] for all panes together. The scan
+/// finds members of a shell's session that left its process tree
+/// (orphans adopted by init or a subreaper).
+pub(super) struct SessionScanner(std::sync::mpsc::Sender<(PaneId, i32)>);
+
+impl SessionScanner {
+    pub fn new(tx: Sender<Msg>) -> Self {
+        let (req, rx) = std::sync::mpsc::channel::<(PaneId, i32)>();
+        let worker = std::thread::Builder::new().name("session-scan".into()).spawn(move || {
+            while let Ok(first) = rx.recv() {
+                let started = Instant::now();
+                let wanted: HashSet<(PaneId, i32)> = std::iter::once(first).chain(rx.try_iter()).collect();
+                let procs = processes();
+                for (id, shell) in wanted {
+                    let remote = remote_in_session(&procs, shell).map(str::to_string);
+                    if tx.send(Msg::SessionScanned(id, shell, remote)).is_err() {
+                        return;
+                    }
+                }
+                std::thread::sleep(LOCALITY_TTL.saturating_sub(started.elapsed()));
+            }
+        });
+        if let Err(e) = worker {
+            tracing::warn!("session scan thread failed to start, scanning on the GUI thread: {e}");
+        }
+        Self(req)
+    }
+
+    /// False if the worker is gone; the caller scans itself then.
+    fn request(&self, id: PaneId, shell: i32) -> bool {
+        self.0.send((id, shell)).is_ok()
+    }
 }
 
 impl Pane {
@@ -264,6 +346,9 @@ impl Pane {
             plugin: None,
             deferred_size: None,
             fg_local: None,
+            session_remote: None,
+            session_checked: None,
+            session_pending: false,
             logged_local: None,
             span: pane_span,
         };
@@ -292,6 +377,9 @@ impl Pane {
             plugin: None,
             deferred_size: None,
             fg_local: None,
+            session_remote: None,
+            session_checked: None,
+            session_pending: false,
             logged_local: None,
             span: tracing::Span::none(),
         }
@@ -429,27 +517,57 @@ impl Pane {
     /// Tell the terminal whether its output comes from this machine: SSH
     /// panes, and panes where any process of the shell's session or below
     /// it is a remote-access program or a multiplexer client, do not.
-    pub fn update_locality(&mut self) {
-        let local = self.remote.is_none()
-            && match self.pty.as_ref().and_then(|p| Some((p.foreground_pgrp()?, p.child_pid()))) {
-                None => false,
-                Some((pgrp, shell)) => match self.fg_local {
-                    Some((cached, local, at)) if cached == pgrp && at.elapsed() < LOCALITY_TTL => local,
-                    _ => {
-                        let procs = processes();
-                        let remote = remote_in_session(&procs, shell);
-                        let local = remote.is_none();
-                        if self.logged_local != Some(local) {
-                            self.logged_local = Some(local);
-                            self.span.in_scope(|| {
-                                tracing::debug!(shell, local, remote_program = remote, "pane locality changed")
-                            });
-                        }
-                        self.fg_local = Some((pgrp, local, Instant::now()));
-                        local
-                    }
-                },
-            };
+    ///
+    /// The shell's process tree is walked here (cheap, and current when a
+    /// new job takes the foreground); the rest of the session needs a scan
+    /// of all of `/proc`, which `scanner` runs in the background.
+    pub fn update_locality(&mut self, id: PaneId, scanner: &SessionScanner) {
+        let Some((pgrp, shell)) = self
+            .pty
+            .as_ref()
+            .filter(|_| self.remote.is_none())
+            .and_then(|p| Some((p.foreground_pgrp()?, p.child_pid())))
+        else {
+            self.term.set_local(false);
+            return;
+        };
+        let fresh = matches!(&self.fg_local, Some((cached, _, at)) if *cached == pgrp && at.elapsed() < LOCALITY_TTL);
+        if !fresh {
+            let remote = remote_in_tree(&[shell, pgrp], proc_children, proc_comm);
+            self.fg_local = Some((pgrp, remote, Instant::now()));
+        }
+        if !self.session_pending && self.session_checked.is_none_or(|t| t.elapsed() >= LOCALITY_TTL) {
+            if scanner.request(id, shell) {
+                self.session_pending = true;
+            } else {
+                self.session_remote = remote_in_session(&processes(), shell).map(str::to_string);
+                self.session_checked = Some(Instant::now());
+            }
+        }
+        self.apply_locality(shell);
+    }
+
+    /// The result of a whole-session scan requested by [`Pane::update_locality`].
+    pub fn session_scanned(&mut self, shell: i32, remote: Option<String>) {
+        if self.pty.as_ref().map(|p| p.child_pid()) != Some(shell) {
+            return;
+        }
+        self.session_pending = false;
+        self.session_checked = Some(Instant::now());
+        self.session_remote = remote;
+        if self.remote.is_none() && self.fg_local.is_some() {
+            self.apply_locality(shell);
+        }
+    }
+
+    fn apply_locality(&mut self, shell: i32) {
+        let tree = self.fg_local.as_ref().and_then(|(_, r, _)| r.as_deref());
+        let remote = tree.or(self.session_remote.as_deref());
+        let local = remote.is_none();
+        if self.logged_local != Some(local) {
+            self.logged_local = Some(local);
+            self.span.in_scope(|| tracing::debug!(shell, local, remote_program = remote, "pane locality changed"));
+        }
         self.term.set_local(local);
     }
 
@@ -457,6 +575,7 @@ impl Pane {
     pub fn expire_proc_title(&mut self) {
         self.proc_checked = None;
         self.fg_local = None;
+        self.session_checked = None;
     }
 
     /// Re-read the foreground process at most once a second. Returns true
