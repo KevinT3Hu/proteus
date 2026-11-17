@@ -25,8 +25,33 @@ const PROC_REFRESH: Duration = Duration::from_secs(1);
 /// Pty output sent to the GUI in one message once this much is collected.
 /// With one more read on top, two batches fit the per-pane budget (64 KiB).
 const READ_BATCH: usize = 24 << 10;
-/// Longest wait for pty output or for room in the output budget.
-const IDLE_POLL: Duration = Duration::from_millis(50);
+/// Longest wait for room in the output budget before collecting more output.
+const BUDGET_WAIT: Duration = Duration::from_millis(50);
+
+/// Tells a pane's reader thread to stop: the flag for its budget waits, and
+/// an eventfd that wakes its poll for output.
+#[derive(Clone)]
+struct ReaderStop {
+    flag: Arc<AtomicBool>,
+    wake: Arc<std::os::fd::OwnedFd>,
+}
+
+impl ReaderStop {
+    fn new() -> io::Result<Self> {
+        use rustix::event::EventfdFlags;
+        let wake = rustix::event::eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK)?;
+        Ok(Self { flag: Arc::default(), wake: Arc::new(wake) })
+    }
+
+    fn stop(&self) {
+        self.flag.store(true, Ordering::Release);
+        let _ = rustix::io::write(&*self.wake, &1u64.to_ne_bytes());
+    }
+
+    fn stopped(&self) -> bool {
+        self.flag.load(Ordering::Acquire)
+    }
+}
 
 pub struct Pane {
     pub term: Terminal,
@@ -40,7 +65,8 @@ pub struct Pane {
     /// None for a plugin's pane.
     pub pty: Option<Pty>,
     writer: Option<InputWriter>,
-    reader_stop: Arc<AtomicBool>,
+    /// None for a plugin's pane, which has no reader thread.
+    reader_stop: Option<ReaderStop>,
     /// Size last sent to the PTY.
     size: WindowSize,
     /// Foreground process name and cwd, used when the app sets no title.
@@ -246,7 +272,7 @@ impl Pane {
         term.set_cell_pixel_size(cell.0, cell.1);
         let writer = InputWriter::new(pty.try_clone_master()?)?;
         let mut reader = pty.try_clone_master()?;
-        let reader_stop = Arc::new(AtomicBool::new(false));
+        let reader_stop = ReaderStop::new()?;
         let stop = reader_stop.clone();
         use proteus_pty::budget::Budget;
         static OUTPUT: std::sync::OnceLock<Budget> = std::sync::OnceLock::new();
@@ -264,22 +290,23 @@ impl Pane {
             // as it takes). `Some(false)`: no room by the deadline.
             let send = |batch: &mut Vec<u8>, deadline: Option<Instant>| -> Option<bool> {
                 let n = batch.len();
-                let Ok(local) = pending.acquire_until(n, &stop, deadline) else { return Some(false) };
-                let Ok(global) = total.acquire_until(n, &stop, deadline) else { return Some(false) };
+                let Ok(local) = pending.acquire_until(n, &stop.flag, deadline) else { return Some(false) };
+                let Ok(global) = total.acquire_until(n, &stop.flag, deadline) else { return Some(false) };
                 tracing::trace!(bytes = n, "pty output");
                 let data = std::mem::take(batch);
                 tx.send(Msg::Pty(id, data, (local?, global?))).ok().map(|()| true)
             };
-            let poll = |reader: &std::fs::File, wait: Duration| -> rustix::io::Result<()> {
-                let mut polls = [rustix::event::PollFd::new(reader, rustix::event::PollFlags::IN)];
-                let wait = rustix::event::Timespec::try_from(wait).expect("small timeout");
-                match rustix::event::poll(&mut polls, Some(&wait)) {
+            // Wait for output or for the pane to stop, however long that takes.
+            let poll = |reader: &std::fs::File| -> rustix::io::Result<()> {
+                use rustix::event::{PollFd, PollFlags};
+                let mut polls = [PollFd::new(reader, PollFlags::IN), PollFd::new(&*stop.wake, PollFlags::IN)];
+                match rustix::event::poll(&mut polls, None) {
                     Err(rustix::io::Errno::INTR) => Ok(()),
                     r => r.map(drop),
                 }
             };
             loop {
-                if stop.load(Ordering::Relaxed) {
+                if stop.stopped() {
                     tracing::trace!("pty reader stopped");
                     return;
                 }
@@ -298,14 +325,12 @@ impl Pane {
                         // for room for the batch for a while, then go back to
                         // collecting whatever the pty has meanwhile.
                         if !batch.is_empty() {
-                            match send(&mut batch, Some(Instant::now() + IDLE_POLL)) {
+                            match send(&mut batch, Some(Instant::now() + BUDGET_WAIT)) {
                                 None => return,
                                 Some(_) => continue,
                             }
                         }
-                        // Readiness wakes immediately on output; the timeout
-                        // only exists to notice a closed pane.
-                        if let Err(e) = poll(&reader, IDLE_POLL) {
+                        if let Err(e) = poll(&reader) {
                             tracing::warn!("pty poll failed: {e}");
                             break;
                         }
@@ -335,7 +360,7 @@ impl Pane {
             pending_run: None,
             pty: Some(pty),
             writer: Some(writer),
-            reader_stop,
+            reader_stop: Some(reader_stop),
             size,
             proc_title: String::new(),
             proc_checked: None,
@@ -366,7 +391,7 @@ impl Pane {
             pending_run: None,
             pty: None,
             writer: None,
-            reader_stop: Arc::default(),
+            reader_stop: None,
             size: WindowSize::default(),
             proc_title: String::new(),
             proc_checked: None,
@@ -463,9 +488,15 @@ impl Pane {
 
     pub(super) fn ended_title(&mut self, title: String) {
         self.proc_title = title;
-        self.reader_stop.store(true, Ordering::Relaxed);
+        self.stop_reader();
         self.writer = None;
         self.pty = None;
+    }
+
+    fn stop_reader(&self) {
+        if let Some(s) = &self.reader_stop {
+            s.stop();
+        }
     }
 
     /// Hang up and collect the exit status if the child is already gone,
@@ -643,7 +674,7 @@ impl Pane {
 
 impl Drop for Pane {
     fn drop(&mut self) {
-        self.reader_stop.store(true, Ordering::Relaxed);
+        self.stop_reader();
     }
 }
 
