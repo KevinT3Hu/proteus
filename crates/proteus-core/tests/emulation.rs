@@ -492,3 +492,89 @@ fn style_compaction_keeps_cell_styles() {
         .unwrap();
     assert_eq!(row.len(), 5);
 }
+
+/// Ground-state text is handled outside `vte` and printable ASCII is written
+/// a run at a time. Fed byte by byte, multi-byte characters go through `vte`
+/// and each ASCII character through `put_char` on its own; random chunks mix
+/// both. All must leave the same screen and replies.
+#[test]
+fn bulk_text_matches_byte_by_byte_parsing() {
+    let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    const PIECES: &[&[u8]] = &[
+        b"hello world ",
+        b"abcdefghijklmnopqrstuvwxyz",
+        b"x",
+        b"\r\n",
+        b"\n",
+        b"\r",
+        b"\x08",
+        b"\t",
+        b"\x7f",
+        "中文".as_bytes(),
+        "e\u{301}".as_bytes(),
+        b"\xe4\xb8",
+        b"\xff",
+        b"\x9b",
+        b"\x1b[31m",
+        b"\x1b[0m",
+        b"\x1b[4h",
+        b"\x1b[4l",
+        b"\x1b[?7l",
+        b"\x1b[?7h",
+        b"\x1b[3D",
+        b"\x1b[5C",
+        b"\x1b[2;7H",
+        b"\x1b[K",
+        b"\x1b[2P",
+        b"\x1b[3@",
+        b"\x1b[3b",
+        b"\x1b[1\n2C",
+        b"\x1b[5\x18x",
+        b"\x1b]2;title\x07",
+        b"\x1b]2;t\x1b\\",
+        b"\x1bP$qm\x1b\\",
+        b"\x1b[6n",
+        b"\x1b7",
+        b"\x1b8",
+        b"\x1b(0",
+        b"\x1b(B",
+        b"\x0e",
+        b"\x0f",
+        b"\x1b[?2027h",
+        "\u{200f}".as_bytes(),
+        "\r\u{200f}".as_bytes(),
+    ];
+    let state = |t: &mut Terminal| {
+        let rows: Vec<_> = (0..4).map(|y| t.grid().row(y).clone()).collect();
+        let c = t.cursor();
+        (rows, (c.x, c.y, c.pending_wrap), t.take_pty_output())
+    };
+    for _ in 0..300 {
+        let mut input = Vec::new();
+        for _ in 0..80 {
+            input.extend_from_slice(PIECES[(next() % PIECES.len() as u64) as usize]);
+        }
+        let mut whole = Terminal::new(13, 4, Config::default());
+        whole.advance(&input);
+        let mut bytes = Terminal::new(13, 4, Config::default());
+        for b in &input {
+            bytes.advance(std::slice::from_ref(b));
+        }
+        let mut chunks = Terminal::new(13, 4, Config::default());
+        let mut rest = &input[..];
+        while !rest.is_empty() {
+            let n = (next() % 9 + 1).min(rest.len() as u64) as usize;
+            chunks.advance(&rest[..n]);
+            rest = &rest[n..];
+        }
+        let expected = state(&mut bytes);
+        assert_eq!(state(&mut whole), expected, "{:?}", String::from_utf8_lossy(&input));
+        assert_eq!(state(&mut chunks), expected, "{:?}", String::from_utf8_lossy(&input));
+    }
+}

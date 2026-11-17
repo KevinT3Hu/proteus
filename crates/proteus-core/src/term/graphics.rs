@@ -332,18 +332,85 @@ impl Terminal {
     // vte 0.15 can consume an extra ASCII byte when completing a partial
     // UTF-8 scalar from a previous call. Feeding the first three bytes singly
     // completes any pending scalar without giving that path surplus input.
-    // The rest retains the parser's fast bulk path; no buffering or copies.
+    // Only a parser in an unknown state can hold one.
+    //
+    // While the parser is known to be in its ground state (`self.ground`),
+    // text up to the next ESC is handled here exactly as `vte` would, so runs
+    // of printable ASCII skip the per-character callbacks. `vte` gets the rest
+    // and stops once a sequence returns it to the ground state.
     fn advance_parser(&mut self, parser: &mut vte::Parser, bytes: &[u8]) {
-        let mut prefix = bytes.len().min(3);
-        // Do not introduce a new split inside a scalar at our bulk boundary.
-        while prefix < bytes.len().min(6) && bytes[prefix] & 0xc0 == 0x80 {
-            prefix += 1;
+        let mut rest = bytes;
+        if !self.ground {
+            let mut prefix = rest.len().min(3);
+            // Do not introduce a new split inside a scalar at our bulk boundary.
+            while prefix < rest.len().min(6) && rest[prefix] & 0xc0 == 0x80 {
+                prefix += 1;
+            }
+            let mut fed = 0;
+            while fed < prefix && !self.ground {
+                fed += parser.advance_until_terminated(self, &rest[fed..fed + 1]);
+            }
+            rest = &rest[fed..];
         }
-        for byte in &bytes[..prefix] {
-            parser.advance(self, std::slice::from_ref(byte));
+        while !rest.is_empty() {
+            if self.ground {
+                rest = self.ground_text(rest);
+                if rest.is_empty() {
+                    break;
+                }
+                self.ground = false;
+            }
+            let n = parser.advance_until_terminated(self, rest);
+            rest = &rest[n..];
         }
-        if prefix < bytes.len() {
-            parser.advance(self, &bytes[prefix..]);
+        self.flush_run();
+    }
+
+    /// Handle ground-state text as `vte` does, up to an ESC or bytes that are
+    /// not valid UTF-8 (possibly cut off), which are returned.
+    fn ground_text<'a>(&mut self, mut rest: &'a [u8]) -> &'a [u8] {
+        use vte::Perform;
+        loop {
+            let ascii = rest.iter().position(|b| !(0x20..0x7f).contains(b)).unwrap_or(rest.len());
+            if ascii > 0 {
+                if self.ascii_charset() {
+                    self.run.extend_from_slice(&rest[..ascii]);
+                } else {
+                    for &b in &rest[..ascii] {
+                        self.print(b as char);
+                    }
+                }
+                rest = &rest[ascii..];
+            }
+            match rest.first() {
+                None | Some(0x1b) => return rest,
+                Some(&b @ 0x00..=0x1f) => {
+                    self.execute(b);
+                    rest = &rest[1..];
+                }
+                Some(0x7f) => {
+                    self.print('\x7f');
+                    rest = &rest[1..];
+                }
+                Some(_) => {
+                    let end = rest.iter().position(|&b| b < 0x80).unwrap_or(rest.len());
+                    let valid = match std::str::from_utf8(&rest[..end]) {
+                        Ok(s) => s,
+                        Err(e) => std::str::from_utf8(&rest[..e.valid_up_to()]).unwrap_or_default(),
+                    };
+                    if valid.is_empty() {
+                        return rest;
+                    }
+                    for c in valid.chars() {
+                        if ('\u{80}'..='\u{9f}').contains(&c) {
+                            self.execute(c as u8);
+                        } else {
+                            self.print(c);
+                        }
+                    }
+                    rest = &rest[valid.len()..];
+                }
+            }
         }
     }
 

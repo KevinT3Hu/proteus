@@ -223,10 +223,6 @@ impl Row {
         &mut self.cells_to(x + 1)[x]
     }
 
-    pub(crate) fn into_cells(self) -> Vec<Cell> {
-        self.cells
-    }
-
     /// Move the cells out, leaving the row without any.
     pub(crate) fn take_cells(&mut self) -> Vec<Cell> {
         self.blank_from = 0;
@@ -300,7 +296,7 @@ impl Row {
     /// its content, in `spare`'s allocation if one is given. Returns the
     /// full-width row it gave up, now blank, for reuse. Soft-wrapped rows
     /// keep their width: their trailing blanks are text.
-    pub(crate) fn archive(&mut self, spare: &mut Option<Vec<Cell>>) -> Option<Row> {
+    pub(crate) fn archive(&mut self, spare: &mut Option<Row>) -> Option<Row> {
         if self.wrapped {
             return None;
         }
@@ -309,7 +305,8 @@ impl Row {
             return None;
         }
         let mut kept = match spare.take() {
-            Some(mut v) => {
+            Some(row) => {
+                let mut v = row.cells;
                 v.clear();
                 // Rows in history should not hold much more memory than they use.
                 if v.capacity() > len + len / 2 + 8 {

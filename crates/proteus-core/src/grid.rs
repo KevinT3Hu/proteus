@@ -183,13 +183,14 @@ impl Grid {
     fn push_screen_row(&mut self, style: StyleId) {
         let mut spare = None;
         if self.rows.len() >= self.lines + self.max_scrollback {
-            spare = self.rows.pop_front().map(Row::into_cells);
+            spare = self.rows.pop_front();
             self.dropped += 1;
         }
         let top = self.history_len();
         let mut row = match self.rows[top].archive(&mut spare) {
             Some(row) => row,
-            None => Row::from_cells(spare.unwrap_or_default(), false),
+            // The dropped row keeps track of its blank tail, so reset only clears what it wrote.
+            None => spare.unwrap_or_else(|| Row::from_cells(Vec::new(), false)),
         };
         row.reset(self.cols, style);
         self.rows.push_back(row);

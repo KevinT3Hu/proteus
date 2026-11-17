@@ -164,6 +164,10 @@ pub struct Terminal {
     damage: Damage,
     last_cursor: (usize, usize, bool),
     last_char: Option<(char, usize)>,
+    /// Printable ASCII the parser handed over, not written yet.
+    run: Vec<u8>,
+    /// The parser is in its ground state with no partial UTF-8 scalar.
+    ground: bool,
     dcs: Option<Dcs>,
     notify_times: VecDeque<Instant>,
     cell_px: (u32, u32),
@@ -257,6 +261,8 @@ impl Terminal {
             damage: Damage::new(lines),
             last_cursor: (usize::MAX, usize::MAX, false),
             last_char: None,
+            run: Vec::new(),
+            ground: true,
             dcs: None,
             notify_times: VecDeque::new(),
             cell_px: (0, 0),
@@ -957,6 +963,63 @@ impl Terminal {
         } else {
             self.cursor.x = x + width;
             self.cursor.pending_wrap = false;
+        }
+    }
+
+    fn ascii_charset(&self) -> bool {
+        self.cursor.charsets[self.cursor.gl] == Charset::Ascii
+    }
+
+    /// Write the pending run of printable ASCII.
+    #[inline]
+    pub(super) fn flush_run(&mut self) {
+        if !self.run.is_empty() {
+            self.write_run();
+        }
+    }
+
+    fn write_run(&mut self) {
+        let run = std::mem::take(&mut self.run);
+        match *run.as_slice() {
+            [c] => self.put_char(c as char, 1),
+            _ => self.put_ascii(&run),
+        }
+        self.last_char = run.last().map(|&b| (b as char, 1));
+        self.run = run;
+        self.run.clear();
+    }
+
+    /// `put_char(c, 1)` for each byte of printable ASCII, a row at a time.
+    fn put_ascii(&mut self, mut run: &[u8]) {
+        let cols = self.cols();
+        let autowrap = self.mode.contains(TermMode::AUTOWRAP);
+        while let Some(&first) = run.first() {
+            if (self.cursor.pending_wrap && autowrap) || self.mode.contains(TermMode::INSERT) {
+                self.put_char(first as char, 1);
+                run = &run[1..];
+                continue;
+            }
+            let (x, y, style) = (self.cursor.x, self.cursor.y, self.style_id);
+            let n = run.len().min(cols - x);
+            let row = self.grid.row_mut(y).cells_to(x + n);
+            let plain = row[x..x + n].iter().take_while(|c| c.flags().is_empty() && !c.has_text()).count();
+            if plain == 0 {
+                self.put_char(first as char, 1);
+                run = &run[1..];
+                continue;
+            }
+            for (cell, &b) in row[x..x + plain].iter_mut().zip(run) {
+                *cell = Cell::new(b as char, style, CellFlags::empty());
+            }
+            self.damage_line(y);
+            if x + plain >= cols {
+                self.cursor.x = cols - 1;
+                self.cursor.pending_wrap = autowrap;
+            } else {
+                self.cursor.x = x + plain;
+                self.cursor.pending_wrap = false;
+            }
+            run = &run[plain..];
         }
     }
 
@@ -2137,10 +2200,16 @@ impl Terminal {
 
 impl Perform for Terminal {
     fn print(&mut self, c: char) {
+        if (' '..='~').contains(&c) && self.ascii_charset() {
+            self.run.push(c as u8);
+            return;
+        }
+        self.flush_run();
         self.print_char(c);
     }
 
     fn execute(&mut self, byte: u8) {
+        self.flush_run();
         self.last_char = None;
         match byte {
             0x07 => self.events.push(Event::Bell),
@@ -2170,6 +2239,8 @@ impl Perform for Terminal {
     }
 
     fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
+        self.flush_run();
+        self.ground = true;
         self.last_char = None;
         if ignore {
             return;
@@ -2197,6 +2268,8 @@ impl Perform for Terminal {
     }
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
+        self.flush_run();
+        self.ground = true;
         let last = self.last_char.take();
         if ignore {
             return;
@@ -2288,6 +2361,7 @@ impl Perform for Terminal {
     }
 
     fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
+        self.flush_run();
         self.last_char = None;
         if std::mem::take(&mut self.osc_drop) {
             return;
@@ -2297,6 +2371,7 @@ impl Perform for Terminal {
     }
 
     fn hook(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
+        self.flush_run();
         self.last_char = None;
         let kind = match (intermediates, action) {
             (b"+", 'q') => Some(DcsKind::XtGetTcap),
@@ -2328,12 +2403,19 @@ impl Perform for Terminal {
     }
 
     fn unhook(&mut self) {
+        self.flush_run();
         if let Some(d) = self.dcs.take() {
             if d.sixel.is_none() && d.data.len() >= MAX_DCS {
                 tracing::debug!(kind = "dcs", max = MAX_DCS, "oversized string truncated");
             }
             self.dcs_finish(d);
         }
+    }
+
+    /// Stop `vte` once it is back in its ground state, so the text after it
+    /// takes the bulk path in `advance_parser`.
+    fn terminated(&self) -> bool {
+        self.ground
     }
 }
 

@@ -78,7 +78,12 @@ pub struct StyleTable {
     index: hashbrown::HashTable<u32>,
     /// Randomly seeded: styles come from application output.
     hasher: foldhash::fast::RandomState,
+    /// Ids interned last: colored output switches between a few styles.
+    recent: [u32; RECENT],
+    next_recent: usize,
 }
+
+const RECENT: usize = 4;
 
 impl std::fmt::Debug for StyleTable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -88,14 +93,30 @@ impl std::fmt::Debug for StyleTable {
 
 impl Default for StyleTable {
     fn default() -> Self {
-        let mut table = Self { styles: Vec::new(), index: hashbrown::HashTable::new(), hasher: Default::default() };
-        table.intern(&Style::default());
+        let mut table = Self {
+            styles: Vec::new(),
+            index: hashbrown::HashTable::new(),
+            hasher: Default::default(),
+            recent: [0; RECENT],
+            next_recent: 0,
+        };
+        table.lookup(&Style::default());
         table
     }
 }
 
 impl StyleTable {
     pub fn intern(&mut self, style: &Style) -> StyleId {
+        if let Some(&id) = self.recent.iter().find(|&&id| self.styles[id as usize] == *style) {
+            return StyleId(id);
+        }
+        let id = self.lookup(style);
+        self.recent[self.next_recent] = id.0;
+        self.next_recent = (self.next_recent + 1) % RECENT;
+        id
+    }
+
+    fn lookup(&mut self, style: &Style) -> StyleId {
         let hash = self.hasher.hash_one(style);
         if let Some(&id) = self.index.find(hash, |&id| self.styles[id as usize] == *style) {
             return StyleId(id);
